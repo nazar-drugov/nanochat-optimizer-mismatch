@@ -38,7 +38,7 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
-    # Some params (wte, value_embeds) are stored in bf16, so do the math in fp32 and
+    # Some params (such as wte) are stored in bf16, so do the math in fp32 and
     # cast back at the end. MPS errors on mixed-dtype ops (CUDA promotes them), and
     # scalar arithmetic like 1 - beta2 loses all precision in bf16. compile fuses the casts.
     p32 = p.float()
