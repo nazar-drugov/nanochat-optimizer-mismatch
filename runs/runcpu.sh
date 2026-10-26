@@ -32,7 +32,6 @@ python -m scripts.tok_eval
 python -m scripts.base_train \
     --depth=6 \
     --head-dim=64 \
-    --window-pattern=L \
     --max-seq-len=512 \
     --device-batch-size=32 \
     --total-batch-size=16384 \

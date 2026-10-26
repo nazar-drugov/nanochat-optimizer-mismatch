@@ -148,8 +148,7 @@ def main():
         dtype_counts[dtype_name] = dtype_counts.get(dtype_name, 0) + p.numel()
     param_dtypes = ", ".join(f"{n:,} {dtype_name}" for dtype_name, n in sorted(dtype_counts.items()))
     print(f"Parameters: {num_params:,} ({param_dtypes}) | weight bytes as stored: {w_bytes/2**20:.0f} MiB")
-    print(f"KV cache: {kv_store:,} bytes/token stored | {kv_read:,} bytes read/step at context {context_mid} "
-          f"(window pattern {config.window_pattern})")
+    print(f"KV cache: {kv_store:,} bytes/token stored | {kv_read:,} bytes read/step at context {context_mid}")
     print(f"Theoretical decode ceiling at batch 1: {ceiling_bs1:,.0f} tok/s | "
           f"max ~{max_rows:,} full-context rows in VRAM")
     print("=" * 100)

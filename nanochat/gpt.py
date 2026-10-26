@@ -33,10 +33,6 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
-    # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (quarter context)
-    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
-    window_pattern: str = "L"
 
 
 def norm(x):
@@ -75,7 +71,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, window_size, kv_cache):
+    def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -91,11 +87,9 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # Flash Attention (FA3 or SDPA fallback), always using full causal attention
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, 0))
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -104,7 +98,7 @@ class CausalSelfAttention(nn.Module):
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
-                window_size=window_size,
+                window_size=(-1, 0),
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -135,8 +129,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
+    def forward(self, x, cos_sin, kv_cache):
+        x = x + self.attn(norm(x), cos_sin, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -150,9 +144,6 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
-        # Compute per-layer window sizes for sliding window attention
-        # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
-        self.window_sizes = self._compute_window_sizes(config)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -232,35 +223,6 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
-    def _compute_window_sizes(self, config):
-        """
-        Compute per-layer window sizes for sliding window attention.
-
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after current position to attend to (0 for causal)
-
-        Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
-        """
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Map characters to window sizes
-        long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
-        char_to_window = {
-            "L": (long_window, 0),
-            "S": (short_window, 0),
-        }
-        # Tile pattern across layers
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -269,20 +231,17 @@ class GPT(nn.Module):
         Return the estimated FLOPs per token for the model (forward + backward).
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
+        On top of that, 12 * h * q * sequence_len accounts for key @ query matmul FLOPs inside attention.
         Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
         This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+        h = self.config.n_head
+        q = self.config.n_embd // self.config.n_head
+        t = self.config.sequence_len
+
+        attn_flops = self.config.n_layer * 12 * h * q * t
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
 
@@ -298,24 +257,20 @@ class GPT(nn.Module):
 
     def estimate_decode_flops(self, context_len):
         """
-        Forward FLOPs to decode one token at a given context length during inference:
-        2 FLOPs per matmul param, plus attention over min(context, window) per layer.
+        Estimate forward FLOPs for decoding one token with full attention.
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
+        attn_flops = self.config.n_layer * 4 * h * q * context_len
         decode_flops = 2 * self.num_matmul_params() + attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
-        """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
+        """Estimate forward FLOPs for prefilling a prompt with full causal attention."""
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
-        attn_flops = 0
-        for window, _ in self.window_sizes:
-            w = min(window, num_tokens)
-            attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
+        attended_tokens = num_tokens * (num_tokens + 1) // 2
+        attn_flops = self.config.n_layer * 4 * h * q * attended_tokens
         prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
         return prefill_flops
 
@@ -326,14 +281,10 @@ class GPT(nn.Module):
         return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
-        """Bytes of KV cache *read* by one decode step at a given context length, per row.
-        Sliding window layers only attend to (and read) the last `window` tokens."""
+        """Bytes of KV cache read by one full-attention decode step, per row."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
-        total = 0
-        for window, _ in self.window_sizes:
-            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
-        return total
+        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * context_len
 
     def num_scaling_params(self):
         """
@@ -409,8 +360,8 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the trunk of the Transformer
-        for i, block in enumerate(self.transformer.h):
-            x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+        for block in self.transformer.h:
+            x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
