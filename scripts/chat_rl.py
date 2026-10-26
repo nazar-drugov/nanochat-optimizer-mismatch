@@ -195,9 +195,10 @@ def run_gsm8k_eval(task, tokenizer, engine,
 
 # Init the optimizer
 optimizer = model.setup_optimizer(
+    optimizer_name="muon",
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
+    muon_matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
 )
 

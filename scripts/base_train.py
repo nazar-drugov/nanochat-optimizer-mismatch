@@ -43,6 +43,8 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
+parser.add_argument("--ffn-type", choices=("dense", "moe"), default="dense")
+parser.add_argument("--n-experts", type=int, default=4)
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
@@ -52,12 +54,20 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
+parser.add_argument("--optimizer-name", choices=("adamw", "muon"), default="adamw")
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--router-lr", type=float, default=0.004, help="learning rate for MoE router parameters (AdamW)")
+parser.add_argument("--adamw-matrix-lr", type=float, default=6e-4, help="learning rate for transformer matrices in AdamW mode")
+parser.add_argument("--adamw-beta1", type=float, default=0.9, help="AdamW beta1 for every AdamW parameter group")
+parser.add_argument("--adamw-beta2", type=float, default=0.95, help="AdamW beta2 for every AdamW parameter group")
+parser.add_argument("--adamw-eps", type=float, default=1e-8, help="AdamW epsilon for every AdamW parameter group")
+parser.add_argument("--muon-matrix-lr", type=float, default=0.02, help="learning rate for transformer matrices in Muon mode")
+parser.add_argument("--muon-beta2", type=float, default=0.9, help="Muon second-moment decay")
+parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay for transformer matrix parameters")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -125,6 +135,7 @@ def build_model_meta(depth):
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
+        ffn_type=args.ffn_type, n_experts=args.n_experts,
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
     )
@@ -216,13 +227,19 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the selected optimizer. Muon mode uses AdamW for embeddings, the lm_head, and routers.
 optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
+    optimizer_name=args.optimizer_name,
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
+    router_lr=args.router_lr * batch_lr_scale,
+    adamw_matrix_lr=args.adamw_matrix_lr * batch_lr_scale,
+    adamw_beta1=args.adamw_beta1,
+    adamw_beta2=args.adamw_beta2,
+    adamw_eps=args.adamw_eps,
+    muon_matrix_lr=args.muon_matrix_lr * batch_lr_scale,
+    muon_beta2=args.muon_beta2,
+    muon_ns_steps=args.muon_ns_steps,
     weight_decay=weight_decay_scaled,
 )
 

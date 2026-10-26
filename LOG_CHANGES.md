@@ -92,3 +92,20 @@
 - Initialized router matrices with a small 0.1-scaled uniform distribution to break top-1 routing ties while keeping initial probabilities near uniform.
 - Added tests for feed-forward selection, MoE forward/backward behavior, complete top-1 token routing, routing-probability scaling, FP32 router computation, full causal attention, and bit-identical shared dense/MoE initialization.
 - Focused GPT tests: 11 passed.
+
+## Commit 11: Add AdamW and Muon training options
+
+- Added a choice between AdamW and Muon training.
+- AdamW mode uses AdamW for every model parameter.
+- Muon mode uses Muon for attention and feed-forward matrices. Embeddings, the language-model head, and MoE routers still use AdamW.
+- Kept MoE router parameters out of the Muon parameter groups.
+- Added separate learning rates for AdamW matrices, Muon matrices, and MoE routers.
+- Made the AdamW beta values and epsilon configurable.
+- Made the Muon beta2 value and Newton-Schulz step count configurable.
+- Added checks that every model parameter belongs to exactly one optimizer group.
+- Added training arguments for the optimizer, feed-forward type, and number of experts.
+- Updated SFT and RL to use the renamed Muon learning-rate argument.
+- Added `ffn_type` and `n_experts` to SFT checkpoint metadata.
+- Added optimizer-group tests for dense and MoE models with both optimizer choices.
+- Focused GPT tests: 14 passed.
+- One forward, backward, and optimizer step passed for dense and MoE models with both AdamW and Muon.

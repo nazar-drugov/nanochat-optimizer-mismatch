@@ -129,7 +129,13 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    optimizer_name="muon",
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    muon_matrix_lr=args.matrix_lr,
+    weight_decay=0.0,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -407,6 +413,8 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "ffn_type": model.config.ffn_type,
+                    "n_experts": model.config.n_experts,
                 },
                 "user_config": user_config, # inputs to the training script
             },

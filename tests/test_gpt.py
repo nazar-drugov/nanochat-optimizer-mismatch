@@ -22,7 +22,7 @@ def make_model(seed=42, ffn_type="dense"):
         n_experts=4,
     )
     model = GPT(config, pad_vocab_size_to=1)
-    model.init_weights()
+    model.init_weights(seed=seed)
     return model
 
 
@@ -44,9 +44,18 @@ def test_dense_forward_backward():
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
 
 
-def test_dense_optimizer_covers_every_parameter_once():
-    model = make_model()
-    optimizer = model.setup_optimizer()
+@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+@pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
+def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
+    model = make_model(ffn_type=ffn_type)
+    optimizer = model.setup_optimizer(
+        optimizer_name=optimizer_name,
+        adamw_beta1=0.81,
+        adamw_beta2=0.93,
+        adamw_eps=2e-8,
+        muon_beta2=0.87,
+        muon_ns_steps=3,
+    )
 
     model_parameter_ids = [id(parameter) for parameter in model.parameters()]
     optimizer_parameter_ids = [
@@ -57,7 +66,31 @@ def test_dense_optimizer_covers_every_parameter_once():
 
     assert len(optimizer_parameter_ids) == len(set(optimizer_parameter_ids))
     assert set(optimizer_parameter_ids) == set(model_parameter_ids)
-    assert {group["kind"] for group in optimizer.param_groups} == {"adamw", "muon"}
+
+    expected_kinds = {"adamw"} if optimizer_name == "adamw" else {"adamw", "muon"}
+    assert {group["kind"] for group in optimizer.param_groups} == expected_kinds
+
+    for group in optimizer.param_groups:
+        if group["kind"] == "adamw":
+            assert group["betas"] == (0.81, 0.93)
+            assert group["eps"] == 2e-8
+        else:
+            assert group["beta2"] == 0.87
+            assert group["ns_steps"] == 3
+
+    if ffn_type == "moe":
+        adamw_parameter_ids = {
+            id(parameter)
+            for group in optimizer.param_groups
+            if group["kind"] == "adamw"
+            for parameter in group["params"]
+        }
+        router_parameter_ids = {
+            id(parameter)
+            for block in model.transformer.h
+            for parameter in block.mlp.router.parameters()
+        }
+        assert router_parameter_ids <= adamw_parameter_ids
 
 
 def test_dense_state_dict_round_trip():

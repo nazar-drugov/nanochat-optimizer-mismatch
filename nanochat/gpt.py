@@ -397,14 +397,30 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+    def setup_optimizer(
+        self,
+        optimizer_name="adamw",
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        muon_matrix_lr=0.02,
+        adamw_matrix_lr=6e-4,
+        router_lr=0.004,
+        adamw_beta1=0.9,
+        adamw_beta2=0.95,
+        adamw_eps=1e-8,
+        muon_momentum=0.95,
+        muon_beta2=0.9,
+        muon_ns_steps=5,
+        weight_decay=0.0,
+    ):
         model_dim = self.config.n_embd
+        adamw_betas = (adamw_beta1, adamw_beta2)
+
+        # STEP 1: add to param_groups parameters that always use AdamW
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -412,21 +428,79 @@ class GPT(nn.Module):
 
         # Build param_groups with all required fields explicit
         param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            # AdamW groups (embeddings and lm_head)
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adamw_betas, eps=adamw_eps, weight_decay=0.01),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adamw_betas, eps=adamw_eps, weight_decay=0.001),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+
+        # STEP 2:
+        # If we're training an MoE, assign router weights to AdamW regardless of the optimizer choice
+        router_params = []
+        if self.config.ffn_type == "moe":
+            router_params = [parameter
+                             for block in self.transformer.h
+                             for parameter in block.mlp.router.parameters()]
+
             param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                kind='adamw',
+                params=router_params,
+                lr=router_lr * dmodel_lr_scale,
+                betas=adamw_betas,
+                eps=adamw_eps,
+                weight_decay=0.0
             ))
 
-        optimizer = MuonAdamW(param_groups)
+        # STEP 3: Collect all matrix params, excluding router params
+        # Assign them to the selected optimizer
+        router_param_ids = {id(param) for param in router_params}
+
+        matrix_params = [
+            parameter
+            for parameter in self.transformer.h.parameters()
+            if id(parameter) not in router_param_ids # Exclude router params from matrix_params
+        ]
+
+        if optimizer_name == "adamw":
+            param_groups.append(
+                dict(
+                    kind="adamw",
+                    params=matrix_params,
+                    lr=adamw_matrix_lr * dmodel_lr_scale,
+                    betas=adamw_betas,
+                    eps=adamw_eps,
+                    weight_decay=weight_decay,
+                )
+            )
+
+        elif optimizer_name == "muon":
+            # Muon groups (matrix params, grouped by shape for stacking)
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=muon_matrix_lr,
+                    momentum=muon_momentum, ns_steps=muon_ns_steps,
+                    beta2=muon_beta2, weight_decay=weight_decay,
+                ))
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+        # Verify that we have assigned every parameter to exactly one group
+        model_param_ids = {id(parameter) for parameter in self.parameters()}
+        grouped_param_ids = [id(parameter)
+                             for group in param_groups
+                             for parameter in group["params"]]
+        assert len(grouped_param_ids) == len(model_param_ids)
+        assert set(grouped_param_ids) == model_param_ids
+
+        # STEP 4: Instantiate optimizer object, conditional on the selected optimizer
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(param_groups)
+        else:
+            optimizer = MuonAdamW(param_groups)
+
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
+
         return optimizer
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
