@@ -84,8 +84,6 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
 
         # Flash Attention (FA3 or SDPA fallback), always using full causal attention
         if kv_cache is None:
