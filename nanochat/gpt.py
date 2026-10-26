@@ -33,7 +33,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
-
+    ffn_type: str = "dense" # dense | moe
+    n_experts: int = 4
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
@@ -120,12 +121,67 @@ class DenseMLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class MoEMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.router = Linear(config.n_embd, config.n_experts, bias=False, dtype=torch.float32)
 
-class Block(nn.Module):
+        # Each expert has its own expansion and projection layer
+        self.experts = nn.ModuleList(
+                DenseMLP(config) for _ in range(config.n_experts)
+            ) 
+
+    def forward(self, x):
+        # x is (batch, seq_len, n_embd)
+
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            router_logits = self.router(x.float()) # (batch, seq_len, n_experts)
+            router_probs = F.softmax(router_logits, dim=-1) # (batch, seq_len, n_experts)
+        router_choices = torch.argmax(router_probs, dim=-1) # (batch, seq_len)
+
+        # Prepare an output tensor. We will modify distinct inputs at each iteration of 
+        # the loop
+        output = torch.zeros_like(x) # (batch, seq_len, n_embd)
+
+        for idx, expert in enumerate(self.experts):
+            # Create a mask that's 1 for positions current expert will process, and 0
+            # for all other positions
+            mask = (router_choices == idx)
+
+            # Extract token embeddings that should go to the current expert
+            # It will be flattened into a (n_curr, n_embd) tensor, where n_curr is the total number of tokens
+            # in the batch that were routed to the current expert
+            curr_expert_input = x[mask] # (n_curr, n_embd)
+            curr_expert_output = expert(curr_expert_input) # (n_curr, n_embd)
+
+            # Get a tensor of size (n_curr, ), where element i is the probability from
+            # router_probs that the current expert would process this token
+            curr_expert_probs = router_probs[mask][:, idx] # (n_curr,)
+            curr_expert_probs = curr_expert_probs.unsqueeze(-1)
+            assert curr_expert_probs.shape[0] == curr_expert_output.shape[0]
+
+            # Following Shazeer et al. (2017), Eq. 1, an MoE output is the
+            # router-weighted sum of expert outputs: y = sum_i G(x)_i * E_i(x).
+            # With top-1 routing, this reduces to: y = G(x)_selected * E_selected(x).
+            # https://arxiv.org/abs/1701.06538
+            curr_expert_probs = curr_expert_probs.to(curr_expert_output.dtype)
+            curr_expert_output = curr_expert_output * curr_expert_probs
+
+            # Put the current expert's outputs into relevant positions of output tensor
+            output[mask] = curr_expert_output
+
+        return output
+
+
+class Block(nn.Module):#
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = DenseMLP(config)
+
+        if config.ffn_type == "dense":
+            self.mlp = DenseMLP(config)
+        elif config.ffn_type == "moe":
+            self.mlp = MoEMLP(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
@@ -163,36 +219,68 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
-    def init_weights(self):
+    def init_weights(self, seed=42):
         """
         Initialize the full model in this one function for maximum clarity.
 
-        wte (embedding):     normal, std=1.0
+        wte (embedding):     normal, std=0.8
         lm_head:             normal, std=0.001
         for each block:
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_fc:        uniform, std=0.4/sqrt(n_embd)
             mlp.c_proj:      zeros
         """
+        device = self.transformer.wte.weight.device
+
+        # Create a random number generator for components that are the same
+        # in both MoE and dense transformer
+        shared_rng = torch.Generator(device=device)
+        shared_rng.manual_seed(seed)
+
+        # Create a separate rng for FFNs
+        ffn_rng = torch.Generator(device=device)
+        ffn_rng.manual_seed(seed + 1)
+
+        # Create a separate rng for routers
+        router_rng = torch.Generator(device=device)
+        router_rng.manual_seed(seed + 2)
 
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8, generator=shared_rng)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001, generator=shared_rng)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        
+        # First initialize components that have identical structure in both dense and MoE transformer
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s, generator=shared_rng) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s, generator=shared_rng)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s, generator=shared_rng)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
+        # Next, initialize the MLPs
+        for block in self.transformer.h:
+            # Case 1: dense transformer
+            if self.config.ffn_type == "dense":
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4, generator=ffn_rng)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+            # Case 2: MoE transformer
+            elif self.config.ffn_type == "moe":
+                for expert in block.mlp.experts:
+                    torch.nn.init.uniform_(expert.c_fc.weight, -s * 0.4, s * 0.4, generator=ffn_rng)  # 0.4x init scale for c_fc
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+
+        # Finally, initialize the MoE routers
+        if self.config.ffn_type == "moe": 
+            for block in self.transformer.h:
+                torch.nn.init.uniform_(block.mlp.router.weight, -s * 0.1, s * 0.1, generator=router_rng) # 0.1x init scale for the router
+    
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)

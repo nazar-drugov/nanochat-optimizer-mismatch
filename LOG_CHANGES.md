@@ -78,3 +78,17 @@
 - Kept Flash Attention's FP8 compatibility comment because it describes the external attention kernel rather than FP8 model training.
 - Python and shell syntax checks passed.
 - Combined focused tests: 18 passed, 14 skipped.
+
+## Commit 10: Add dense and top-1 MoE feed-forward variants
+
+- Added `ffn_type` and `n_experts` to `GPTConfig`, defaulting to `"dense"` and four experts.
+- Added `MoEMLP` with a bias-free FP32 router and top-1 token-choice routing.
+- Kept every expert architecturally identical to `DenseMLP`: `n_embd -> 4 * n_embd -> n_embd` with ReLU-squared activation.
+- Routed every token without a capacity limit or token dropping, and multiplied each selected expert output by its routing probability.
+- Kept the MoE free of shared experts and auxiliary routing losses.
+- Updated `Block` to select `DenseMLP` or `MoEMLP` from `ffn_type` while leaving attention, normalization, and residual logic unchanged.
+- Split initialization into independent shared, feed-forward, and router random-number streams.
+- Initialized dense and expert matrices with the same rules: `c_fc` uses the existing 0.4-scaled uniform initialization and `c_proj` starts at zero.
+- Initialized router matrices with a small 0.1-scaled uniform distribution to break top-1 routing ties while keeping initial probabilities near uniform.
+- Added tests for feed-forward selection, MoE forward/backward behavior, complete top-1 token routing, routing-probability scaling, FP32 router computation, full causal attention, and bit-identical shared dense/MoE initialization.
+- Focused GPT tests: 11 passed.

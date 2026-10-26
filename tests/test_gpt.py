@@ -1,13 +1,15 @@
-"""Regression tests for the simplified dense GPT baseline."""
+"""Regression tests for the simplified dense and MoE GPT variants."""
 
+import pytest
 import torch
+import torch.nn as nn
 
 from nanochat.common import COMPUTE_DTYPE
 from nanochat.engine import KVCache
-from nanochat.gpt import GPT, GPTConfig, flash_attn
+from nanochat.gpt import Block, DenseMLP, GPT, GPTConfig, MoEMLP, flash_attn
 
 
-def make_model(seed=42):
+def make_model(seed=42, ffn_type="dense"):
     torch.manual_seed(seed)
     config = GPTConfig(
         sequence_len=16,
@@ -16,6 +18,8 @@ def make_model(seed=42):
         n_head=2,
         n_kv_head=2,
         n_embd=16,
+        ffn_type=ffn_type,
+        n_experts=4,
     )
     model = GPT(config, pad_vocab_size_to=1)
     model.init_weights()
@@ -68,8 +72,9 @@ def test_dense_state_dict_round_trip():
     torch.testing.assert_close(restored(idx), model(idx))
 
 
-def test_gpt_uses_full_attention_for_training_and_kv_cache(monkeypatch):
-    model = make_model()
+@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+def test_gpt_uses_full_attention_for_training_and_kv_cache(monkeypatch, ffn_type):
+    model = make_model(ffn_type=ffn_type)
     idx = torch.randint(0, model.config.vocab_size, (1, 4))
     training_calls = []
     cache_calls = []
@@ -105,6 +110,108 @@ def test_gpt_uses_full_attention_for_training_and_kv_cache(monkeypatch):
 
     assert cache_calls == [(True, (-1, 0))] * model.config.n_layer
     assert kv_cache.get_pos() == idx.size(1)
+
+
+def test_block_selects_requested_feed_forward_implementation():
+    dense_config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=16, ffn_type="dense")
+    moe_config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=16, ffn_type="moe")
+
+    assert isinstance(Block(dense_config, layer_idx=0).mlp, DenseMLP)
+    assert isinstance(Block(moe_config, layer_idx=0).mlp, MoEMLP)
+
+
+def test_moe_forward_backward_routes_every_token_once():
+    config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=8, ffn_type="moe", n_experts=4)
+    mlp = MoEMLP(config)
+
+    # Make routing deterministic and ensure every expert receives tokens.
+    with torch.no_grad():
+        mlp.router.weight.zero_()
+        mlp.router.weight[:, :config.n_experts].copy_(torch.eye(config.n_experts))
+    token = torch.eye(config.n_experts, config.n_embd)
+    x = token.unsqueeze(0).repeat(2, 1, 1).requires_grad_()
+
+    token_counts = [None] * config.n_experts
+    hooks = []
+    for expert_idx, expert in enumerate(mlp.experts):
+        def record_input_count(_module, args, expert_idx=expert_idx):
+            token_counts[expert_idx] = args[0].shape[0]
+
+        hooks.append(expert.register_forward_pre_hook(record_input_count))
+
+    output = mlp(x)
+    for hook in hooks:
+        hook.remove()
+
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+    assert token_counts == [2] * config.n_experts
+    assert sum(token_counts) == x.shape[0] * x.shape[1]
+
+    output.square().mean().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert mlp.router.weight.grad is not None
+    assert torch.isfinite(mlp.router.weight.grad).all()
+    for expert in mlp.experts:
+        assert all(parameter.grad is not None for parameter in expert.parameters())
+        assert all(torch.isfinite(parameter.grad).all() for parameter in expert.parameters())
+
+
+def test_moe_scales_selected_expert_output_by_router_probability():
+    class OnesExpert(nn.Module):
+        def forward(self, x):
+            return torch.ones_like(x)
+
+    config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=8, ffn_type="moe", n_experts=4)
+    mlp = MoEMLP(config)
+    mlp.experts = nn.ModuleList(OnesExpert() for _ in range(config.n_experts))
+    with torch.no_grad():
+        mlp.router.weight.zero_()
+
+    x = torch.randn(2, 3, config.n_embd)
+    output = mlp(x)
+
+    # Equal router logits give every expert probability 1 / n_experts, and
+    # argmax deterministically selects expert zero.
+    torch.testing.assert_close(output, torch.full_like(output, 1 / config.n_experts))
+
+
+def test_moe_router_computation_is_float32_under_autocast():
+    config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=8, ffn_type="moe", n_experts=4)
+    mlp = MoEMLP(config)
+    router_output_dtypes = []
+    hook = mlp.router.register_forward_hook(
+        lambda _module, _args, output: router_output_dtypes.append(output.dtype)
+    )
+
+    x = torch.randn(2, 3, config.n_embd, dtype=torch.bfloat16)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = mlp(x)
+    hook.remove()
+
+    assert router_output_dtypes == [torch.float32]
+    assert output.dtype == x.dtype
+
+
+def test_dense_and_moe_initialization_matches_for_shared_weights():
+    dense = make_model(seed=1234, ffn_type="dense")
+    moe = make_model(seed=1234, ffn_type="moe")
+
+    assert all(isinstance(block.mlp, DenseMLP) for block in dense.transformer.h)
+    assert all(isinstance(block.mlp, MoEMLP) for block in moe.transformer.h)
+
+    torch.testing.assert_close(dense.transformer.wte.weight, moe.transformer.wte.weight, rtol=0, atol=0)
+    torch.testing.assert_close(dense.lm_head.weight, moe.lm_head.weight, rtol=0, atol=0)
+    for dense_block, moe_block in zip(dense.transformer.h, moe.transformer.h):
+        for projection in ("c_q", "c_k", "c_v", "c_proj"):
+            torch.testing.assert_close(
+                getattr(dense_block.attn, projection).weight,
+                getattr(moe_block.attn, projection).weight,
+                rtol=0,
+                atol=0,
+            )
 
 
 def test_full_attention_cost_estimates():
