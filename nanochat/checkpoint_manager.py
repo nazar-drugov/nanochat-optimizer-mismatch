@@ -26,18 +26,6 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
-    n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
-
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -95,7 +83,6 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
