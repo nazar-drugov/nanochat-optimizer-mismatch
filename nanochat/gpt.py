@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW
+from nanochat.optim import DistributedOptimizer
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -493,10 +493,7 @@ class GPT(nn.Module):
         assert set(grouped_param_ids) == model_param_ids
 
         # STEP 4: Instantiate optimizer object, conditional on the selected optimizer
-        if optimizer_name == "adamw":
-            optimizer = torch.optim.AdamW(param_groups)
-        else:
-            optimizer = MuonAdamW(param_groups)
+        optimizer = DistributedOptimizer(param_groups)
 
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]

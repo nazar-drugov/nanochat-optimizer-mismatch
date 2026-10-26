@@ -181,9 +181,9 @@ def muon_step_fused(
 
 # -----------------------------------------------------------------------------
 
-class MuonAdamW(torch.optim.Optimizer):
+class DistributedOptimizer(torch.optim.Optimizer):
     """
-    Combined optimizer: Muon for 2D matrix params, AdamW for others.
+    Distributed optimizer supporting AdamW and Muon parameter groups.
 
     AdamW - Fused AdamW optimizer step.
 

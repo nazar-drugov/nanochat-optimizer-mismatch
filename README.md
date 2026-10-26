@@ -190,7 +190,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── test_attention_fallback.py  # FA3/SDPA attention fallback
 │   ├── test_engine.py              # Inference engine, KV cache
 │   ├── test_execution.py           # Sandboxed code execution
-│   ├── test_optim.py               # MuonAdamW optimizer (needs GPU)
+│   ├── test_optim.py               # Distributed optimizer (needs GPU)
 │   ├── test_tasks.py               # Task slicing, mixtures, HubDataset
 │   └── test_tokenizer.py           # BPE round-trips, chat rendering
 └── uv.lock

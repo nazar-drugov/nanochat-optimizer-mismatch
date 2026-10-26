@@ -127,7 +127,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# Initialize the distributed optimizer: Muon for matrix parameters, AdamW for the rest
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
 optimizer = model.setup_optimizer(
     optimizer_name="muon",

@@ -1,5 +1,5 @@
 """
-Test the combined MuonAdamW optimizer (single rank, no process group).
+Test the distributed optimizer on one GPU without a process group.
 The AdamW half is checked against torch.optim.AdamW as a reference;
 the Muon half is checked behaviorally (determinism + convergence).
 
@@ -16,7 +16,7 @@ cuda_available = torch.cuda.is_available()
 pytestmark = pytest.mark.skipif(not cuda_available, reason="optimizer tests require CUDA")
 
 if cuda_available:
-    from nanochat.optim import MuonAdamW
+    from nanochat.optim import DistributedOptimizer
 
 DEVICE = "cuda"
 
@@ -50,7 +50,7 @@ def test_adamw_matches_torch_reference():
     hypers = dict(lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
     p_ours = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
     p_ref = torch.nn.Parameter(p_ours.detach().clone())
-    opt_ours = MuonAdamW([dict(kind="adamw", params=[p_ours], **hypers)])
+    opt_ours = DistributedOptimizer([dict(kind="adamw", params=[p_ours], **hypers)])
     opt_ref = torch.optim.AdamW([p_ref], **hypers)
     for step in range(10):
         grad = torch.randn(p_ours.shape, generator=torch.Generator(device=DEVICE).manual_seed(step), device=DEVICE)
@@ -66,7 +66,7 @@ def test_determinism():
     results = []
     for _ in range(2):
         params, groups = make_params_and_groups()
-        opt = MuonAdamW(groups)
+        opt = DistributedOptimizer(groups)
         for step in range(5):
             gen = torch.Generator(device=DEVICE).manual_seed(step)
             for p in params:
@@ -82,7 +82,7 @@ def test_convergence():
     targets_params, _ = make_params_and_groups(seed=999)
     targets = [p.detach().clone() for p in targets_params]
     params, groups = make_params_and_groups(seed=999, offset=0.1) # start offset from the targets
-    opt = MuonAdamW(groups)
+    opt = DistributedOptimizer(groups)
     def distances():
         return [(p.detach() - t).norm().item() for p, t in zip(params, targets)]
     initial = distances()
@@ -104,7 +104,7 @@ def test_muon_update_is_orthogonalized():
     """
     p = torch.nn.Parameter(torch.zeros(MUON_WIDE_SHAPE, device=DEVICE))
     group = dict(kind="muon", params=[p], lr=1.0, momentum=0.0, ns_steps=5, beta2=1.0, weight_decay=0.0)
-    opt = MuonAdamW([group])
+    opt = DistributedOptimizer([group])
     p.grad = torch.randn(p.shape, generator=torch.Generator(device=DEVICE).manual_seed(0), device=DEVICE)
     opt.step()
     # with lr=1, wd=0: p_new = -update, so the update is just -p
