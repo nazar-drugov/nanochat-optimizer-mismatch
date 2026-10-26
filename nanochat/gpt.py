@@ -464,7 +464,6 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x0 = x
-        n_layer = self.config.n_layer
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
