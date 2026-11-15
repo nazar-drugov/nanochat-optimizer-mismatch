@@ -148,6 +148,17 @@ class DenseMLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden = 3 * config.n_embd
+        self.up = Linear(config.n_embd, hidden, bias=False)
+        self.gate = Linear(config.n_embd, hidden, bias=False)
+        self.down = Linear(hidden, config.n_embd, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
 class MoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -155,7 +166,7 @@ class MoEMLP(nn.Module):
 
         # Each expert has its own expansion and projection layer
         self.experts = nn.ModuleList(
-                DenseMLP(config) for _ in range(config.n_experts)
+                SwiGLUMLP(config) for _ in range(config.n_experts)
             ) 
 
     def forward(self, x):
@@ -257,8 +268,10 @@ class GPT(nn.Module):
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=0.4/sqrt(n_embd)
-            mlp.c_proj:      zeros
+            dense MLP: c_fc uniform; c_proj zero
+            MoE SwiGLU: up and gate truncated normal, std=sqrt(0.1/d)
+            down truncated normal, std=sqrt(0.1/(3d))
+            each truncated at ±2 std
         """
         device = self.transformer.wte.weight.device
 
@@ -300,8 +313,14 @@ class GPT(nn.Module):
             # Case 2: MoE transformer
             elif self.config.ffn_type == "moe":
                 for expert in block.mlp.experts:
-                    torch.nn.init.uniform_(expert.c_fc.weight, -s * 0.4, s * 0.4, generator=ffn_rng)  # 0.4x init scale for c_fc
-                    torch.nn.init.zeros_(expert.c_proj.weight)
+                    for weight in (expert.up.weight, expert.gate.weight, expert.down.weight):
+                        fan_in = weight.shape[1]
+                        std = (0.1 / fan_in) ** 0.5
+                        torch.nn.init.trunc_normal_(
+                            weight, mean=0.0, std=std,
+                            a=-2 * std, b=2 * std,
+                            generator=ffn_rng,
+                        )
 
         # Finally, initialize the MoE routers
         if self.config.ffn_type == "moe": 
