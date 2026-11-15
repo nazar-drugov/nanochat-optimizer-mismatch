@@ -5,6 +5,7 @@ import os
 import re
 import json
 import logging
+import warnings
 import torch
 
 from nanochat.common import get_base_dir
@@ -18,6 +19,56 @@ logger = logging.getLogger(__name__)
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
+
+def make_base_experiment_name(args):
+    matrix_lr = (
+        args.adamw_matrix_lr
+        if args.optimizer_name == "adamw"
+        else args.muon_matrix_lr
+    )
+
+    parts = [
+        f"d{args.depth}",
+        args.ffn_type,
+    ]
+
+    if args.ffn_type == "moe":
+        parts.append(f"e{args.n_experts}")
+
+    parts.extend([
+        args.optimizer_name,
+        f"s{args.seed}",
+        f"tok{args.train_tokens}",
+        f"bs{args.total_batch_size}",
+        f"mlr{matrix_lr:g}",
+        f"elr{args.embedding_lr:g}",
+        f"ulr{args.unembedding_lr:g}",
+    ])
+
+    if args.ffn_type == "moe":
+        parts.append(f"rlr{args.router_lr:g}")
+
+    if args.optimizer_name == "adamw":
+        parts.append(f"wd{args.weight_decay:g}")
+    else:
+        parts.append(f"ns{args.muon_ns_steps}")
+
+    parts.extend([
+        f"wu{args.warmup_steps}",
+        f"wdr{args.warmdown_ratio:g}",
+    ])
+
+    return "-".join(parts)
+
+
+def validate_experiment_name(name):
+    """Validate a user-provided name before using it as a checkpoint directory."""
+    if not name or not name.strip():
+        raise ValueError("run name cannot be empty")
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("run name cannot contain '/', '\\', or be '.' or '..'")
+    return name
+
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -52,6 +103,24 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+def validate_checkpoint_seed(meta_data, seed):
+    """Ensure a resumed run uses the seed recorded by the original run."""
+    checkpoint_seed = meta_data.get("user_config", {}).get("seed")
+    if checkpoint_seed is None:
+        warnings.warn(
+            "Checkpoint metadata does not contain user_config.seed; "
+            f"cannot validate requested seed {seed}. Continuing for compatibility with older checkpoints.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    if checkpoint_seed != seed:
+        raise ValueError(
+            f"Checkpoint seed {checkpoint_seed} does not match requested --seed={seed}. "
+            f"Resume with --seed={checkpoint_seed} to preserve the original experiment metadata."
+        )
 
 
 def build_model(checkpoint_dir, step, device, phase):

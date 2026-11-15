@@ -31,6 +31,8 @@ SERIES_NAME="${1:-${SERIES_NAME:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
 DEPTHS=(12 14 16 18 20 22 24 26)
 # Hardware
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+TRAIN_TOKENS="${TRAIN_TOKENS:-125829120}"
+TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"
 # Logging
 WANDB_RUN="${WANDB_RUN:-${SERIES_NAME}_miniseries}"
 
@@ -40,7 +42,7 @@ RESULTS_FILE="$RESULTS_DIR/results.csv"
 
 # Write CSV header only if file doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
-    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+    echo "depth,model_dim,num_iterations,tokens_trained,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
 fi
 
 log() {
@@ -68,8 +70,9 @@ for d in "${DEPTHS[@]}"; do
 
     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
         --depth=$d \
+        --train-tokens=$TRAIN_TOKENS \
+        --total-batch-size=$TOTAL_BATCH_SIZE \
         --run="${WANDB_RUN}_d${d}" \
-        --model-tag="${TAG}" \
         --core-metric-every=999999 \
         --core-metric-max-per-task=-1 \
         --sample-every=-1 \
@@ -82,11 +85,8 @@ for d in "${DEPTHS[@]}"; do
 
     # Extract stats from log
     LOG_FILE="$RESULTS_DIR/${TAG}_train.log"
-    NUM_PARAMS=$(grep "Number of parameters:" "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | head -1 | tr -d ',')
-    NUM_SCALING_PARAMS=$(grep "Number of parameters:" "$LOG_FILE" | tail -1 | grep -oP 'scaling: [\d,]+' | grep -oP '[\d,]+' | tr -d ',')
-    NUM_ITERS=$(grep "Calculated number of iterations" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
-    TOKENS_TRAINED=$((NUM_ITERS * 524288))
-    PARAM_DATA_RATIO=$(python -c "print(f'{$TOKENS_TRAINED / $NUM_SCALING_PARAMS:.2f}')")
+    NUM_ITERS=$(grep "Number of iterations:" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
+    TOKENS_TRAINED=$TRAIN_TOKENS
     MODEL_DIM=$((d * 64))
     VAL_BPB=$(grep "Validation bpb:" "$LOG_FILE" | tail -1 | grep -oP '[\d.]+$')
     CORE_SCORE=$(grep "CORE metric:" "$LOG_FILE" | tail -1 | awk '{print $NF}')
@@ -95,10 +95,10 @@ for d in "${DEPTHS[@]}"; do
         CORE_SCORE="0.0"
     fi
 
-    log "  d=$d: params=$NUM_PARAMS, scaling=$NUM_SCALING_PARAMS, ratio=$PARAM_DATA_RATIO, bpb=$VAL_BPB, CORE=$CORE_SCORE, time=${TRAIN_TIME}s"
+    log "  d=$d: iterations=$NUM_ITERS, tokens=$TOKENS_TRAINED, bpb=$VAL_BPB, CORE=$CORE_SCORE, time=${TRAIN_TIME}s"
 
     # Append to CSV
-    echo "$d,$MODEL_DIM,$NUM_PARAMS,$NUM_SCALING_PARAMS,$NUM_ITERS,$TOKENS_TRAINED,$PARAM_DATA_RATIO,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
+    echo "$d,$MODEL_DIM,$NUM_ITERS,$TOKENS_TRAINED,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
 done
 
 log "=============================================="

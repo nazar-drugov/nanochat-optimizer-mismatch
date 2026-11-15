@@ -10,7 +10,6 @@ from nanochat.gpt import Block, DenseMLP, GPT, GPTConfig, MoEMLP, flash_attn
 
 
 def make_model(seed=42, ffn_type="dense"):
-    torch.manual_seed(seed)
     config = GPTConfig(
         sequence_len=16,
         vocab_size=32,
@@ -24,6 +23,37 @@ def make_model(seed=42, ffn_type="dense"):
     model = GPT(config, pad_vocab_size_to=1)
     model.init_weights(seed=seed)
     return model
+
+
+@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+def test_same_seed_initializes_identical_parameters(ffn_type):
+    first = make_model(seed=1234, ffn_type=ffn_type)
+    second = make_model(seed=1234, ffn_type=ffn_type)
+
+    first_parameters = dict(first.named_parameters())
+    second_parameters = dict(second.named_parameters())
+    assert first_parameters.keys() == second_parameters.keys()
+    for name in first_parameters:
+        torch.testing.assert_close(
+            first_parameters[name],
+            second_parameters[name],
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+def test_different_seeds_initialize_different_parameters(ffn_type):
+    first = make_model(seed=1234, ffn_type=ffn_type)
+    second = make_model(seed=5678, ffn_type=ffn_type)
+
+    first_parameters = dict(first.named_parameters())
+    second_parameters = dict(second.named_parameters())
+    assert first_parameters.keys() == second_parameters.keys()
+    assert any(
+        not torch.equal(first_parameters[name], second_parameters[name])
+        for name in first_parameters
+    )
 
 
 def test_dense_forward_backward():
@@ -53,7 +83,6 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
         adamw_beta1=0.81,
         adamw_beta2=0.93,
         adamw_eps=2e-8,
-        muon_beta2=0.87,
         muon_ns_steps=3,
     )
 
@@ -75,8 +104,9 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
             assert group["betas"] == (0.81, 0.93)
             assert group["eps"] == 2e-8
         else:
-            assert group["beta2"] == 0.87
             assert group["ns_steps"] == 3
+            assert "beta2" not in group
+            assert "weight_decay" not in group
 
     if ffn_type == "moe":
         adamw_parameter_ids = {

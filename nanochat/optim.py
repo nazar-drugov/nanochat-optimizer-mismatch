@@ -12,7 +12,6 @@ Further contributions from @karpathy and @chrisjmccormick.
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from nanochat.common import COMPUTE_DTYPE
 
 # -----------------------------------------------------------------------------
 """
@@ -64,10 +63,9 @@ def adamw_step_fused(
 
 # -----------------------------------------------------------------------------
 """
-Muon optimizer adapted and simplified from modded-nanogpt.
-https://github.com/KellerJordan/modded-nanogpt
+Original Muon optimizer from Keller et al.
+https://kellerjordan.github.io/posts/muon/
 
-Background:
 Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
 quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
 of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
@@ -75,115 +73,47 @@ zero even beyond the point where the iteration no longer converges all the way t
 on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
 where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
 performance at all relative to UV^T, where USV^T = G is the SVD.
-
-Here, an alternative to Newton-Schulz iteration with potentially better convergence properties:
-Polar Express Sign Method for orthogonalization.
-https://arxiv.org/pdf/2505.16932
-by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-
-NorMuon variance reduction: per-neuron/column adaptive learning rate that normalizes
-update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
-https://arxiv.org/pdf/2510.05491
-
-Two more (very) slight and optional improvements:
-1) MuonEq row equilibration: rescale each row to the mean row norm so the spectrum
-entering orthogonalization is better conditioned (https://arxiv.org/abs/2603.28254)
-2) Muon+ renormalization: snap the Frobenius norm to sqrt(min(m, n)), the norm of an exactly
-semi-orthogonal matrix, correcting for under-convergence of the polar iteration (https://arxiv.org/abs/2602.21545)
-
-Some of the changes in nanochat implementation:
-- Uses a simpler, more general approach to parameter grouping and stacking
-- Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
-- Makes no assumptions about model architecture (e.g. that attention weights are fused into QKVO format)
 """
-
-# Coefficients for Polar Express (computed for num_iters=5, safety_factor=2e-2, cushion=2)
-# From https://arxiv.org/pdf/2505.16932
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
-
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
-    stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
-    stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
-    momentum_buffer: Tensor,        # (12, 768, 3072) - first moment buffer
-    second_momentum_buffer: Tensor, # (12, 768, 1) or (12, 1, 3072) - factored second moment
-    momentum_t: Tensor,             # () - 0-D CPU tensor, momentum coefficient
-    lr_t: Tensor,                   # () - 0-D CPU tensor, learning rate
-    wd_t: Tensor,                   # () - 0-D CPU tensor, weight decay
-    beta2_t: Tensor,                # () - 0-D CPU tensor, beta2 for second moment
-    ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
-    red_dim: int,                   # -1 or -2 - reduction dimension for variance
+    stacked_grads: Tensor,   # (12, 768, 3072) - stacked gradients
+    stacked_params: Tensor,  # (12, 768, 3072) - stacked parameters
+    momentum_buffer: Tensor, # (12, 768, 3072) - momentum buffer
+    momentum_t: Tensor,      # () - 0-D CPU tensor, momentum coefficient
+    lr_t: Tensor,            # () - 0-D CPU tensor, aspect-ratio-adjusted learning rate
+    ns_steps: int,           # 5 - number of Newton-Schulz iterations
 ) -> None:
     """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+    Original Muon update: Nesterov momentum, fixed-coefficient Newton-Schulz
+    orthogonalization, then the parameter update. The aspect-ratio adjustment is
+    included in lr_t by the caller.
     """
-
-    # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    # Original Muon always performs the orthogonalization in bfloat16.
+    X = g.bfloat16()
+    if g.size(-2) > g.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
 
-    # MuonEq row equilibration: rescale each row to the mean row norm so the spectrum entering orthogonalization is better conditioned
-    target = X.float().norm(dim=(-2, -1), keepdim=True) / (X.size(-2) ** 0.5)
-    row_norm = X.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    X = X * (target / row_norm).to(X.dtype)
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    for _ in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
 
-    # Polar Express orthogonalization: replace each update with the nearest orthogonal matrix
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    # Cast back to the param dtype (MPS errors on the mixed-dtype ops below when X is bf16)
-    g = X.to(stacked_params.dtype)
-
-    # Muon+ renormalization: snap Frobenius norm to sqrt(min(m, n))
-    target_norm = min(g.size(-2), g.size(-1)) ** 0.5
-    current_norm = g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-    g = g * (target_norm / current_norm).to(g.dtype)
-
-    # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    if g.size(-2) > g.size(-1):
+        X = X.mT
+    stacked_params.sub_(lr_t.to(stacked_params.dtype) * X.to(stacked_params.dtype))
 
 # -----------------------------------------------------------------------------
 
 class DistributedOptimizer(torch.optim.Optimizer):
     """
-    Distributed optimizer supporting AdamW and Muon parameter groups.
+    Distributed optimizer supporting AdamW and original Muon parameter groups.
 
     AdamW - Fused AdamW optimizer step.
 
@@ -241,7 +171,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
     - reduce_scatter the stacked grads so each rank gets its chunk.
     - Each rank computes Muon update only for params it owns.
     - all_gather the updated params back to all ranks.
-    - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
+    - Optimizer state (momentum_buffer) is sharded by chunk.
     - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
       then ignore the padding when copying back.
 
@@ -255,7 +185,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
             - 'params': List of parameters
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+            - For Muon groups: 'lr', 'momentum', 'ns_steps'
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
@@ -268,8 +198,6 @@ class DistributedOptimizer(torch.optim.Optimizer):
         self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -377,10 +305,6 @@ class DistributedOptimizer(torch.optim.Optimizer):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         stacked_owned = None
         if num_owned > 0:
@@ -389,14 +313,11 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
+                state["momentum_buffer"][:num_owned],
+                self._muon_momentum_t, self._muon_lr_t, group["ns_steps"],
             )
 
         if info['stacked_grads'] is None:

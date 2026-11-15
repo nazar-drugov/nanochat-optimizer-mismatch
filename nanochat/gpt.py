@@ -36,6 +36,33 @@ class GPTConfig:
     ffn_type: str = "dense" # dense | moe
     n_experts: int = 4
 
+def make_gpt_config(
+    *,
+    depth,
+    aspect_ratio,
+    head_dim,
+    max_seq_len,
+    vocab_size,
+    ffn_type,
+    n_experts,
+):
+    """Build the GPT configuration shared by training and planning scripts."""
+    # Nudge the model dimension up to a multiple of head_dim so every attention
+    # head has exactly the requested size.
+    base_dim = depth * aspect_ratio
+    model_dim = ((base_dim + head_dim - 1) // head_dim) * head_dim
+    num_heads = model_dim // head_dim
+    return GPTConfig(
+        ffn_type=ffn_type,
+        n_experts=n_experts,
+        sequence_len=max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=depth,
+        n_head=num_heads,
+        n_kv_head=num_heads,
+        n_embd=model_dim,
+    )
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
@@ -409,7 +436,6 @@ class GPT(nn.Module):
         adamw_beta2=0.95,
         adamw_eps=1e-8,
         muon_momentum=0.95,
-        muon_beta2=0.9,
         muon_ns_steps=5,
         weight_decay=0.0,
     ):
@@ -479,7 +505,6 @@ class GPT(nn.Module):
                 param_groups.append(dict(
                     kind='muon', params=group_params, lr=muon_matrix_lr,
                     momentum=muon_momentum, ns_steps=muon_ns_steps,
-                    beta2=muon_beta2, weight_decay=weight_decay,
                 ))
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")

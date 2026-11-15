@@ -2,13 +2,14 @@
 
 LABEL="jan26"
 
-FLOPS_BUDGETS=(
-    1e18
-    2.15e18
-    4.64e18
-    1e19
+TOKEN_BUDGETS=(
+    125829120
+    251658240
+    503316480
+    1006632960
 )
 DEPTHS=(10 12 14 16 18 20)
+TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-524288}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
@@ -24,7 +25,7 @@ RESULTS_FILE="$RESULTS_DIR/results.csv"
 
 # Write CSV header only if file doesn't exist
 if [ ! -f "$RESULTS_FILE" ]; then
-    echo "flops_budget,depth,model_dim,params_wte,params_value_embeds,params_lm_head,params_transformer,params_scalars,params_total,num_iterations,tokens_trained,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+    echo "token_budget,depth,model_dim,num_iterations,tokens_trained,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
 fi
 
 log() {
@@ -33,32 +34,32 @@ log() {
 
 # Check if a run already exists in results
 run_exists() {
-    local flops=$1
+    local tokens=$1
     local depth=$2
-    grep -q "^${flops},${depth}," "$RESULTS_FILE" 2>/dev/null
+    grep -q "^${tokens},${depth}," "$RESULTS_FILE" 2>/dev/null
 }
 
 # =============================================================================
 # Main Loop
 # =============================================================================
 
-for flops in "${FLOPS_BUDGETS[@]}"; do
+for tokens in "${TOKEN_BUDGETS[@]}"; do
     log "=============================================="
-    log "Compute budget: $flops FLOPs"
+    log "Token budget: $tokens tokens"
     log "=============================================="
 
     for d in "${DEPTHS[@]}"; do
 
         # Skip if already completed
-        if run_exists "$flops" "$d"; then
-            log "Skipping d=$d at $flops FLOPs (already in results)"
+        if run_exists "$tokens" "$d"; then
+            log "Skipping d=$d at $tokens tokens (already in results)"
             continue
         fi
 
-        log "Training d=$d at $flops FLOPs..."
+        log "Training d=$d at $tokens tokens..."
 
         # Unique tag for this run
-        TAG="scaling_${flops}_d${d}"
+        TAG="scaling_${tokens}_d${d}"
 
         # Reduce --device-batch-size to avoid OOM at larger depths
         if [ $d -ge 28 ]; then
@@ -72,15 +73,13 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
         # Record start time
         START_TIME=$(date +%s)
 
-        # Train the model with fixed flops budget
-        # The script will auto-calculate num_iterations to hit target_flops
+        # Train the model with a fixed token and batch budget.
         # CORE eval happens once at the end (999999 ensures only final step)
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
             --depth=$d \
-            --target-flops=$flops \
-            --target-param-data-ratio=-1 \
+            --train-tokens=$tokens \
+            --total-batch-size=$TOTAL_BATCH_SIZE \
             --run="${WANDB_RUN}_${TAG}" \
-            --model-tag="${TAG}" \
             --eval-tokens=$EVAL_TOKENS \
             --core-metric-every=999999 \
             --core-metric-max-per-task=-1 \
@@ -95,20 +94,8 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
         # Extract training stats from the log
         LOG_FILE="$RESULTS_DIR/${TAG}_train.log"
 
-        # Extract detailed parameter counts (for scaling law analysis with different conventions)
-        # Note: the log format is padded, e.g. "wte                     : 25,165,824"
-        # so we grep for "^key " (key at start of line followed by space) to avoid false matches
-        PARAMS_WTE=$(grep "^wte " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-        PARAMS_VE=$(grep "^value_embeds " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-        PARAMS_LM=$(grep "^lm_head " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-        PARAMS_TRANSFORMER=$(grep "^transformer_matrices " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-        PARAMS_SCALARS=$(grep "^scalars " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-        PARAMS_TOTAL=$(grep "^total " "$LOG_FILE" | tail -1 | grep -oP '[\d,]+' | tr -d ',')
-
-        NUM_ITERS=$(grep "Calculated number of iterations" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
-        # Extract actual batch size from log (auto-computed, varies by model size)
-        BATCH_SIZE=$(grep "Total batch size" "$LOG_FILE" | tail -1 | grep -oP 'Total batch size \K[\d,]+' | tr -d ',')
-        TOKENS_TRAINED=$((NUM_ITERS * BATCH_SIZE))
+        NUM_ITERS=$(grep "Number of iterations:" "$LOG_FILE" | tail -1 | sed 's/.*: //' | tr -d ',')
+        TOKENS_TRAINED=$tokens
         # Model dim
         MODEL_DIM=$((d * 64))
         # Val BPB from final eval
@@ -121,10 +108,10 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             CORE_SCORE="0.0"
         fi
 
-        log "  Params: $PARAMS_TOTAL (transformer: $PARAMS_TRANSFORMER), Iters: $NUM_ITERS, Val BPB: $VAL_BPB, CORE: $CORE_SCORE"
+        log "  Iters: $NUM_ITERS, Tokens: $TOKENS_TRAINED, Val BPB: $VAL_BPB, CORE: $CORE_SCORE"
 
         # Append to CSV
-        echo "$flops,$d,$MODEL_DIM,$PARAMS_WTE,$PARAMS_VE,$PARAMS_LM,$PARAMS_TRANSFORMER,$PARAMS_SCALARS,$PARAMS_TOTAL,$NUM_ITERS,$TOKENS_TRAINED,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
+        echo "$tokens,$d,$MODEL_DIM,$NUM_ITERS,$TOKENS_TRAINED,$VAL_BPB,$CORE_SCORE,$TRAIN_TIME" >> "$RESULTS_FILE"
     done
 done
 

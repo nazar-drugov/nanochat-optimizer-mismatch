@@ -7,7 +7,7 @@
 # bash runs/speedrun.sh
 # 2) Example launch in a screen session (because the run takes ~1.5 hours):
 # screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
-# 3) Example launch with wandb logging, but see below for setting up wandb first:
+# 3) Example launch with a custom W&B run name:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
@@ -29,15 +29,12 @@ source .venv/bin/activate
 
 # -----------------------------------------------------------------------------
 # wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
+# Pretraining always logs to W&B.
+# 1) Make sure to first log in to W&B, e.g. run:
 #    `wandb login`
 # 2) Set the WANDB_RUN environment variable when running this script, e.g.:
 #    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
-fi
+WANDB_RUN="${WANDB_RUN:-speedrun}"
 
 # -----------------------------------------------------------------------------
 # Tokenizer
@@ -64,7 +61,7 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --train-tokens=5838471168 --total-batch-size=1048576 --device-batch-size=16 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
 

@@ -18,7 +18,7 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --extra cpu
 source .venv/bin/activate
 if [ -z "$WANDB_RUN" ]; then
-    WANDB_RUN=dummy
+    WANDB_RUN=runcpu
 fi
 
 # train tokenizer on ~2B characters (~34 seconds on my MacBook Pro M3 Max)
@@ -28,7 +28,7 @@ python -m scripts.tok_eval
 
 # train a small 6 layer model
 # I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
-# To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
+# To get better results, try increasing train_tokens, or get other ideas from your favorite LLM.
 python -m scripts.base_train \
     --depth=6 \
     --head-dim=64 \
@@ -39,7 +39,7 @@ python -m scripts.base_train \
     --eval-tokens=524288 \
     --core-metric-every=-1 \
     --sample-every=100 \
-    --num-iterations=5000 \
+    --train-tokens=81920000 \
     --run=$WANDB_RUN
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 

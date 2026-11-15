@@ -1,39 +1,22 @@
 # Next changes
 
-1. **Make AdamW distributed-safe.**
+1. **Run the plain-Muon and AdamW parity tests on two GPUs.**
 
-   Nanochat does not use DDP; `DistributedOptimizer` performs its own distributed gradient synchronization. Returning ordinary `torch.optim.AdamW` means AdamW training is correct on one GPU but may train independent models on multiple GPUs.
+   `muon` now means the original Muon algorithm: Nesterov momentum, fixed-coefficient
+   Newton-Schulz orthogonalization, and the original aspect-ratio learning-rate scaling.
+   It does not use Polar Express, MuonEq, Muon+, NorMuon, or cautious weight decay.
 
-   You need either:
+   Single-rank and two-rank parity tests compare `DistributedOptimizer` with
+   `torch.optim.Muon`. The two-rank CUDA test still needs to be run on a machine with
+   at least two GPUs.
 
-   - a separate distributed AdamW implementation, or
-   - a generic distributed optimizer capable of running only AdamW groups.
+2. **Measure MoE active compute separately from the fixed token budget.**
 
-   This is the highest-priority correctness issue.
+   Pretraining now requires an explicit token budget and batch size; it no longer scales the budget, learning rates, or weight decay from parameter or FLOP estimates. The separate Chinchilla-style planner counts total parameters, including all experts, to suggest 20× and 40× token budgets.
 
-2. **Define exactly what “Muon” means.**
+   Top-1 routing executes one expert per token. Add active-parameter and active-FLOP estimates for reporting and cost comparisons. The total-parameter planner is a heuristic, not an exact compute-optimal MoE rule. Use the same selected rounded token budget for matched AdamW and Muon runs on the same MoE architecture.
 
-   The current `DistributedOptimizer` is not plain reference Muon. It includes Polar Express, MuonEq, Muon+, NorMuon, and cautious weight decay.
-
-   For interpretable results, either:
-
-   - implement a reference/plain Muon option matching the algorithm used by the papers, or
-   - call the current optimizer something like `nanochat_muon` and describe every modification.
-
-   Otherwise, a result attributed to “Muon” could actually be caused by one of those additions.
-
-3. **Fix MoE compute and budget accounting.**
-
-   Current parameter/FLOP accounting counts all experts, even though top-1 routing executes only one expert per token. This affects:
-
-   - reported FLOPs,
-   - automatically selected token budget,
-   - batch-size scaling,
-   - learning-rate and weight-decay scaling.
-
-   Report both total parameters and active parameters, but match dense and MoE primarily by fixed training tokens and active FLOPs. Otherwise the MoE may receive a substantially larger training budget.
-
-4. **Finish the post-training optimizer-switch path.**
+3. **Finish the post-training optimizer-switch path.**
 
    `chat_sft.py` still uses the old `matrix_lr` interface and does not fully expose the new optimizer choices and metadata.
 
@@ -54,7 +37,7 @@
 
 ## Experimental rigor changes
 
-5. **Use equal hyperparameter-search budgets.**
+4. **Use equal hyperparameter-search budgets.**
 
    Do not require AdamW and Muon to use the same numerical learning rate—that is not a fair comparison. Give every architecture × optimizer × stage combination the same tuning budget.
 
@@ -68,27 +51,21 @@
 
    Later sensitivity experiments can include betas, epsilon, Muon momentum, and Newton–Schulz steps. The papers specifically show that conclusions can change after learning-rate tuning.
 
-6. **Add configurable gradient clipping.**
+5. **Add configurable gradient clipping.**
 
    It is currently missing. Both papers treat clipping as an optimizer-relevant hyperparameter. Log the pre-clipping gradient norm as well as whether clipping occurred.
 
-7. **Add seeds and statistical reporting.**
+6. **Run paired seeds and report variation.**
 
-   Expose a seed argument and use it consistently for initialization and data order. Use paired seeds so corresponding dense/MoE and AdamW/Muon runs see the same examples in the same order.
+   Pretraining now exposes `--seed`, uses it for global CPU/CUDA randomness and explicit model initialization, saves it in checkpoints, and validates it on resume. Verify that paired AdamW/Muon runs see the same examples in the same order, including after resume.
 
-   Use at least three seeds for final experimental cells and report means, standard deviations or confidence intervals, and paired differences.
+   Use at least three paired seeds for final experimental cells and report means, standard deviations or confidence intervals, and paired differences.
 
-8. **Measure the actual interaction.**
+7. **Measure the optimizer-switch effect.**
 
-   The important question is not simply whether MoE or Muon has a lower loss. Estimate whether the penalty from switching optimizers differs by architecture.
+   The primary comparison holds the MoE architecture and token budget fixed, then compares matched and mismatched pretraining/SFT optimizer pairs. Report the switch penalty with paired seeds. Dense experiments can provide a secondary architecture interaction analysis.
 
-   Conceptually, compare:
-
-   `MoE mismatch penalty − dense mismatch penalty`
-
-   Ideally model architecture, pretraining optimizer, post-training optimizer, and their interactions rather than comparing isolated runs.
-
-9. **Add MoE-specific diagnostics.**
+8. **Add MoE-specific diagnostics.**
 
    Without an auxiliary balancing loss, routing collapse is an important possible confounder. Log per layer:
 
@@ -101,7 +78,7 @@
 
    You do not need to add an auxiliary loss to the primary experiment. Keep the routing design fixed and consider balancing losses as a later ablation.
 
-10. **Evaluate more than final loss.**
+9. **Evaluate more than final loss.**
 
    Record:
 
@@ -113,8 +90,8 @@
 
    Compare by both tokens and active FLOPs because MoE routing and Muon have different computational overheads.
 
-11. **Improve reproducibility metadata.**
+10. **Improve reproducibility metadata.**
 
    Each checkpoint or run record should include the complete model and optimizer configuration, all parameter-group settings, seed, data/tokenizer identity, precision, schedules, Git commit, hardware, and whether optimizer state was reset.
 
-I would fix the distributed AdamW path, reference-Muon definition, active-expert accounting, and `chat_sft.py` wiring before starting any expensive sweep. Those four can otherwise invalidate the experiment rather than merely reduce its statistical power.
+Before an expensive sweep, run the two-GPU optimizer parity tests, finish `chat_sft.py` optimizer-switch wiring, and add MoE routing diagnostics. Keep the current Muon momentum schedule until it is reviewed separately.
