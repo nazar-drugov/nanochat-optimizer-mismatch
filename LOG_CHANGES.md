@@ -192,3 +192,12 @@
 - Updated the main pretraining examples and launch scripts to use explicit token and batch budgets.
 - Focused tests: 31 passed and 7 CUDA-only tests were skipped.
 - Python syntax, command-line help, and diff checks passed.
+
+## In progress: SwiGLU MoE experts and routing losses
+
+- Replaced the MoE experts' ReLU-squared MLPs with SwiGLU MLPs using three bias-free `Linear` projections: up, gate, and down. The hidden width is three times the model width.
+- Added explicit fan-in-scaled truncated-normal initialization for the three SwiGLU matrices in `GPT.init_weights()`; dense-model initialization remains separate.
+- Added preliminary per-layer routing losses in `MoEMLP.forward()`: the Switch-style expert load-balancing loss and router z-loss. The normal return remains the expert output; an optional path returns the output and raw auxiliary losses.
+- Started an optional auxiliary-loss path through `Block.forward()`. This path is incomplete: `Block` does not yet pass the auxiliary-loss request to `MoEMLP` before unpacking its return.
+- Auxiliary losses have not yet been collected across blocks in `GPT.forward()`, added to the pretraining objective, or logged. They currently do not affect training.
+- The SwiGLU initialization and forward/backward smoke check passed before the auxiliary-loss edits; the current auxiliary-loss path still needs focused verification.

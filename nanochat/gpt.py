@@ -36,6 +36,7 @@ class GPTConfig:
     ffn_type: str = "dense" # dense | moe
     n_experts: int = 4
 
+
 def make_gpt_config(
     *,
     depth,
@@ -162,6 +163,8 @@ class SwiGLUMLP(nn.Module):
 class MoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
+
         self.router = Linear(config.n_embd, config.n_experts, bias=False, dtype=torch.float32)
 
         # Each expert has its own expansion and projection layer
@@ -169,8 +172,10 @@ class MoEMLP(nn.Module):
                 SwiGLUMLP(config) for _ in range(config.n_experts)
             ) 
 
-    def forward(self, x):
+    def forward(self, x, return_aux_losses=False):
         # x is (batch, seq_len, n_embd)
+        total_num_tokens = x.shape[0] * x.shape[1]
+        total_num_experts = self.config.n_experts
 
         with torch.autocast(device_type=x.device.type, enabled=False):
             router_logits = self.router(x.float()) # (batch, seq_len, n_experts)
@@ -180,6 +185,10 @@ class MoEMLP(nn.Module):
         # Prepare an output tensor. We will modify distinct inputs at each iteration of 
         # the loop
         output = torch.zeros_like(x) # (batch, seq_len, n_embd)
+
+        # Compute data that will be useful for L_balance and L_z
+        avg_router_probs = router_probs.mean(dim=(0, 1)) # (n_experts)
+        avg_router_freqs = torch.zeros_like(avg_router_probs)
 
         for idx, expert in enumerate(self.experts):
             # Create a mask that's 1 for positions current expert will process, and 0
@@ -208,7 +217,15 @@ class MoEMLP(nn.Module):
             # Put the current expert's outputs into relevant positions of output tensor
             output[mask] = curr_expert_output
 
-        return output
+            # Compute the average frequency of this expert
+            avg_router_freqs[idx] = (router_choices == idx).sum() / total_num_tokens
+
+        if return_aux_losses:
+            L_balance = total_num_experts * (avg_router_freqs * avg_router_probs).sum()
+            L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
+            return output, {"balance": L_balance, "z": L_z}
+        else:
+            return output
 
 
 class Block(nn.Module):#
@@ -221,10 +238,18 @@ class Block(nn.Module):#
         elif config.ffn_type == "moe":
             self.mlp = MoEMLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, return_aux_losses=False):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+
+        mlp_input = norm(x)
+
+        if return_aux_losses:
+            mlp_output, aux_losses = self.mlp(mlp_input)
+            x = x + mlp_output
+            return x, aux_losses
+        else:
+            x = x + self.mlp(mlp_input)
+            return x
 
 
 class GPT(nn.Module):
