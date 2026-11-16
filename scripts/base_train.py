@@ -28,6 +28,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name
+from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_routing_snapshot, snapshot_change_rates
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -283,6 +284,21 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
+# Rank 0 owns the fixed probe and its snapshots. On resume, reload the exact
+# tokens used by the checkpoint rather than drawing a fresh validation batch.
+previous_snapshot = None
+probe_tokens = None
+if args.ffn_type == "moe" and master_process:
+    if resuming:
+        previous_path = os.path.join(checkpoint_dir, f"routing_{step:06d}.pt")
+        previous_snapshot = load_routing_snapshot(previous_path)
+        if previous_snapshot["step"] != step:
+            raise ValueError(f"Routing snapshot at {previous_path} has the wrong step")
+        probe_tokens = previous_snapshot["probe_tokens"].to(device)
+    else:
+        # The validation loader reuses its output buffer, so keep our own copy.
+        probe_tokens = next(build_val_loader())[0].clone()
+
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -350,7 +366,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if step != args.resume_from_step and (last_step or (step > 0 and args.save_every > 0 and step % args.save_every == 0)):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -374,6 +390,28 @@ while True:
             },
             rank=ddp_rank,
         )
+
+        if args.ffn_type == "moe" and master_process:
+            current_choices = routing_probe(orig_model, probe_tokens)
+            current_snapshot = {
+                "step": step,
+                "probe_tokens": probe_tokens.cpu(),
+                "choices": current_choices,
+            }
+            if previous_snapshot is not None:
+                change_rates = snapshot_change_rates(previous_snapshot, current_snapshot)
+                wandb_run.log({
+                    "step": step,
+                    "tokens_seen": tokens_seen,
+                    **{
+                        f"probe/moe/layer_{layer_idx}/change_rate": rate.item()
+                        for layer_idx, rate in enumerate(change_rates)
+                    },
+                })
+
+            snapshot_path = os.path.join(checkpoint_dir, f"routing_{step:06d}.pt")
+            save_routing_snapshot(snapshot_path, step, probe_tokens, current_choices)
+            previous_snapshot = current_snapshot
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:

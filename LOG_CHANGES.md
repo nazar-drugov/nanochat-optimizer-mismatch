@@ -193,7 +193,7 @@
 - Focused tests: 31 passed and 7 CUDA-only tests were skipped.
 - Python syntax, command-line help, and diff checks passed.
 
-## In progress: SwiGLU MoE experts and routing losses
+## SwiGLU MoE experts, routing losses, and training diagnostics
 
 - Replaced the MoE experts' ReLU-squared MLPs with SwiGLU MLPs using three bias-free `Linear` projections: up, gate, and down. The hidden width is three times the model width.
 - Added explicit fan-in-scaled truncated-normal initialization for the three SwiGLU matrices in `GPT.init_weights()`; dense-model initialization remains separate.
@@ -202,3 +202,12 @@
 - `base_train.py` logs cross-entropy, balance, z, total loss, and per-layer routing statistics without an auxiliary-loss CLI switch.
 - Every 100 training steps, `base_train.py` also logs each expert's gradient norm after accumulation and unscaling, before the optimizer step. Distributed logs report the RMS local norm across ranks.
 - Focused model and experiment-name tests passed. Compiled GPU throughput remains unverified.
+
+## Fixed-probe routing stability at pretraining checkpoints
+
+- Added `nanochat/routing_probe.py` to run a saved token batch through the full, uncompiled MoE model. Temporary hooks capture each layer's actual router logits and record one top-1 expert ID for every batch and sequence position. The helper removes its hooks and restores the model's training mode, including if the forward pass fails.
+- Added per-layer change rates: for each layer, divide the number of probe positions whose selected expert differs from the preceding snapshot by the number of probe positions. The first snapshot is a baseline and has no change rate.
+- Store `routing_<step>.pt` beside each MoE pretraining checkpoint with the checkpoint step, fixed probe token IDs, and per-layer choices. Snapshot comparison rejects changed probe inputs or mismatched choice shapes, and saving refuses to overwrite an existing snapshot.
+- Rank 0 selects one validation batch for a new run, runs the probe at each checkpoint, and logs the per-layer change rates to W&B. On resume it reloads the saved inputs and choices for the requested checkpoint; a missing snapshot fails explicitly instead of silently selecting a new batch. Resuming from the final step does not rewrite its checkpoint or snapshot.
+- Added focused tests for capture shape and expert range, evaluation and training mode restoration, hook cleanup after failure, per-layer rates, snapshot round trips, changed-probe rejection, and dense-model rejection. The routing-probe and GPT suites passed: 25 tests.
+- `--save-every=-1` creates only a final baseline. A positive checkpoint interval is required for a pretraining stability time series. Full training and distributed probe execution remain unverified.
