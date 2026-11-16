@@ -18,7 +18,8 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.routing_probe import load_routing_snapshot, routing_probe, save_routing_snapshot, snapshot_change_rates
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -38,19 +39,26 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
-parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
-parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--model-tag", type=str, required=True, help="pretraining run to load")
+parser.add_argument("--model-step", type=int, required=True, help="exact pretraining checkpoint step")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
-# Optimization (default: inherit from pretrained checkpoint)
-parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
-parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
-parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+# Optimization: SFT optimizer and learning-rate settings
+parser.add_argument("--optimizer-name", choices=("adamw", "muon"), required=True, help="optimizer for SFT transformer matrices")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--router-lr", type=float, default=0.004, help="learning rate for MoE router parameters (AdamW)")
+parser.add_argument("--adamw-matrix-lr", type=float, default=6e-4, help="learning rate for transformer matrices in AdamW mode")
+parser.add_argument("--adamw-beta1", type=float, default=0.9, help="AdamW beta1 for every AdamW parameter group")
+parser.add_argument("--adamw-beta2", type=float, default=0.95, help="AdamW beta2 for every AdamW parameter group")
+parser.add_argument("--adamw-eps", type=float, default=1e-8, help="AdamW epsilon for every AdamW parameter group")
+parser.add_argument("--muon-matrix-lr", type=float, default=0.02, help="learning rate for transformer matrices in Muon mode")
+parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay for transformer matrices in AdamW mode; original Muon does not use weight decay")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -61,11 +69,14 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
+parser.add_argument(
+    "--save-every", type=int, default=-1,
+    help="save SFT checkpoints every N steps (-1 = final only)",
+)
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
 args = parser.parse_args()
-user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -82,16 +93,42 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
-
 # Flash Attention status
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+base_dir = get_base_dir()
+model, tokenizer, meta = load_model(
+    "base",
+    device,
+    phase="train",
+    model_tag=args.model_tag,
+    step=args.model_step,
+)
+pretrain_optimizer = meta["user_config"]["optimizer_name"]
+
+# Reuse the exact pretraining probe for MoE routing comparisons during SFT.
+# Only rank 0 runs probes and writes their snapshots.
+base_snapshot = None
+probe_tokens = None
+if model.config.ffn_type == "moe":
+    base_probe_path = os.path.join(
+        base_dir,
+        "base_checkpoints",
+        args.model_tag,
+        f"routing_{args.model_step:06d}.pt",
+    )
+    if not os.path.isfile(base_probe_path):
+        raise FileNotFoundError(
+            f"Pretraining routing snapshot not found: {base_probe_path}. "
+            "SFT routing comparisons require the probe saved with the selected checkpoint."
+        )
+    if master_process:
+        base_snapshot = load_routing_snapshot(base_probe_path)
+        if base_snapshot["step"] != args.model_step:
+            raise ValueError(f"Routing snapshot at {base_probe_path} has the wrong step")
+        probe_tokens = base_snapshot["probe_tokens"].to(device)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -99,9 +136,6 @@ for name, fallback, source in [
     ("max_seq_len",       2048,  meta),
     ("device_batch_size", 32,    meta),
     ("total_batch_size",  524288, meta),
-    ("embedding_lr",      0.3,   pretrain_user_config),
-    ("unembedding_lr",    0.004, pretrain_user_config),
-    ("matrix_lr",         0.02,  pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -113,6 +147,13 @@ for name, fallback, source in [
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
         print0(f"Using {name}={arg_val}")
+
+# Record config values we're actually using for this SFT
+user_config = vars(args).copy()
+
+# wandb logging init
+use_dummy_wandb = args.run == "dummy" or not master_process
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -127,32 +168,21 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the distributed optimizer: Muon for matrix parameters, AdamW for the rest
-# Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
+# AdamW updates embeddings, the output head, and MoE routers in both modes.
+# The selected optimizer updates the transformer matrices.
 optimizer = model.setup_optimizer(
-    optimizer_name="muon",
+    optimizer_name=args.optimizer_name,
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
-    muon_matrix_lr=args.matrix_lr,
-    weight_decay=0.0,
+    router_lr=args.router_lr,
+    adamw_matrix_lr=args.adamw_matrix_lr,
+    adamw_beta1=args.adamw_beta1,
+    adamw_beta2=args.adamw_beta2,
+    adamw_eps=args.adamw_eps,
+    muon_matrix_lr=args.muon_matrix_lr,
+    muon_ns_steps=args.muon_ns_steps,
+    weight_decay=args.weight_decay if args.optimizer_name == "adamw" else 0.0,
 )
-
-# Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
-# pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
-# restore our fresh SFT LRs after loading.
-base_dir = get_base_dir()
-if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
-    if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
-    else:
-        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -329,10 +359,44 @@ def get_muon_momentum(it):
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = None # no validation result yet
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+output_dirname = (
+    f"{args.model_tag}-step{args.model_step:06d}"
+    f"-sft-{args.optimizer_name}"
+)
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+
+# Capture the pretrained model's routing on the same fixed probe before SFT
+# performs its first optimizer update.
+previous_sft_snapshot = None
+if orig_model.config.ffn_type == "moe" and master_process:
+    step0_choices = routing_probe(orig_model, probe_tokens)
+    step0_snapshot = {
+        "step": 0,
+        "probe_tokens": probe_tokens.cpu(),
+        "choices": step0_choices,
+    }
+    transition_rates = snapshot_change_rates(base_snapshot, step0_snapshot)
+    save_routing_snapshot(
+        os.path.join(checkpoint_dir, "routing_000000.pt"),
+        0,
+        probe_tokens,
+        step0_choices,
+    )
+    previous_sft_snapshot = step0_snapshot
+    wandb_run.log({
+        "step": 0,
+        **{
+            f"probe/moe/layer_{layer_idx}/pretrain_to_sft_change_rate": rate.item()
+            for layer_idx, rate in enumerate(transition_rates)
+        },
+    })
+    print0(f"Step 0 routing change from pretraining: {transition_rates.tolist()}")
+
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -394,10 +458,11 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    # All ranks save their optimizer shard at periodic and final checkpoints.
+    should_save = last_step or (
+        step > 0 and args.save_every > 0 and step % args.save_every == 0
+    )
+    if should_save:
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -417,9 +482,41 @@ while True:
                     "n_experts": model.config.n_experts,
                 },
                 "user_config": user_config, # inputs to the training script
+                "pretrain_source": {
+                    "model_tag": args.model_tag,
+                    "step": args.model_step,
+                    "optimizer_name": pretrain_optimizer,
+                },
+                "optimizer_state_reset": True,
             },
             rank=ddp_rank,
         )
+
+        # Rank 0 compares the same fixed probe against the preceding SFT snapshot.
+        # Step 0 was already recorded before the first optimizer update.
+        if orig_model.config.ffn_type == "moe" and master_process and step > 0:
+            current_choices = routing_probe(orig_model, probe_tokens)
+            current_snapshot = {
+                "step": step,
+                "probe_tokens": probe_tokens.cpu(),
+                "choices": current_choices,
+            }
+            change_rates = snapshot_change_rates(previous_sft_snapshot, current_snapshot)
+            save_routing_snapshot(
+                os.path.join(checkpoint_dir, f"routing_{step:06d}.pt"),
+                step,
+                probe_tokens,
+                current_choices,
+            )
+            wandb_run.log({
+                "step": step,
+                **{
+                    f"probe/moe/layer_{layer_idx}/change_rate": rate.item()
+                    for layer_idx, rate in enumerate(change_rates)
+                },
+            })
+            print0(f"Step {step:05d} routing change from previous SFT snapshot: {change_rates.tolist()}")
+            previous_sft_snapshot = current_snapshot
 
     if last_step:
         break
