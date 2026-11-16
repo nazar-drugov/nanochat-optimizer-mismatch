@@ -384,14 +384,32 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+
+    metrics_sums = {}
+    router_stats_sums = None
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        loss, metrics, router_stats = model(x, y, return_metrics=True)
+
+        # Divide the loss by the number of gradient accumulation steps
+        scaled_loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        for key, value in metrics.items():
+            metrics_sums[key] = metrics_sums.get(key, 0) + value.detach() / grad_accum_steps
+        if router_stats:
+            per_layer_stats = {
+                key: torch.stack([layer[key] for layer in router_stats]) / grad_accum_steps
+                for key in router_stats[0]
+            }
+            if router_stats_sums is None:
+                router_stats_sums = per_layer_stats
+            else:
+                for key, value in per_layer_stats.items():
+                    router_stats_sums[key] += value
+
+        # Backpropagate through the loss
         if scaler is not None:
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
+            scaled_loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -402,6 +420,30 @@ while True:
             group["momentum"] = muon_momentum
     if scaler is not None:
         scaler.unscale_(optimizer)
+
+    # Sample raw expert gradients after accumulation and unscaling, before the
+    # optimizer updates parameters and zero_grad clears the gradients.
+    expert_grad_norms = None
+    if args.ffn_type == "moe" and step % 100 == 0:
+        expert_grad_sq = torch.zeros(
+            (orig_model.config.n_layer, orig_model.config.n_experts), device=device
+        )
+        with torch.no_grad():
+            for layer_idx, block in enumerate(orig_model.transformer.h):
+                for expert_idx, expert in enumerate(block.mlp.experts):
+                    for param in expert.parameters():
+                        if param.grad is not None:
+                            expert_grad_sq[layer_idx, expert_idx] += (
+                                param.grad.detach().float().square().sum()
+                            )
+        # The optimizer reduces gradients inside step(), so this diagnostic is
+        # the RMS local gradient norm across ranks, not the optimizer update norm.
+        if is_ddp_initialized():
+            dist.all_reduce(expert_grad_sq, op=dist.ReduceOp.SUM)
+            expert_grad_sq /= ddp_world_size
+        expert_grad_norms = expert_grad_sq.sqrt()
+
+    if scaler is not None:
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
         # the found_inf flag (MAX = if any rank found inf, all ranks skip).
@@ -413,7 +455,7 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_f = metrics_sums["total"].item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -439,6 +481,10 @@ while True:
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
+        if router_stats_sums is not None and is_ddp_initialized():
+            for value in router_stats_sums.values():
+                dist.all_reduce(value, op=dist.ReduceOp.SUM)
+                value /= ddp_world_size
         log_data = {
             "step": step,
             "tokens_seen": tokens_seen + total_batch_size,
@@ -449,6 +495,26 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/epoch": epoch,
         }
+        log_data.update({
+            f"train/{key}_loss": value.item()
+            for key, value in metrics_sums.items()
+        })
+        if router_stats_sums is not None:
+            for layer_idx, (shares, probs, entropy, z_loss) in enumerate(zip(
+                router_stats_sums["expert_shares"],
+                router_stats_sums["mean_expert_probs"],
+                router_stats_sums["router_entropy"],
+                router_stats_sums["z_loss"],
+            )):
+                log_data[f"train/moe/layer_{layer_idx}/router_entropy"] = entropy.item()
+                log_data[f"train/moe/layer_{layer_idx}/z_loss"] = z_loss.item()
+                for expert_idx, (share, prob) in enumerate(zip(shares.tolist(), probs.tolist())):
+                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_share"] = share
+                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_mean_prob"] = prob
+        if expert_grad_norms is not None:
+            for layer_idx, layer_norms in enumerate(expert_grad_norms.tolist()):
+                for expert_idx, grad_norm in enumerate(layer_norms):
+                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_grad_norm"] = grad_norm
         wandb_run.log(log_data)
 
     # state update

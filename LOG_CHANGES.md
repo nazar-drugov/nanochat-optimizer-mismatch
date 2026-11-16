@@ -197,7 +197,8 @@
 
 - Replaced the MoE experts' ReLU-squared MLPs with SwiGLU MLPs using three bias-free `Linear` projections: up, gate, and down. The hidden width is three times the model width.
 - Added explicit fan-in-scaled truncated-normal initialization for the three SwiGLU matrices in `GPT.init_weights()`; dense-model initialization remains separate.
-- Added preliminary per-layer routing losses in `MoEMLP.forward()`: the Switch-style expert load-balancing loss and router z-loss. The normal return remains the expert output; an optional path returns the output and raw auxiliary losses.
-- Started an optional auxiliary-loss path through `Block.forward()`. This path is incomplete: `Block` does not yet pass the auxiliary-loss request to `MoEMLP` before unpacking its return.
-- Auxiliary losses have not yet been collected across blocks in `GPT.forward()`, added to the pretraining objective, or logged. They currently do not affect training.
-- The SwiGLU initialization and forward/backward smoke check passed before the auxiliary-loss edits; the current auxiliary-loss path still needs focused verification.
+- `MoEMLP.forward()` now returns its expert output, Switch-style balance and z-losses, and detached routing statistics for every MoE call.
+- MoE scalar training losses always include the mean layer balance loss at weight 0.01 and mean layer z-loss at weight 0.001. Dense losses and per-token cross-entropy requests keep their existing behavior.
+- `base_train.py` logs cross-entropy, balance, z, total loss, and per-layer routing statistics without an auxiliary-loss CLI switch.
+- Every 100 training steps, `base_train.py` also logs each expert's gradient norm after accumulation and unscaling, before the optimizer step. Distributed logs report the RMS local norm across ranks.
+- Focused model and experiment-name tests passed. Compiled GPU throughput remains unverified.
