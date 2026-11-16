@@ -74,6 +74,52 @@ def test_dense_forward_backward():
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
 
 
+def test_moe_auxiliary_objective_and_router_gradients():
+    model = make_model(ffn_type="moe")
+    idx = torch.arange(16).reshape(2, 8) % model.config.vocab_size
+    targets = (idx + 1) % model.config.vocab_size
+
+    ce_loss = model(idx, targets, loss_reduction="none").mean()
+    ce_loss.backward()
+    ce_router_grads = [block.mlp.router.weight.grad.clone() for block in model.transformer.h]
+    model.zero_grad(set_to_none=True)
+
+    full_loss, metrics, router_stats = model(idx, targets, return_metrics=True)
+    assert set(metrics) == {"ce", "balance", "z", "total"}
+    assert all(value.ndim == 0 and torch.isfinite(value) and not value.requires_grad
+               for value in metrics.values())
+    torch.testing.assert_close(metrics["ce"], ce_loss.detach())
+    torch.testing.assert_close(
+        full_loss.detach(),
+        metrics["ce"] + 0.01 * metrics["balance"] + 0.001 * metrics["z"],
+    )
+    torch.testing.assert_close(metrics["total"], full_loss.detach())
+    torch.testing.assert_close(model(idx, targets).detach(), full_loss.detach())
+    assert model(idx).shape == (2, 8, model.config.vocab_size)
+    assert len(router_stats) == model.config.n_layer
+    for layer in router_stats:
+        assert set(layer) == {"expert_shares", "router_entropy", "mean_expert_probs", "z_loss"}
+        assert all(not value.requires_grad for value in layer.values())
+        torch.testing.assert_close(layer["expert_shares"].sum(), torch.tensor(1.0))
+
+    full_loss.backward()
+    for ce_grad, block in zip(ce_router_grads, model.transformer.h):
+        aux_grad = block.mlp.router.weight.grad
+        assert aux_grad is not None
+        assert torch.isfinite(aux_grad).all()
+        assert torch.any(aux_grad != 0)
+        assert not torch.allclose(aux_grad, ce_grad)
+
+
+def test_dense_model_reports_only_cross_entropy():
+    model = make_model(ffn_type="dense")
+    idx = torch.randint(0, model.config.vocab_size, (2, 8))
+    loss, metrics, router_stats = model(idx, idx, return_metrics=True)
+    assert router_stats == []
+    assert set(metrics) == {"ce", "total"}
+    torch.testing.assert_close(loss.detach(), metrics["ce"])
+
+
 @pytest.mark.parametrize("ffn_type", ["dense", "moe"])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
 def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
@@ -202,7 +248,7 @@ def test_moe_forward_backward_routes_every_token_once():
 
         hooks.append(expert.register_forward_pre_hook(record_input_count))
 
-    output = mlp(x)
+    output, aux_losses, router_stats = mlp(x)
     for hook in hooks:
         hook.remove()
 
@@ -210,6 +256,8 @@ def test_moe_forward_backward_routes_every_token_once():
     assert torch.isfinite(output).all()
     assert token_counts == [2] * config.n_experts
     assert sum(token_counts) == x.shape[0] * x.shape[1]
+    assert set(aux_losses) == {"balance", "z"}
+    assert router_stats["expert_shares"].shape == (config.n_experts,)
 
     output.square().mean().backward()
 
@@ -234,11 +282,14 @@ def test_moe_scales_selected_expert_output_by_router_probability():
         mlp.router.weight.zero_()
 
     x = torch.randn(2, 3, config.n_embd)
-    output = mlp(x)
+    output, _, router_stats = mlp(x)
 
     # Equal router logits give every expert probability 1 / n_experts, and
     # argmax deterministically selects expert zero.
     torch.testing.assert_close(output, torch.full_like(output, 1 / config.n_experts))
+    torch.testing.assert_close(router_stats["router_entropy"], torch.tensor(1.3862944))
+    torch.testing.assert_close(router_stats["mean_expert_probs"], torch.full((4,), 0.25))
+    torch.testing.assert_close(router_stats["expert_shares"], torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
 
 def test_moe_router_computation_is_float32_under_autocast():
@@ -251,7 +302,7 @@ def test_moe_router_computation_is_float32_under_autocast():
 
     x = torch.randn(2, 3, config.n_embd, dtype=torch.bfloat16)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        output = mlp(x)
+        output, _, _ = mlp(x)
     hook.remove()
 
     assert router_output_dtypes == [torch.float32]

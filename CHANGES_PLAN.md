@@ -67,7 +67,7 @@
 
 8. **Add MoE-specific diagnostics.**
 
-   Without an auxiliary balancing loss, routing collapse is an important possible confounder. Log per layer:
+   Routing collapse remains an important possible confounder. Log per layer:
 
    - fraction of tokens assigned to each expert,
    - routing entropy,
@@ -76,7 +76,7 @@
    - router gradient and update norms,
    - expert gradient and update norms.
 
-   You do not need to add an auxiliary loss to the primary experiment. Keep the routing design fixed and consider balancing losses as a later ablation.
+   MoE scalar training losses include load-balancing and router z-losses. Keep their coefficients fixed across optimizer runs.
 
 9. **Evaluate more than final loss.**
 

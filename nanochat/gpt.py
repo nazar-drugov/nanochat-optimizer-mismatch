@@ -172,7 +172,7 @@ class MoEMLP(nn.Module):
                 SwiGLUMLP(config) for _ in range(config.n_experts)
             ) 
 
-    def forward(self, x, return_aux_losses=False):
+    def forward(self, x):
         # x is (batch, seq_len, n_embd)
         total_num_tokens = x.shape[0] * x.shape[1]
         total_num_experts = self.config.n_experts
@@ -182,13 +182,16 @@ class MoEMLP(nn.Module):
             router_probs = F.softmax(router_logits, dim=-1) # (batch, seq_len, n_experts)
         router_choices = torch.argmax(router_probs, dim=-1) # (batch, seq_len)
 
+        # Entropy of each token's distribution over experts.
+        router_entropy = -(router_probs * F.log_softmax(router_logits, dim=-1)).sum(dim=-1) # (batch, seq_len)
+        mean_router_entropy = router_entropy.mean()  # one scalar for this MoE layer
+
         # Prepare an output tensor. We will modify distinct inputs at each iteration of 
         # the loop
         output = torch.zeros_like(x) # (batch, seq_len, n_embd)
 
-        # Compute data that will be useful for L_balance and L_z
-        avg_router_probs = router_probs.mean(dim=(0, 1)) # (n_experts)
-        avg_router_freqs = torch.zeros_like(avg_router_probs)
+        mean_expert_probs = router_probs.mean(dim=(0, 1)) # (n_experts)
+        expert_shares = torch.zeros_like(mean_expert_probs)
 
         for idx, expert in enumerate(self.experts):
             # Create a mask that's 1 for positions current expert will process, and 0
@@ -218,19 +221,25 @@ class MoEMLP(nn.Module):
             output[mask] = curr_expert_output
 
             # Compute the average frequency of this expert
-            avg_router_freqs[idx] = (router_choices == idx).sum() / total_num_tokens
+            expert_shares[idx] = (router_choices == idx).sum() / total_num_tokens
 
-        if return_aux_losses:
-            L_balance = total_num_experts * (avg_router_freqs * avg_router_probs).sum()
-            L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
-            return output, {"balance": L_balance, "z": L_z}
-        else:
-            return output
+
+        # The raw z-loss also serves as a routing diagnostic.
+        L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
+        L_balance = total_num_experts * (expert_shares * mean_expert_probs).sum()
+        router_stats = {
+            "expert_shares": expert_shares.detach(),
+            "router_entropy": mean_router_entropy.detach(),
+            "mean_expert_probs": mean_expert_probs.detach(),
+            "z_loss": L_z.detach(),
+        }
+        return output, {"balance": L_balance, "z": L_z}, router_stats
 
 
 class Block(nn.Module):#
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.config = config
         self.attn = CausalSelfAttention(config, layer_idx)
 
         if config.ffn_type == "dense":
@@ -238,18 +247,15 @@ class Block(nn.Module):#
         elif config.ffn_type == "moe":
             self.mlp = MoEMLP(config)
 
-    def forward(self, x, cos_sin, kv_cache, return_aux_losses=False):
+    def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-
         mlp_input = norm(x)
 
-        if return_aux_losses:
-            mlp_output, aux_losses = self.mlp(mlp_input)
-            x = x + mlp_output
-            return x, aux_losses
-        else:
+        if self.config.ffn_type == "dense":
             x = x + self.mlp(mlp_input)
             return x
+        mlp_output, aux_losses, router_stats = self.mlp(mlp_input)
+        return x + mlp_output, aux_losses, router_stats
 
 
 class GPT(nn.Module):
@@ -351,7 +357,7 @@ class GPT(nn.Module):
         if self.config.ffn_type == "moe": 
             for block in self.transformer.h:
                 torch.nn.init.uniform_(block.mlp.router.weight, -s * 0.1, s * 0.1, generator=router_rng) # 0.1x init scale for the router
-    
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -569,7 +575,7 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_metrics=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -580,14 +586,26 @@ class GPT(nn.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
+        aux_losses_list = []
+        router_stats_list = []
+
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
-        # Forward the trunk of the Transformer
+        # Per-token losses are used as log probabilities by evaluation and RL,
+        # so auxiliary losses are only added to scalar training objectives.
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            if self.config.ffn_type == "moe":
+                x, aux_losses, router_stats = block(x, cos_sin, kv_cache)
+                if targets is not None and loss_reduction != 'none':
+                    aux_losses_list.append(aux_losses)
+                    if return_metrics:
+                        router_stats_list.append(router_stats)
+            else:
+                x = block(x, cos_sin, kv_cache)
+
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -598,7 +616,19 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+            if self.config.ffn_type == "moe" and loss_reduction != 'none':
+                balance_loss = torch.stack([a["balance"] for a in aux_losses_list]).mean()
+                z_loss = torch.stack([a["z"] for a in aux_losses_list]).mean()
+                loss = ce_loss + 0.01 * balance_loss + 0.001 * z_loss
+            else:
+                loss = ce_loss
+            if return_metrics:
+                metrics = {"ce": ce_loss.detach(), "total": loss.detach()}
+                if self.config.ffn_type == "moe" and loss_reduction != 'none':
+                    metrics.update({"balance": balance_loss.detach(), "z": z_loss.detach()})
+                return loss, metrics, router_stats_list
             return loss
         else:
             # inference: just return the logits directly
