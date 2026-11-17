@@ -125,9 +125,7 @@ if model.config.ffn_type == "moe":
             "SFT routing comparisons require the probe saved with the selected checkpoint."
         )
     if master_process:
-        base_snapshot = load_routing_snapshot(base_probe_path)
-        if base_snapshot["step"] != args.model_step:
-            raise ValueError(f"Routing snapshot at {base_probe_path} has the wrong step")
+        base_snapshot = load_routing_snapshot(base_probe_path, expected_step=args.model_step, n_experts=model.config.n_experts)
         probe_tokens = base_snapshot["probe_tokens"].to(device)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
@@ -386,6 +384,7 @@ if orig_model.config.ffn_type == "moe" and master_process:
         0,
         probe_tokens,
         step0_choices,
+        n_experts=orig_model.config.n_experts,
     )
     previous_sft_snapshot = step0_snapshot
     wandb_run.log({
@@ -507,6 +506,7 @@ while True:
                 step,
                 probe_tokens,
                 current_choices,
+                n_experts=orig_model.config.n_experts,
             )
             wandb_run.log({
                 "step": step,

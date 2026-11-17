@@ -292,6 +292,40 @@ def test_moe_scales_selected_expert_output_by_router_probability():
     torch.testing.assert_close(router_stats["expert_shares"], torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
 
+def test_moe_nonuniform_router_statistics_against_independent_logits():
+    import math
+
+    config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=8, ffn_type="moe", n_experts=4)
+    mlp = MoEMLP(config)
+    with torch.no_grad():
+        mlp.router.weight.zero_()
+        mlp.router.weight[:, :4].copy_(torch.eye(4))
+    rows = [(3.0, 0.0, 0.0, 0.0), (0.0, 2.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 4.0, 0.0)]
+    x = torch.zeros((1, 4, 8))
+    x[0, :, :4] = torch.tensor(rows)
+    _, _, stats = mlp(x)
+
+    # Compute references from the specified logits using scalar Python math.
+    probabilities = []
+    entropies = []
+    squared_log_partitions = []
+    for row in rows:
+        weights = [math.exp(value) for value in row]
+        partition = sum(weights)
+        probs = [weight / partition for weight in weights]
+        probabilities.append(probs)
+        entropies.append(-sum(prob * math.log(prob) for prob in probs))
+        squared_log_partitions.append(math.log(partition) ** 2)
+    mean_probs = [sum(row[idx] for row in probabilities) / 4 for idx in range(4)]
+
+    torch.testing.assert_close(stats["expert_shares"], torch.tensor([0.25, 0.5, 0.25, 0.0]))
+    torch.testing.assert_close(stats["mean_expert_probs"], torch.tensor(mean_probs), rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(stats["router_entropy"], torch.tensor(sum(entropies) / 4), rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(stats["z_loss"], torch.tensor(sum(squared_log_partitions) / 4), rtol=1e-6, atol=1e-7)
+    assert stats["mean_expert_probs"][3] > 0
+
+
 def test_moe_router_computation_is_float32_under_autocast():
     config = GPTConfig(n_layer=1, n_head=2, n_kv_head=2, n_embd=8, ffn_type="moe", n_experts=4)
     mlp = MoEMLP(config)

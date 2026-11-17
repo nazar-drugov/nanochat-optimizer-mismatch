@@ -29,6 +29,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name
 from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_routing_snapshot, snapshot_change_rates
+from nanochat.training_stats import accumulate_router_stats, expert_gradient_squared_norms, add_router_log_fields, write_train_stats_jsonl
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -82,6 +83,8 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--train-stats-every", type=int, default=100, help="log training statistics every N optimizer updates")
+parser.add_argument("--train-stats-jsonl", type=str, default=None, help="optional rank-0 JSONL file for W&B training log records")
 # Output
 args = parser.parse_args()
 
@@ -91,6 +94,8 @@ if args.total_batch_size <= 0:
     parser.error("--total-batch-size must be greater than zero")
 if args.train_tokens % args.total_batch_size != 0:
     parser.error("--train-tokens must be divisible by --total-batch-size")
+if args.train_stats_every <= 0:
+    parser.error("--train-stats-every must be greater than zero")
 
 total_batch_size = args.total_batch_size
 total_tokens = args.train_tokens
@@ -291,9 +296,7 @@ probe_tokens = None
 if args.ffn_type == "moe" and master_process:
     if resuming:
         previous_path = os.path.join(checkpoint_dir, f"routing_{step:06d}.pt")
-        previous_snapshot = load_routing_snapshot(previous_path)
-        if previous_snapshot["step"] != step:
-            raise ValueError(f"Routing snapshot at {previous_path} has the wrong step")
+        previous_snapshot = load_routing_snapshot(previous_path, expected_step=step, n_experts=model_config.n_experts)
         probe_tokens = previous_snapshot["probe_tokens"].to(device)
     else:
         # The validation loader reuses its output buffer, so keep our own copy.
@@ -381,7 +384,13 @@ while True:
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "train_tokens": total_tokens,
-                "dataloader_state_dict": dataloader_state_dict,
+                # x/y have already been prefetched. Replay them first on resume,
+                # then continue from the saved document buffer and cursor.
+                "dataloader_state_dict": {
+                    **dataloader_state_dict,
+                    "pending_inputs": x.detach().cpu().tolist(),
+                    "pending_targets": y.detach().cpu().tolist(),
+                },
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
@@ -410,7 +419,7 @@ while True:
                 })
 
             snapshot_path = os.path.join(checkpoint_dir, f"routing_{step:06d}.pt")
-            save_routing_snapshot(snapshot_path, step, probe_tokens, current_choices)
+            save_routing_snapshot(snapshot_path, step, probe_tokens, current_choices, n_experts=model_config.n_experts)
             previous_snapshot = current_snapshot
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
@@ -433,15 +442,7 @@ while True:
         for key, value in metrics.items():
             metrics_sums[key] = metrics_sums.get(key, 0) + value.detach() / grad_accum_steps
         if router_stats:
-            per_layer_stats = {
-                key: torch.stack([layer[key] for layer in router_stats]) / grad_accum_steps
-                for key in router_stats[0]
-            }
-            if router_stats_sums is None:
-                router_stats_sums = per_layer_stats
-            else:
-                for key, value in per_layer_stats.items():
-                    router_stats_sums[key] += value
+            router_stats_sums = accumulate_router_stats(router_stats_sums, router_stats, grad_accum_steps)
 
         # Backpropagate through the loss
         if scaler is not None:
@@ -462,18 +463,8 @@ while True:
     # Sample raw expert gradients after accumulation and unscaling, before the
     # optimizer updates parameters and zero_grad clears the gradients.
     expert_grad_norms = None
-    if args.ffn_type == "moe" and step % 100 == 0:
-        expert_grad_sq = torch.zeros(
-            (orig_model.config.n_layer, orig_model.config.n_experts), device=device
-        )
-        with torch.no_grad():
-            for layer_idx, block in enumerate(orig_model.transformer.h):
-                for expert_idx, expert in enumerate(block.mlp.experts):
-                    for param in expert.parameters():
-                        if param.grad is not None:
-                            expert_grad_sq[layer_idx, expert_idx] += (
-                                param.grad.detach().float().square().sum()
-                            )
+    if args.ffn_type == "moe" and step % args.train_stats_every == 0:
+        expert_grad_sq = expert_gradient_squared_norms(orig_model, device)
         # The optimizer reduces gradients inside step(), so this diagnostic is
         # the RMS local gradient norm across ranks, not the optimizer update norm.
         if is_ddp_initialized():
@@ -518,7 +509,7 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if step % args.train_stats_every == 0:
         if router_stats_sums is not None and is_ddp_initialized():
             for value in router_stats_sums.values():
                 dist.all_reduce(value, op=dist.ReduceOp.SUM)
@@ -537,23 +528,9 @@ while True:
             f"train/{key}_loss": value.item()
             for key, value in metrics_sums.items()
         })
-        if router_stats_sums is not None:
-            for layer_idx, (shares, probs, entropy, z_loss) in enumerate(zip(
-                router_stats_sums["expert_shares"],
-                router_stats_sums["mean_expert_probs"],
-                router_stats_sums["router_entropy"],
-                router_stats_sums["z_loss"],
-            )):
-                log_data[f"train/moe/layer_{layer_idx}/router_entropy"] = entropy.item()
-                log_data[f"train/moe/layer_{layer_idx}/z_loss"] = z_loss.item()
-                for expert_idx, (share, prob) in enumerate(zip(shares.tolist(), probs.tolist())):
-                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_share"] = share
-                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_mean_prob"] = prob
-        if expert_grad_norms is not None:
-            for layer_idx, layer_norms in enumerate(expert_grad_norms.tolist()):
-                for expert_idx, grad_norm in enumerate(layer_norms):
-                    log_data[f"train/moe/layer_{layer_idx}/expert_{expert_idx}_grad_norm"] = grad_norm
+        add_router_log_fields(log_data, router_stats_sums, expert_grad_norms)
         wandb_run.log(log_data)
+        write_train_stats_jsonl(args.train_stats_jsonl, log_data, master_process)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

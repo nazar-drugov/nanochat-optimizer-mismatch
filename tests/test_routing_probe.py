@@ -100,3 +100,48 @@ def test_snapshot_round_trip_and_rejects_changed_probe(tmp_path):
 def test_probe_rejects_dense_model():
     with pytest.raises(ValueError, match="MoE model"):
         routing_probe(make_model("dense"), torch.arange(8).reshape(1, 8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA precision modes")
+def test_cuda_probe_uses_training_matmul_precision_and_restores_caller():
+    model = make_model().cuda()
+    observed = []
+    hook = model.transformer.h[0].mlp.router.register_forward_hook(
+        lambda _module, _inputs, _output: observed.append(torch.get_float32_matmul_precision())
+    )
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        routing_probe(model, torch.arange(8, device="cuda").reshape(1, 8))
+        assert observed == ["high"]
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        hook.remove()
+        torch.set_float32_matmul_precision(previous)
+
+
+def test_missing_snapshot_in_disposable_directory_fails_with_path(tmp_path):
+    missing = tmp_path / "fresh-resume" / "routing_000001.pt"
+    with pytest.raises(FileNotFoundError, match="routing_000001.pt"):
+        load_routing_snapshot(missing)
+
+
+def test_malformed_snapshot_rejected_before_change_rate(tmp_path):
+    path = tmp_path / "routing_000003.pt"
+    good = {
+        "step": 3,
+        "probe_tokens": torch.arange(8).reshape(1, 8),
+        "choices": torch.zeros((2, 1, 8), dtype=torch.long),
+    }
+    for altered, message in [
+        ({"choices": torch.zeros((2, 8), dtype=torch.long)}, "shape"),
+        ({"choices": torch.zeros((2, 1, 7), dtype=torch.long)}, "shape"),
+        ({"choices": torch.full((2, 1, 8), 4)}, "out-of-range"),
+        ({"step": 2}, "wrong step"),
+    ]:
+        torch.save({**good, **altered}, path)
+        with pytest.raises(ValueError, match=message):
+            load_routing_snapshot(path, expected_step=3, n_experts=4)
+
+    with pytest.raises(ValueError, match="different probe tokens"):
+        snapshot_change_rates(good, {**good, "probe_tokens": good["probe_tokens"] + 1})
