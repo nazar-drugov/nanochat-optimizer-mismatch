@@ -328,11 +328,29 @@ def test_dense_and_moe_initialization_matches_for_shared_weights():
             )
 
 
-def test_full_attention_cost_estimates():
-    model = make_model()
+@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+def test_full_attention_cost_estimates(ffn_type):
+    model = make_model(ffn_type=ffn_type)
     config = model.config
     head_dim = config.n_embd // config.n_head
-    matmul_params = model.num_matmul_params()
+    # Count the projections used by one token directly from the architecture.
+    # MoE executes the router and one expert, regardless of how many are stored.
+    matmul_params = model.lm_head.weight.numel()
+    for block in model.transformer.h:
+        matmul_params += sum(
+            getattr(block.attn, name).weight.numel()
+            for name in ("c_q", "c_k", "c_v", "c_proj")
+        )
+        if ffn_type == "moe":
+            matmul_params += block.mlp.router.weight.numel()
+            matmul_params += sum(
+                getattr(block.mlp.experts[0], name).weight.numel()
+                for name in ("up", "gate", "down")
+            )
+        else:
+            matmul_params += block.mlp.c_fc.weight.numel()
+            matmul_params += block.mlp.c_proj.weight.numel()
+    assert model.num_matmul_params() == matmul_params
 
     expected_training = (
         6 * matmul_params
