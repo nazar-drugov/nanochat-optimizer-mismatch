@@ -410,12 +410,18 @@ class GPT(nn.Module):
 
     def num_matmul_params(self):
         """
-        The number of parameters that participate in matmuls with the token stream,
-        i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
-        matmul in this model goes through the Linear class, while non-matmul params
-        (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+        The number of active matmul parameters per token. Each contributes 2
+        FLOPs/param in the forward pass. All matmuls go through Linear; embeddings
+        and per-layer scalars do not contribute. Top-1 MoE uses one expert per
+        layer, so exclude the other experts while retaining shared projections.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        if self.config.ffn_type == "moe":
+            for block in self.transformer.h:
+                for expert in block.mlp.experts[1:]:
+                    matmul_params -= sum(
+                        m.weight.numel() for m in expert.modules() if isinstance(m, Linear)
+                    )
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
