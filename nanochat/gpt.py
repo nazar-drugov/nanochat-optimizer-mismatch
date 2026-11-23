@@ -795,9 +795,12 @@ class GPT(nn.Module):
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
             if aux_losses_list:
-                # Per-layer losses are averaged over MoE layers, then weighted.
-                balance_loss = torch.stack([a["balance"] for a in aux_losses_list]).mean()
-                z_loss = torch.stack([a["z"] for a in aux_losses_list]).mean()
+                # Per-layer losses are summed over MoE layers, then weighted, so every
+                # layer carries the full coefficient (Switch: "for each Switch layer, this
+                # auxiliary loss is added to the total model loss"; Ludziejewski et al.'s
+                # code sums over layers too). The logged "balance" and "z" are these sums.
+                balance_loss = torch.stack([a["balance"] for a in aux_losses_list]).sum()
+                z_loss = torch.stack([a["z"] for a in aux_losses_list]).sum()
                 balance_coef = self.config.balance_coef if self.config.balancer == "aux" else 0.0
                 loss = ce_loss
                 if balance_coef:

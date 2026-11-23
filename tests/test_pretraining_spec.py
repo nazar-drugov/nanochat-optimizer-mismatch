@@ -62,8 +62,11 @@ def test_e1_with_default_balancer_only_adds_constant_and_z_terms():
     moe = make_model(ffn_type="moe", n_experts=1)  # aux 0.01, z 0.001 defaults
     idx, targets = batch(1)
     loss, metrics, _ = moe(idx, targets, return_metrics=True)
-    torch.testing.assert_close(metrics["balance"], torch.tensor(1.0))  # E * f * P = 1 * 1 * 1
-    torch.testing.assert_close(loss.detach(), metrics["ce"] + 0.01 * 1.0 + 0.001 * metrics["z"])
+    # Per layer E * f * P = 1 * 1 * 1; the layers are summed, not averaged.
+    n_moe_layers = len(moe.moe_layer_indices)
+    assert n_moe_layers > 1
+    torch.testing.assert_close(metrics["balance"], torch.tensor(float(n_moe_layers)))
+    torch.testing.assert_close(loss.detach(), metrics["ce"] + 0.01 * n_moe_layers + 0.001 * metrics["z"])
 
 
 # -----------------------------------------------------------------------------
