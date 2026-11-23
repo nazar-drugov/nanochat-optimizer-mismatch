@@ -148,6 +148,82 @@ def checkpoint_tokenizer_name(meta_data):
     return meta_data.get("tokenizer") or meta_data.get("user_config", {}).get("tokenizer") or "nanochat"
 
 
+def train_shard_inventory(train_paths):
+    """Name and size in bytes of every training shard, in loader order.
+
+    The data loader saves its position as "file number, row group", so the
+    same files in the same order are needed to continue from that position.
+    """
+    return [{"name": os.path.basename(path), "size": os.path.getsize(path)} for path in train_paths]
+
+
+def validate_checkpoint_training_data(meta_data, train_shards):
+    """Refuse to resume if the training shards differ from the original run's.
+
+    Compares file names, order and sizes. A same-size edit is not caught here:
+    runs/pretrain_study.sh hashes every shard against the data manifest before
+    each start and resume. Checkpoints from before this check have no inventory,
+    so they only produce a warning.
+    """
+    saved = meta_data.get("train_shards")
+    if saved is None:
+        warnings.warn(
+            "Checkpoint metadata does not contain train_shards; cannot confirm the training "
+            "data is unchanged. Continuing for compatibility with older checkpoints.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    saved_sizes = {shard["name"]: shard["size"] for shard in saved}
+    current_sizes = {shard["name"]: shard["size"] for shard in train_shards}
+    missing = sorted(set(saved_sizes) - set(current_sizes))
+    extra = sorted(set(current_sizes) - set(saved_sizes))
+    changed = sorted(name for name in saved_sizes.keys() & current_sizes.keys()
+                     if saved_sizes[name] != current_sizes[name])
+    reordered = not (missing or extra or changed) and [s["name"] for s in saved] != [s["name"] for s in train_shards]
+    if not (missing or extra or changed or reordered):
+        return
+
+    def listed(names):
+        return ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+
+    problems = []
+    if missing:
+        problems.append(f"missing shards ({len(missing)}): {listed(missing)}")
+    if extra:
+        problems.append(f"extra shards ({len(extra)}): {listed(extra)}")
+    if changed:
+        problems.append(f"shards with a different size ({len(changed)}): {listed(changed)}")
+    if reordered:
+        problems.append("same shards, but in a different order")
+    raise ValueError("Training data differs from the checkpoint; refusing to resume. " + "; ".join(problems))
+
+
+def validate_checkpoint_tokenizer(meta_data, tokenizer_name, tokenizer_identity=None):
+    """Refuse to resume with a different tokenizer than the original run.
+
+    Compares the tokenizer name, and the SHA-256 of every tokenizer file the
+    checkpoint recorded. Files added to the tokenizer directory since are fine.
+    Checkpoints from before the identity was recorded are checked by name only.
+    """
+    saved_name = checkpoint_tokenizer_name(meta_data)
+    if saved_name != tokenizer_name:
+        raise ValueError(
+            f"Checkpoint was trained with --tokenizer={saved_name} but --tokenizer={tokenizer_name} was requested. "
+            f"Resume with --tokenizer={saved_name}."
+        )
+    saved_files = (meta_data.get("tokenizer_identity") or {}).get("files")
+    if not saved_files or tokenizer_identity is None:
+        return
+    current_files = tokenizer_identity.get("files") or {}
+    differing = sorted(name for name, digest in saved_files.items() if current_files.get(name) != digest)
+    if differing:
+        raise ValueError(
+            f"Tokenizer files differ from the checkpoint's for tokenizer '{tokenizer_name}': "
+            f"{', '.join(differing)}; refusing to resume."
+        )
+
+
 def patch_missing_expert_bias(model, model_data):
     """MoE checkpoints written before the bias balancer existed have no
     expert_bias buffers. Zero bias is exactly the old selection rule."""

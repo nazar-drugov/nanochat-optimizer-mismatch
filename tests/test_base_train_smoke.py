@@ -12,6 +12,7 @@ python -m pytest tests/test_base_train_smoke.py -v      (marked slow)
 """
 
 import json
+import hashlib
 import os
 import random
 import shutil
@@ -49,14 +50,18 @@ def env(tmp_path_factory):
     return {"base": base, "data": data, "environ": environ}
 
 
-def run_base_train(env, run, *extra):
-    cmd = [sys.executable, "-m", "scripts.base_train", "--device-type", "cpu", "--data-dir", str(env["data"]),
+def base_train_cmd(env, run, *extra):
+    return [sys.executable, "-m", "scripts.base_train", "--device-type", "cpu", "--data-dir", str(env["data"]),
            "--depth", "2", "--aspect-ratio", "32", "--head-dim", "32", "--max-seq-len", "64",
            "--device-batch-size", "2", "--total-batch-size", str(BATCH), "--train-tokens", str(TRAIN_TOKENS),
            "--warmup-steps", "1", "--warmdown-ratio", "0.25", "--eval-every", "4", "--eval-tokens", "256",
            "--core-metric-every", "-1", "--sample-every", "-1", "--save-every", "4",
            "--ffn-type", "moe", "--n-experts", "4", "--run", run, "--train-stats-every", "1",
            "--train-stats-jsonl", str(env["base"] / f"{run}.jsonl"), *extra]
+
+
+def run_base_train(env, run, *extra):
+    cmd = base_train_cmd(env, run, *extra)
     result = subprocess.run(cmd, cwd=REPO_ROOT, env=env["environ"], capture_output=True, text=True, timeout=900)
     assert result.returncode == 0, f"base_train failed:\n{result.stdout[-3000:]}\n{result.stderr[-3000:]}"
     return env["base"] / "base_checkpoints" / run
@@ -119,3 +124,97 @@ def test_schedule_that_does_not_fit_the_run_is_rejected(env):
            "--total-batch-size", str(BATCH), "--train-tokens", str(TRAIN_TOKENS)]  # default 130M-token warmup
     result = subprocess.run(cmd, cwd=REPO_ROOT, env=env["environ"], capture_output=True, text=True, timeout=300)
     assert result.returncode != 0 and "exceeds the run" in result.stderr
+
+
+def test_explicit_d0_is_read_and_recorded(env, tmp_path):
+    # The training directory's validation shard is deliberately invalid. A
+    # successful validation therefore proves that --val-data-dir was used.
+    train_dir = tmp_path / "training"
+    train_dir.mkdir()
+    for shard in (0, 1):
+        shutil.copy2(env["data"] / f"shard_{shard:05d}.parquet", train_dir)
+    (train_dir / "shard_00002.parquet").write_bytes(b"invalid parquet")
+    d0_dir = tmp_path / "heldout"
+    d0_dir.mkdir()
+    d0_file = d0_dir / "d0.parquet"
+    pq.write_table(pa.table({"text": ["A held out document with enough text for evaluation. " * 8] * 400}),
+                   d0_file, row_group_size=50)
+    local_env = {**env, "data": train_dir}
+    ckpt = run_base_train(local_env, "smoke-d0", "--val-data-dir", str(d0_dir),
+                          "--ffn-type", "swiglu", "--train-tokens", "256", "--save-every", "-1")
+    record = json.loads((ckpt / "config.json").read_text())
+    expected_hash = hashlib.sha256(d0_file.read_bytes()).hexdigest()
+    assert record["data"]["val_data_file"] == str(d0_file)
+    assert record["data"]["val_data_sha256"] == expected_hash
+    checkpoint = meta(ckpt, 1)
+    assert checkpoint["val_data_sha256"] == expected_hash
+    assert 0 < checkpoint["val_bpb"] < float("inf")
+
+    # A changed D0 must not silently replace the validation set on resume.
+    pq.write_table(pa.table({"text": ["Changed held out document. " * 8] * 400}),
+                   d0_file, row_group_size=50)
+    cmd = [sys.executable, "-m", "scripts.base_train", "--device-type=cpu",
+           f"--data-dir={train_dir}", f"--val-data-dir={d0_dir}", "--run=smoke-d0",
+           "--depth=2", "--aspect-ratio=32", "--head-dim=32", "--ffn-type=swiglu",
+           "--max-seq-len=64", "--device-batch-size=2", "--total-batch-size=256",
+           "--train-tokens=256", "--warmup-steps=1", "--warmdown-ratio=0.25",
+           "--eval-tokens=256", "--core-metric-every=-1", "--sample-every=-1",
+           "--resume-from-step=1"]
+    result = subprocess.run(cmd, cwd=REPO_ROOT, env=env["environ"],
+                            capture_output=True, text=True, timeout=300)
+    assert result.returncode != 0
+    assert "Validation file or SHA-256 differs" in result.stderr
+
+
+def test_resume_rejects_changed_training_data_and_tokenizer(env, tmp_path):
+    # Use a private copy of the shards so changing them cannot affect other tests.
+    data = tmp_path / "data"
+    shutil.copytree(env["data"], data)
+    local_env = {**env, "data": data}
+    ckpt = run_base_train(local_env, "smoke-guard")
+
+    # The checkpoint and the run record list each training shard (not the validation shard).
+    expected = [{"name": f"shard_{i:05d}.parquet", "size": (data / f"shard_{i:05d}.parquet").stat().st_size}
+                for i in (0, 1)]
+    assert meta(ckpt, 4)["train_shards"] == expected
+    assert json.loads((ckpt / "config.json").read_text())["data"]["train_shards"] == expected
+    tokenizer_files = meta(ckpt, 4)["tokenizer_identity"]["files"]
+    assert tokenizer_files and all(len(digest) == 64 for digest in tokenizer_files.values())
+
+    def resume_error():
+        cmd = base_train_cmd(local_env, "smoke-guard", "--resume-from-step", "4")
+        result = subprocess.run(cmd, cwd=REPO_ROOT, env=env["environ"], capture_output=True, text=True, timeout=900)
+        assert result.returncode != 0, "resume unexpectedly succeeded"
+        return result.stderr
+
+    # An extra training shard (it sorts between the two real ones; the validation shard stays last).
+    extra = data / "shard_00001b.parquet"
+    shutil.copy2(data / "shard_00001.parquet", extra)
+    assert "extra shards (1): shard_00001b.parquet" in resume_error()
+    extra.unlink()
+
+    # A training shard that was changed. Its size differs from the original's.
+    original = (data / "shard_00001.parquet").read_bytes()
+    pq.write_table(pa.table({"text": ["A shard that was replaced after the checkpoint. " * 4] * 100}),
+                   data / "shard_00001.parquet", row_group_size=50)
+    assert "different size (1): shard_00001.parquet" in resume_error()
+
+    # A missing training shard.
+    (data / "shard_00001.parquet").unlink()
+    assert "missing shards (1): shard_00001.parquet" in resume_error()
+    (data / "shard_00001.parquet").write_bytes(original)
+
+    # A different tokenizer name, and a changed tokenizer file, in the checkpoint's metadata.
+    meta_path = ckpt / "meta_000004.json"
+    original_meta = meta_path.read_text()
+    saved = json.loads(original_meta)
+    saved["tokenizer"] = "nanochat"
+    meta_path.write_text(json.dumps(saved))
+    assert "trained with --tokenizer=nanochat but --tokenizer=gpt2" in resume_error()
+
+    saved = json.loads(original_meta)
+    changed_file = sorted(saved["tokenizer_identity"]["files"])[0]
+    saved["tokenizer_identity"]["files"][changed_file] = "0" * 64
+    meta_path.write_text(json.dumps(saved))
+    assert f"Tokenizer files differ from the checkpoint's for tokenizer 'gpt2': {changed_file}" in resume_error()
+    meta_path.write_text(original_meta)

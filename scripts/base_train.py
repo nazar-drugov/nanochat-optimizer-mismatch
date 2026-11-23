@@ -20,6 +20,7 @@ import gc
 import json
 import time
 import argparse
+import hashlib
 from dataclasses import asdict
 
 import wandb
@@ -30,14 +31,17 @@ from nanochat.gpt import GPT, make_gpt_config
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes, tokenizer_dir_for, TOKENIZERS
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name, patch_missing_expert_bias
+from nanochat.checkpoint_manager import (
+    save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name,
+    patch_missing_expert_bias, train_shard_inventory, validate_checkpoint_training_data, validate_checkpoint_tokenizer,
+)
 from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_routing_snapshot, snapshot_change_rates
 from nanochat.training_stats import accumulate_router_stats, expert_gradient_squared_norms, add_router_log_fields, write_train_stats_jsonl, update_batch_fingerprint
 from nanochat.train_config import (
     add_moe_args, add_optimizer_args, resolve_optimizer_args, resolve_moe_args,
     muon_momentum_at, wsd_lr_multiplier, write_run_record, tokenizer_identity,
 )
-from nanochat.dataset import resolve_data_dir
+from nanochat.dataset import resolve_data_dir, list_parquet_files, list_split_files
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -68,6 +72,8 @@ parser.add_argument("--tokenizer", choices=TOKENIZERS, default="gpt2",
                     help="gpt2: GPT-2 BPE via tiktoken (team decision 2026-11-23; matches Ludziejewski et al.); nanochat: <base_dir>/tokenizer")
 parser.add_argument("--dataset", type=str, default=None, help="pretraining dataset name (default: the registry default, FineWeb-Edu-100B)")
 parser.add_argument("--data-dir", type=str, default=None, help="directory of nanochat-format parquet shards (overrides --dataset)")
+parser.add_argument("--val-data-dir", type=str, default=None,
+                    help="directory containing one validation parquet (e.g. D0); default: last shard in --data-dir")
 # Training horizon
 parser.add_argument("--train-tokens", type=int, required=True, help="total number of training tokens")
 # Optimization
@@ -114,6 +120,24 @@ if args.warmup_steps is None:
 optimizer_kwargs = resolve_optimizer_args(args)
 moe_config_kwargs = resolve_moe_args(args)
 data_dir = resolve_data_dir(args.dataset, args.data_dir)
+val_data_dir = resolve_data_dir(data_dir=args.val_data_dir) if args.val_data_dir else data_dir
+try:
+    val_files = list_parquet_files(val_data_dir)
+except FileNotFoundError as exc:
+    parser.error(str(exc))
+if not val_files or (args.val_data_dir and len(val_files) != 1):
+    parser.error(f"Validation directory {val_data_dir} must contain "
+                 + ("exactly one" if args.val_data_dir else "at least one") + " parquet file")
+val_data_file = val_files[-1]
+val_sha256 = hashlib.sha256()
+with open(val_data_file, "rb") as val_file:
+    for chunk in iter(lambda: val_file.read(1024 * 1024), b""):
+        val_sha256.update(chunk)
+val_data_sha256 = val_sha256.hexdigest()
+# Names and sizes of the training shards, saved in checkpoints so a resumed run
+# can detect added, removed or changed shards (the saved data position is only
+# "file number, row group" and is meaningless for different files).
+train_shards = train_shard_inventory(list_split_files("train", data_dir))
 
 total_batch_size = args.total_batch_size
 total_tokens = args.train_tokens
@@ -150,7 +174,12 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     print0(f"GPU: {gpu_device_name}")
+eval_batch_tokens = args.device_batch_size * args.max_seq_len * ddp_world_size
+if args.eval_every > 0 and (args.eval_tokens < eval_batch_tokens or args.eval_tokens % eval_batch_tokens):
+    parser.error(f"--eval-tokens must be a positive multiple of {eval_batch_tokens} "
+                 "(device batch size × sequence length × world size)")
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+print0(f"Validation data: {val_data_file} (SHA-256 {val_data_sha256})")
 
 # wandb logging init
 wandb_run = (
@@ -183,6 +212,7 @@ tokenizer = get_tokenizer(args.tokenizer)
 token_bytes = get_token_bytes(device=device, name=args.tokenizer)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
+tokenizer_id = tokenizer_identity(tokenizer_dir_for(args.tokenizer))  # file SHA-256s, saved in checkpoints and checked on resume
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -221,6 +251,13 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     validate_checkpoint_seed(meta_data, args.seed)
+    validate_checkpoint_training_data(meta_data, train_shards)
+    validate_checkpoint_tokenizer(meta_data, args.tokenizer, tokenizer_id)
+    saved_val_sha256 = meta_data.get("val_data_sha256")
+    if saved_val_sha256 is None and args.val_data_dir:
+        raise ValueError("Checkpoint has no validation SHA-256; refusing to resume with --val-data-dir")
+    if saved_val_sha256 is not None and (saved_val_sha256 != val_data_sha256 or meta_data.get("val_data_file") != val_data_file):
+        raise ValueError("Validation file or SHA-256 differs from the checkpoint; refusing to resume")
     patch_missing_expert_bias(model, model_data)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -253,8 +290,10 @@ if master_process:
         os.path.join(checkpoint_dir, record_name),
         args=args, model=orig_model, optimizer=optimizer,
         device_type=device_type, world_size=ddp_world_size, compute_dtype=COMPUTE_DTYPE,
-        data={"train_data_dir": data_dir, "tokenizer_name": args.tokenizer,
-              "tokenizer": tokenizer_identity(tokenizer_dir_for(args.tokenizer))},
+        data={"train_data_dir": data_dir, "train_shards": train_shards, "val_data_dir": val_data_dir,
+              "val_data_file": val_data_file, "val_data_sha256": val_data_sha256,
+              "tokenizer_name": args.tokenizer,
+              "tokenizer": tokenizer_id},
         extra={"experiment_name": experiment_name, "stage": "pretrain", "num_iterations": num_iterations},
     )
 
@@ -268,7 +307,7 @@ if scaler is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=data_dir)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=data_dir)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=val_data_dir)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # Learning rate schedule (linear warmup, constant, linear decay over the last warmdown_ratio)
@@ -413,7 +452,12 @@ while True:
                 "total_batch_size": total_batch_size,
                 "train_tokens": total_tokens,
                 "tokenizer": args.tokenizer,
+                "tokenizer_identity": tokenizer_id,
                 "data_dir": data_dir,
+                "train_shards": train_shards,
+                "val_data_dir": val_data_dir,
+                "val_data_file": val_data_file,
+                "val_data_sha256": val_data_sha256,
                 "parameter_counts": parameter_counts,
                 "cumulative_expert_counts": None if cumulative_expert_counts is None else cumulative_expert_counts.cpu().tolist(),
                 "data_fingerprints": data_fingerprints,  # per rank, over all batches trained so far

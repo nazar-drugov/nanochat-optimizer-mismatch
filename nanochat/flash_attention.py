@@ -13,6 +13,7 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
 
@@ -22,17 +23,20 @@ import torch.nn.functional as F
 # =============================================================================
 def _load_flash_attention_3():
     """Try to load Flash Attention 3."""
+    if os.environ.get("NANOCHAT_ATTENTION_BACKEND", "").lower() == "sdpa":
+        return None
     if not torch.cuda.is_available():
         return None
     try:
-        major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
-        # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
-        import os
+        capability = torch.cuda.get_device_capability()
+        # The downloaded FA3 binaries target these architectures. has_kernel()
+        # reports package availability, not whether its CUDA image runs here.
+        if capability not in {(8, 0), (8, 6), (8, 9), (9, 0)}:
+            return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
         # The varunneal kernel obtains better results for H100/Hopper
-        if major == 9:
+        if capability[0] == 9:
             hf_kernel = "varunneal/flash-attention-3"
             return get_kernel(hf_kernel).flash_attn_interface
         else:

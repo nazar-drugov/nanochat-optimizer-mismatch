@@ -9,9 +9,22 @@ Adapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+from functools import wraps
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+
+def _compile_cuda_only(fn):
+    """Compile optimizer updates on CUDA; use the same math eagerly elsewhere."""
+    compiled = torch.compile(fn, dynamic=False, fullgraph=True)
+
+    @wraps(fn)
+    def dispatch(*args, **kwargs):
+        return compiled(*args, **kwargs) if args[0].is_cuda else fn(*args, **kwargs)
+
+    return dispatch
 
 # -----------------------------------------------------------------------------
 """
@@ -19,7 +32,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_compile_cuda_only
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -94,7 +107,7 @@ def muon_lr_scale(variant: str, shape) -> float:
     raise ValueError(f"Unknown Muon variant: {variant!r} (expected one of {MUON_VARIANTS})")
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_compile_cuda_only
 def muon_step_fused(
     stacked_grads: Tensor,   # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,  # (12, 768, 3072) - stacked parameters

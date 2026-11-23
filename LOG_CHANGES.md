@@ -230,3 +230,117 @@ Decisions and the learning-rate sweep protocol are in `PRETRAINING_PROTOCOL.md`.
 - **Tests:** 200 passed and 18 CUDA-only tests skipped (`uv run --group dev python -m pytest -q`). They include spec §8 tests 1–7, optimizer parity with `torch.optim.Muon`, a two-rank gloo test, and end-to-end CPU runs of `base_train.py`. Those runs show that AdamW and Muon cells see identical data and that resuming is bit-exact. The only failure is the known macOS `test_execution.py::test_memory_limit`.
 - **Not yet verified:** CUDA throughput, the two-GPU NCCL path and the CUDA-only optimizer tests. They need the cluster.
 - **Parked:** the fine-tuning data scripts, the LM fine-tuning script and the evaluation pipeline. `chat_sft.py` and `base_eval.py` were not updated for GPT-2 checkpoints.
+
+## Data preparation and a launcher for the cluster (2026-11-23)
+
+This entry covers the work done after the "Pretraining readiness" commit (`0ed4cd4`). The main goal was to get the training data ready on the cluster and to make sure every training run measures its results on the same, unchanging held-out data. Some terms used below:
+
+- **D0** is a small held-out set of text (about 2 million tokens) that training never sees. We use it to measure how good each model is. "Bits per byte" (bpb) is the score; lower is better.
+- **Shards** are the pieces the training text is split into. Each one is a `.parquet` file of about 94 MB.
+- **Pool** and **scratch** are two storage areas on the cluster. Pool is for keeping big datasets between jobs. Scratch is fast storage for files that running jobs read and write. Neither is backed up.
+- **SHA-256** is a short "fingerprint" of a file. If even one byte of the file changes, the fingerprint changes, so we can tell when a file was modified.
+
+### The data is now downloaded and D0 is built
+
+- Downloaded 100 FineWeb-Edu training shards (`shard_00000` to `shard_00099`) plus the validation shard (`shard_01822`). They total about 9.5 GB. One copy is in pool and one is in scratch.
+- The GPT-2 tokenizer is cached in `~/.cache/nanochat/tiktoken_cache/`, so jobs without internet can still use it.
+- Built D0 from the validation shard. D0 has 1,881 documents and 2,000,142 GPT-2 tokens.
+- While building D0, every candidate document was compared with all 100 training shards to find near-copies. 136 candidates were found to be near-copies of training text and were thrown out. This keeps D0 fair: the model is not tested on text it has already seen. The full list is saved in `d0_report.json`.
+- Both D0 files live in `/home/ndrugov/orcd/scratch/public/nanochat-optimizer-mismatch/heldout/fineweb-edu-100b/`.
+
+### A saved "snapshot" of the data (`data_manifests/fineweb_edu_100_v1/`)
+
+This folder is a written record of exactly which files we used. The launcher checks the files against it before every training start and resume (see "A single script" below), and anyone can repeat the check by hand. It contains:
+
+- `shards.sha256`: the fingerprint of each of the 101 shard files.
+- `shard_sizes.tsv`: the size in bytes of each shard file.
+- `heldout.sha256`: the fingerprints of `d0.parquet` and `d0_report.json`.
+- `README.md`: explains what the snapshot covers and gives the exact commands for checking the files. It also says that if the shards ever change, a new D0 and a new snapshot version must be made. The fingerprints detect changes, but they do not stop anyone from making them.
+
+### Training can now be told to use D0 (`scripts/base_train.py`)
+
+- Added a `--val-data-dir` option. It points to a folder that holds exactly one parquet file, and training uses that file for its validation scores. Without the option, training works as before and uses the last shard of the training folder.
+- The training script reads the validation file, computes its SHA-256, prints it, and saves it (with the file path and folder) in `config.json`, in each checkpoint's metadata, and in the run record.
+- When a run is resumed from a checkpoint, the script compares the current validation file with the one saved in the checkpoint. If the file or its fingerprint differs, it stops with a clear error instead of silently scoring against different data. It also refuses to resume with `--val-data-dir` if the checkpoint has no saved fingerprint.
+- Added a check on `--eval-tokens`. It must now be a multiple of (per-GPU batch size x sequence length x number of GPUs). Before, a badly chosen value could silently cause fewer tokens to be scored than requested. The study's value, 1,048,576, passes this check.
+
+### A single script to prepare data and start runs (`runs/pretrain_study.sh`)
+
+This is a new script with several modes. The first lines of the file explain how to use it:
+
+- `paths` prints where everything lives.
+- `download` fetches the shards into pool. It needs internet.
+- `stage` copies the shards from pool to scratch.
+- `heldout` builds D0 (this is heavy on the CPU).
+- `dry-run` prints the full training command without starting anything, so you can check it first.
+- `train` starts a training run on the GPUs.
+
+Download, stage and heldout are one-time setup steps. `train` never downloads anything. It always reads the scratch copy, and it always passes D0 to the training script. Safety checks in `train`:
+
+- It stops if the shards or D0 are missing.
+- It checks D0 and its report against the saved fingerprints and stops if they differ.
+- It checks the training shards in two steps, on every start and every resume. First, the list of `.parquet` files in the data folder must match the manifest exactly. The training code treats every file except the last as training data, so one stray extra file would silently become training data, and a missing file would silently shorten it. Second, every shard's SHA-256 must match `shards.sha256`, which catches an edited file even if its size did not change. On this node hashing all 100 shards took about 26 seconds from a cold start and about 13 seconds when the files were already cached. If anything differs, the script prints which file and stops before any GPU time is used. `dry-run` does not do these checks.
+- The shard check follows symbolic links, as the Python data loader does. (My first version did not, and wrongly reported all 101 shards as missing when the data folder was a symbolic link. A test now covers this.)
+- It refuses to reuse a run name that already has results, unless you are resuming a run.
+- You cannot override `--run`, `--data-dir`, `--val-data-dir` or `--train-stats-jsonl` from the command line, because the script sets them. This stops two runs from accidentally sharing output or using different data.
+- It insists on an explicit `--train-tokens` value, and sets `--eval-tokens=1048576` unless you pass your own.
+- The header also describes a short one-step test for the two-GPU node. That test confirms the cluster really reads D0 before the learning-rate sweep starts. **This test has not been run yet.**
+
+### A map of where files go (`STORAGE_PATHS.md`)
+
+New document listing every location: the code and virtual environment in home, the dataset in pool and scratch, D0, checkpoints, logs, and W&B files, plus where SFT, RL and evaluation files go. It says which folders are backed up (home) and which are not (pool, scratch), so final results get copied somewhere safe. It also explains that the paths in it are defaults and patterns, not proof that those files exist.
+
+### Documentation updates
+
+- `PRETRAINING_PROTOCOL.md`: added an explanation of the proposed 1B- and 2B-token "decay branch" checks. These runs are a proposed extra check and are not part of the chosen 3B-token budget. Also added the pool/scratch workflow and changed the example command to use the new launcher. The sections "Batch size" and "Auxiliary loss" are currently empty headings, and "LR Schedule" is one short sentence. Longer drafts of these (the batch-size reasoning and a table of balance-loss values from papers) were written and then removed from the file, so these sections still need their final text.
+- `CHANGES_PLAN.md`: rewritten as an ordered to-do list: confirm the settings, prove the new code works on the cluster, run the learning-rate sweep, run the final comparisons, and do the fine-tuning study. The "prepare the data" stage was removed because that work is done. The stage numbers were not renumbered, so they go 1, 2, 4, 5, 6. The two-GPU check that training reads D0 is still open and is listed under "Settle the protocol before spending GPU time" and in the "Still to do" list below.
+- `README.md`: rewritten to describe this study instead of the original nanochat "GPT-2 speedrun" project. It now points to the new launcher and the storage map.
+- `dev/LEADERBOARD.md`: added notes saying that its commands are historical and are not the instructions for this study.
+
+### Small fixes so the code runs on the cluster
+
+- `nanochat/flash_attention.py`: the code now only tries to load the Flash Attention 3 add-on on GPUs it was built for (compute capability 8.0, 8.6, 8.9 and 9.0). Other GPUs use PyTorch's built-in attention instead. Setting `NANOCHAT_ATTENTION_BACKEND=sdpa` forces the built-in attention on any GPU.
+- `nanochat/optim.py`: the optimizer update functions are now only compiled with `torch.compile` when their data is on a GPU. On a CPU they run the same math without compiling. This is what lets the tests run on CPU.
+- `pyproject.toml` and `uv.lock`: the `gpu` install option now also requires `setuptools`, as the `cpu` option already did.
+- `nanochat/tokenizer.py`: only a comment changed. It no longer points to `tok_train.py`, which was deleted (see below).
+
+### Tests added
+
+- `tests/test_attention_fallback.py`: one test checks that choosing the built-in attention skips loading Flash Attention 3. Another checks that an unsupported GPU (compute capability 10.0) falls back to the built-in attention.
+- `tests/test_base_train_smoke.py`: one new end-to-end test trains a tiny model on CPU. Its training folder contains a deliberately broken validation shard, so the run can only succeed if D0 is really used. The test then checks that the D0 path and fingerprint were saved in `config.json` and in the checkpoint. Finally it changes D0 and checks that resuming fails with the "Validation file or SHA-256 differs" error.
+- `tests/test_checkpoint_manager.py`: 16 new fast tests for the resume checks. They cover identical shards, a moved folder, a missing shard, an extra shard, a changed size, a different order, a long list of problems, an old checkpoint without a shard list, and the tokenizer rules (same tokenizer, different name, old checkpoint without a name, changed file, missing file, added file, name-only check).
+- `tests/test_base_train_smoke.py`: one more end-to-end test. It trains a tiny model, checks that the shard list and tokenizer fingerprints were saved in the checkpoint and in `config.json`, and then tries to resume after: adding a training shard, replacing a shard, removing a shard, changing the tokenizer name in the checkpoint, and changing a tokenizer file fingerprint in the checkpoint. Every one must fail with the right message. (The earlier resume test still passes, so a normal resume gets through the new checks.)
+- `tests/test_pretrain_study_launcher.py` (new file, 6 tests, under a second): runs the launcher's `train` mode on tiny fake shards with a fake manifest. It stops before any training would start. It checks that matching data passes, that a shard edited without changing its size is rejected, that a missing shard and an extra shard are rejected, that a data folder that is a symbolic link works, and that `dry-run` skips the check.
+- **Full test run** (`python -m pytest tests`, on a CPU-only compute node, about 4 minutes): **227 passed, 18 skipped, 0 failed**. The previous entry reported 200 passed and 18 skipped, so these are the 27 new tests. The 18 skipped tests are the same CUDA-only tests as before; this node has no working GPU, so they still have not been run. The macOS-only memory-limit test that failed before passes on this Linux node.
+- I also ran the launcher's data check once against the real 100 shards and the real manifest (using a temporary output folder, so nothing real was written). It passed in about 13 seconds.
+
+### Files removed
+
+These came from the original nanochat project and are not needed for this study, so they were deleted. Anyone who wants them can find them in earlier commits.
+
+- Original launch scripts: `runs/speedrun.sh`, `runs/miniseries.sh`, `runs/scaling_laws.sh` and `runs/runcpu.sh`.
+- Chat and inference tools: `scripts/chat_cli.py`, `scripts/chat_rl.py` and `scripts/infer_bench.py`.
+- Tokenizer tools: `scripts/tok_train.py` and `scripts/tok_eval.py`. The study uses the existing GPT-2 tokenizer, so nothing here trains a new one. The `--tokenizer nanochat` option still exists but now needs a tokenizer trained elsewhere or from an earlier commit.
+
+### Resumed runs now check the training data and the tokenizer
+
+The D0 check above only protected the validation data. When a run was resumed, nothing confirmed that the **training** data was the same as when the checkpoint was saved. The checkpoint stores the reading position as just "file N, row group M", so if shards had been added, removed or edited in between, the run would have carried on from that position in different data without any error. The tokenizer name saved in the checkpoint was not compared with `--tokenizer` either. This is now fixed in two layers:
+
+- **Inside the training code (`scripts/base_train.py`, `nanochat/checkpoint_manager.py`):**
+  - Every checkpoint now saves the list of training shards with their sizes (`train_shards`, in the order the loader reads them). The same list is written to `config.json`.
+  - On resume, the current list is compared with the saved one. The run stops with a clear message that names the problem and the files: "missing shards", "extra shards", "shards with a different size", or "same shards, but in a different order". Long lists are shortened to five names.
+  - Only names, order and sizes are compared, not the folder path. So moving the same data (for example from pool to scratch) is allowed, but changing the data is not.
+  - Every checkpoint now also saves the SHA-256 of each tokenizer file (`tokenizer_identity`). On resume, the tokenizer name must match, and every saved tokenizer file must still exist with the same fingerprint. Extra files added to the tokenizer folder later are allowed, because the GPT-2 cache folder may legitimately gain other tokenizers.
+  - Checkpoints made before this change have no saved shard list, so they only produce a warning and continue (the same way old checkpoints without a seed are handled). Old checkpoints without a saved tokenizer fingerprint are checked by name only.
+- **Inside the launcher (`runs/pretrain_study.sh train`):** the byte-level check against the manifest described above. The Python check only sees sizes, so it cannot catch a file edited without changing its size. The launcher check can. Resuming through the launcher therefore confirms that the data matches the manifest, and the Python check confirms it matches this particular checkpoint.
+
+The running data fingerprint saved in checkpoints is unchanged. It is still only for comparing runs afterwards (for example, to show that an AdamW run and a Muon run saw the same examples in the same order). It was never meant to detect a changed shard.
+
+One limit remains: if you start a run with the training code directly (not through the launcher), the byte-level hash check does not happen. Only the size comparison on resume does. Use the launcher for real runs.
+
+### Still to do
+
+- Run the one-step, two-GPU check that training reads D0 (described at the top of `runs/pretrain_study.sh`).
+- Run the CUDA-only tests and the two-GPU training checks from `CHANGES_PLAN.md`.
+- Confirm the settings listed as "Defaults that still need team confirmation" in `PRETRAINING_PROTOCOL.md`.
+- Fix the reference to `EXPERIMENT_SPEC.md`, which is not in this checkout.

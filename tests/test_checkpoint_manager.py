@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from nanochat.checkpoint_manager import make_base_experiment_name, validate_checkpoint_seed, validate_experiment_name
+from nanochat.checkpoint_manager import (
+    make_base_experiment_name, train_shard_inventory, validate_checkpoint_seed,
+    validate_checkpoint_tokenizer, validate_checkpoint_training_data, validate_experiment_name,
+)
 
 
 def make_experiment_args(**overrides):
@@ -76,6 +79,100 @@ def test_checkpoint_seed_validation_rejects_mismatched_seed():
 def test_checkpoint_seed_validation_warns_when_seed_is_missing():
     with pytest.warns(RuntimeWarning, match=r"does not contain user_config.seed"):
         validate_checkpoint_seed({"user_config": {}}, seed=42)
+
+
+SHARDS = [{"name": "shard_00000.parquet", "size": 100}, {"name": "shard_00001.parquet", "size": 200}]
+
+
+def test_train_shard_inventory_records_names_and_sizes_in_order(tmp_path):
+    paths = []
+    for name, size in (("shard_00000.parquet", 3), ("shard_00001.parquet", 5)):
+        path = tmp_path / name
+        path.write_bytes(b"x" * size)
+        paths.append(str(path))
+    assert train_shard_inventory(paths) == [{"name": "shard_00000.parquet", "size": 3},
+                                            {"name": "shard_00001.parquet", "size": 5}]
+
+
+def test_training_data_validation_accepts_identical_shards():
+    validate_checkpoint_training_data({"train_shards": SHARDS}, [dict(shard) for shard in SHARDS])
+
+
+def test_training_data_validation_accepts_the_same_data_in_another_directory():
+    # Only names, order and sizes matter, so moving the data (pool to scratch) is fine.
+    validate_checkpoint_training_data({"train_shards": SHARDS, "data_dir": "/pool/data"}, SHARDS)
+
+
+def test_training_data_validation_rejects_a_missing_shard():
+    with pytest.raises(ValueError, match=r"missing shards \(1\): shard_00001.parquet"):
+        validate_checkpoint_training_data({"train_shards": SHARDS}, SHARDS[:1])
+
+
+def test_training_data_validation_rejects_an_extra_shard():
+    extra = SHARDS + [{"name": "shard_00002.parquet", "size": 300}]
+    with pytest.raises(ValueError, match=r"extra shards \(1\): shard_00002.parquet"):
+        validate_checkpoint_training_data({"train_shards": SHARDS}, extra)
+
+
+def test_training_data_validation_rejects_a_shard_with_a_different_size():
+    changed = [SHARDS[0], {"name": "shard_00001.parquet", "size": 201}]
+    with pytest.raises(ValueError, match=r"different size \(1\): shard_00001.parquet"):
+        validate_checkpoint_training_data({"train_shards": SHARDS}, changed)
+
+
+def test_training_data_validation_rejects_reordered_shards():
+    with pytest.raises(ValueError, match="different order"):
+        validate_checkpoint_training_data({"train_shards": SHARDS}, SHARDS[::-1])
+
+
+def test_training_data_validation_shortens_long_lists_of_problems():
+    saved = [{"name": f"shard_{i:05d}.parquet", "size": 1} for i in range(8)]
+    with pytest.raises(ValueError, match=r"missing shards \(8\): .* and 3 more"):
+        validate_checkpoint_training_data({"train_shards": saved}, [])
+
+
+def test_training_data_validation_warns_for_checkpoints_without_an_inventory():
+    with pytest.warns(RuntimeWarning, match="does not contain train_shards"):
+        validate_checkpoint_training_data({}, SHARDS)
+
+
+def test_tokenizer_validation_accepts_the_same_tokenizer():
+    identity = {"files": {"a": "1", "b": "2"}}
+    validate_checkpoint_tokenizer({"tokenizer": "gpt2", "tokenizer_identity": identity}, "gpt2", identity)
+
+
+def test_tokenizer_validation_rejects_a_different_tokenizer_name():
+    with pytest.raises(ValueError, match=r"trained with --tokenizer=gpt2 but --tokenizer=nanochat"):
+        validate_checkpoint_tokenizer({"tokenizer": "gpt2"}, "nanochat")
+
+
+def test_tokenizer_validation_treats_old_checkpoints_without_a_name_as_nanochat():
+    validate_checkpoint_tokenizer({}, "nanochat")
+    with pytest.raises(ValueError, match=r"--tokenizer=nanochat but --tokenizer=gpt2"):
+        validate_checkpoint_tokenizer({}, "gpt2")
+
+
+def test_tokenizer_validation_rejects_a_changed_tokenizer_file():
+    saved = {"files": {"a": "1", "b": "2"}}
+    with pytest.raises(ValueError, match=r"Tokenizer files differ.*: b"):
+        validate_checkpoint_tokenizer({"tokenizer": "gpt2", "tokenizer_identity": saved}, "gpt2",
+                                      {"files": {"a": "1", "b": "changed"}})
+
+
+def test_tokenizer_validation_rejects_a_missing_tokenizer_file():
+    saved = {"files": {"a": "1", "b": "2"}}
+    with pytest.raises(ValueError, match=r"Tokenizer files differ.*: b"):
+        validate_checkpoint_tokenizer({"tokenizer": "gpt2", "tokenizer_identity": saved}, "gpt2", {"files": {"a": "1"}})
+
+
+def test_tokenizer_validation_allows_files_added_to_the_tokenizer_directory():
+    saved = {"files": {"a": "1"}}
+    validate_checkpoint_tokenizer({"tokenizer": "gpt2", "tokenizer_identity": saved}, "gpt2",
+                                  {"files": {"a": "1", "other_encoding": "9"}})
+
+
+def test_tokenizer_validation_checks_only_the_name_for_checkpoints_without_an_identity():
+    validate_checkpoint_tokenizer({"tokenizer": "gpt2"}, "gpt2", {"files": {"a": "1"}})
 
 
 @pytest.mark.parametrize("name", ["experiment-1", "d12.moe_adamw-s42"])

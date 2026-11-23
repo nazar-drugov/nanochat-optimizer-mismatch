@@ -262,7 +262,7 @@ class RustBPETokenizer:
 # nanochat-specific convenience functions
 
 # Tokenizers selectable by name:
-#   "nanochat": the BPE trained by scripts/tok_train.py, stored in <base_dir>/tokenizer
+#   "nanochat": a separately trained BPE stored in <base_dir>/tokenizer
 #   "gpt2":     OpenAI's GPT-2 BPE via tiktoken (50,257 tokens; <|endoftext|> is the BOS),
 #               the tokenizer of Ludziejewski et al. (arXiv:2502.05172). It has none of
 #               nanochat's chat special tokens, so it supports pretraining and plain

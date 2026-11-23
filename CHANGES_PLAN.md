@@ -1,97 +1,85 @@
 # Next changes
 
-1. **Run the plain-Muon and AdamW parity tests on two GPUs.**
+Updated 2026-11-23 for commit `0ed4cd4`. The immediate goal is to validate and
+launch the pretraining comparison. `PRETRAINING_PROTOCOL.md` contains the current
+settings and learning-rate sweep. Fine-tuning and the optimizer-switch analysis
+follow after the pretraining path is reliable.
 
-   `muon` now means the original Muon algorithm: Nesterov momentum, fixed-coefficient
-   Newton-Schulz orthogonalization, and the original aspect-ratio learning-rate scaling.
-   It does not use Polar Express, MuonEq, Muon+, NorMuon, or cautious weight decay.
+## 1. Settle the protocol before spending GPU time
 
-   Single-rank and two-rank parity tests compare `DistributedOptimizer` with
-   `torch.optim.Muon`. The two-rank CUDA test still needs to be run on a machine with
-   at least two GPUs.
+- Confirm the settings marked "Defaults that still need team confirmation" in
+  `PRETRAINING_PROTOCOL.md`: balancer, matrix weight decay, router learning rate,
+  AdamW epsilon, model size, token budget, and seed count. Record the chosen
+  values and the reason for each in that file. Keep the decided data, tokenizer,
+  batch size, schedule, and clipping settings fixed across comparable cells.
+- Fix the reference to `EXPERIMENT_SPEC.md` in `PRETRAINING_PROTOCOL.md`: that
+  file is absent from this checkout. Restore the specification if it is the
+  source of the experiment requirements, or replace the reference with a
+  checked-in description of the study and its acceptance criteria.
+- D0 is selected for learning-rate validation. The study launcher passes its
+  directory to `base_train.py`, which records the validation file SHA-256 and
+  rejects changed validation data on resume. Run a short two-GPU test to verify
+  the cluster reads D0. Keep the 1,048,576-token evaluation count and final
+  bits-per-byte selection rule fixed across every comparable cell.
 
-2. **Measure MoE active compute separately from the fixed token budget.**
+## 2. Prove the new pretraining path on the cluster
 
-   Pretraining now requires an explicit token budget and batch size; it no longer scales the budget, learning rates, or weight decay from parameter or FLOP estimates. The separate Chinchilla-style planner counts total parameters, including all experts, to suggest 20× and 40× token budgets.
+- Run the full test suite and the two-GPU CUDA Muon parity test on an allocated
+  GPU node. CPU tests passed during development, but the CUDA-only tests and
+  NCCL path were not verified in `0ed4cd4`.
+- Run short, two-GPU training jobs for both AdamW and plain Muon with the
+  intended MoE architecture, tokenizer, data path, and precision. Check that
+  the jobs compile, finish optimizer steps, and produce finite losses and
+  usable throughput and peak-memory measurements. Repeat for the E=1 control
+  if its model configuration differs from the MoE jobs.
+- Save a checkpoint, resume each kind of job, and compare data fingerprints,
+  checkpoint metadata, routing snapshots, and the resumed training trace.
+  Confirm that matched cells use the same examples in the same order.
+- Review each run's `config.json`: Git commit and dirty state, model and active
+  parameter counts, optimizer groups including the router, schedule, seed,
+  data/tokenizer identity, and hardware must match the intended cell. Resolve
+  any mismatch before the learning-rate sweep.
 
-   Top-1 routing executes one expert per token. Add active-parameter and active-FLOP estimates for reporting and cost comparisons. The total-parameter planner is a heuristic, not an exact compute-optimal MoE rule. Use the same selected rounded token budget for matched AdamW and Muon runs on the same MoE architecture.
 
-3. **Finish the post-training optimizer-switch path.**
+## 4. Make the learning-rate sweep reproducible
 
-   `chat_sft.py` still uses the old `matrix_lr` interface and does not fully expose the new optimizer choices and metadata.
+- Implement or document one launch manifest for the protocol's eight
+  (optimizer, expert-count) cells and five learning rates per cell. Record the
+  exact command, seed, dataset, resolved configuration, code commit, output
+  directory, and run status for each job. Keep the token and batch budgets
+  identical across optimizer comparisons.
+- Select each cell's peak matrix/router learning rate using the same final
+  validation bits-per-byte. Extend a grid whose optimum is at an edge and use
+  the protocol's seed-noise check when neighboring points are close. Save the
+  full sweep results and selection rule, not only the winning runs.
+- Transfer the selected rates to the full budget and perform the specified
+  E=4 transfer check and batch-size robustness runs. If the transfer check
+  fails, use the protocol's longer-run fallback before launching all full
+  runs.
 
-   Your core experiment should eventually contain:
+## 5. Run the final pretraining comparisons and report uncertainty
 
-   | Architecture | Pretraining | Post-training |
-   |---|---|---|
-   | Dense | AdamW | AdamW |
-   | Dense | AdamW | Muon |
-   | Dense | Muon | AdamW |
-   | Dense | Muon | Muon |
-   | MoE | AdamW | AdamW |
-   | MoE | AdamW | Muon |
-   | MoE | Muon | AdamW |
-   | MoE | Muon | Muon |
+- Use paired seeds and identical token order for AdamW and Muon within each
+  architecture. The protocol currently proposes three seeds for E=8 and one
+  elsewhere; decide whether the final claims require more seeds before
+  launching expensive jobs.
+- Report validation curves and final bits-per-byte at fixed token budgets,
+  paired differences, variation across seeds, tokens per second, wall-clock
+  time, and peak memory. Include routing balance and inactive-expert
+  diagnostics. The code already estimates active parameters and FLOPs; use
+  those estimates alongside token counts when comparing dense and MoE costs.
 
-   Start every post-training cell with fresh optimizer state. Otherwise matched cells can carry momentum/history while mismatched cells cannot, confounding optimizer mismatch with state reset.
+## 6. Complete the optimizer-switch study after pretraining
 
-## Experimental rigor changes
-
-4. **Use equal hyperparameter-search budgets.**
-
-   Do not require AdamW and Muon to use the same numerical learning rate—that is not a fair comparison. Give every architecture × optimizer × stage combination the same tuning budget.
-
-   At minimum tune:
-
-   - matrix learning rate,
-   - router learning rate,
-   - weight decay,
-   - warmup,
-   - gradient-clipping norm.
-
-   Later sensitivity experiments can include betas, epsilon, Muon momentum, and Newton–Schulz steps. The papers specifically show that conclusions can change after learning-rate tuning.
-
-5. **Add configurable gradient clipping.**
-
-   It is currently missing. Both papers treat clipping as an optimizer-relevant hyperparameter. Log the pre-clipping gradient norm as well as whether clipping occurred.
-
-6. **Run paired seeds and report variation.**
-
-   Pretraining now exposes `--seed`, uses it for global CPU/CUDA randomness and explicit model initialization, saves it in checkpoints, and validates it on resume. Verify that paired AdamW/Muon runs see the same examples in the same order, including after resume.
-
-   Use at least three paired seeds for final experimental cells and report means, standard deviations or confidence intervals, and paired differences.
-
-7. **Measure the optimizer-switch effect.**
-
-   The primary comparison holds the MoE architecture and token budget fixed, then compares matched and mismatched pretraining/SFT optimizer pairs. Report the switch penalty with paired seeds. Dense experiments can provide a secondary architecture interaction analysis.
-
-8. **Add MoE-specific diagnostics.**
-
-   Routing collapse remains an important possible confounder. Log per layer:
-
-   - fraction of tokens assigned to each expert,
-   - routing entropy,
-   - largest expert share,
-   - inactive/dead experts,
-   - router gradient and update norms,
-   - expert gradient and update norms.
-
-   MoE scalar training losses include load-balancing and router z-losses. Keep their coefficients fixed across optimizer runs.
-
-9. **Evaluate more than final loss.**
-
-   Record:
-
-   - final validation loss at a fixed token budget,
-   - tokens needed to reach specified loss thresholds,
-   - downstream evaluation,
-   - forgetting after post-training,
-   - wall-clock time, tokens/second, and peak memory.
-
-   Compare by both tokens and active FLOPs because MoE routing and Muon have different computational overheads.
-
-10. **Improve reproducibility metadata.**
-
-   Each checkpoint or run record should include the complete model and optimizer configuration, all parameter-group settings, seed, data/tokenizer identity, precision, schedules, Git commit, hardware, and whether optimizer state was reset.
-
-Before an expensive sweep, run the two-GPU optimizer parity tests, finish `chat_sft.py` optimizer-switch wiring, and add MoE routing diagnostics. Keep the current Muon momentum schedule until it is reviewed separately.
+- Update `chat_sft.py` and `base_eval.py` for checkpoints using the GPT-2
+  tokenizer and the current optimizer, router, and model configuration. Add
+  end-to-end tests that load a pretraining checkpoint and run a small SFT and
+  evaluation cycle.
+- Start every SFT cell with fresh optimizer state. Compare matched and
+  mismatched AdamW/Muon pretraining-to-SFT pairs on the same initial checkpoint,
+  post-training data, tuning budget, and paired seeds. Record whether optimizer
+  state was reset and measure the switch penalty and forgetting. Treat dense
+  models as a secondary architecture comparison.
+- Tune the post-training optimizers fairly, with equal search budgets, before
+  interpreting an optimizer mismatch effect. Keep the pretraining protocol
+  and its selected hyperparameters recorded separately from SFT choices.

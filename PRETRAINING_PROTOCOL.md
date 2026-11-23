@@ -26,8 +26,34 @@ Every run writes its fully resolved settings to `config.json` next to its checkp
 | Router learning rate | Same as the matrix LR; router weight decay 0 | Sweep separately |
 | AdamW | β = (0.9, 0.95), ε = 1e-8 | ε = 1e-10 |
 | Model | depth 10 (width 640, 10 blocks): 118M active with GPT-2 vocab | depth 12 costs ~1.55× |
-| Token budget | 3,000,238,080 tokens (11,445 steps) for every E | Decay branches at 1B and 2B for robustness |
+| Token budget | 3,000,238,080 tokens (11,445 steps) for every E | Optional 1B- and 2B-token runs can test whether the result depends on the training horizon; see below. |
 | Pretraining seeds | 3 at E = 8, 1 elsewhere | |
+
+
+### Batch size
+
+
+### LR Schedule
+Ludziejewski et al. use it.
+
+### Auxiliary loss
+
+
+### Token budget
+
+The proposed 1B and 2B **decay branches** are shorter training horizons for a
+robustness check. With the same 130M-token warmup and final 20% LR decay, a
+1B-token run would begin decaying around 0.8B tokens and finish around 1B;
+a 2B-token run would begin decaying around 1.6B and finish around 2B. The
+3B-token run would begin decaying around 2.4B. Comparing their final validation
+bits-per-byte would show whether an optimizer ranking seen at 3B also holds at
+shorter budgets.
+
+"Branch" means reusing a checkpoint from the common constant-LR phase and
+continuing copies with different decay endpoints. These runs are a proposed
+additional check, not part of the chosen 3B-token budget. The current launcher
+does not automate checkpoint branching; it requires a separate, verified resume
+procedure before results can be treated as shared-prefix branches.
 
 ## Learning-rate sweep (Option A)
 
@@ -61,12 +87,25 @@ if the transfer check fails.
   `python -m scripts.make_heldout --dataset fineweb-edu-100b --tokenizer gpt2 --workers 32` (CPU job).
 - Run the throughput benchmark (spec §8.8) and the two-GPU CUDA optimizer test
   (`tests/test_optim.py::test_two_rank_muon_matches_torch_reference`) on the cluster.
+- On ORCD, use `runs/pretrain_study.sh` to download to pool and stage to
+  scratch once per dataset version, then launch many runs using that scratch
+  copy. Downloads and staging are not part of each training run. See
+  `STORAGE_PATHS.md`.
+- The data is frozen in `data_manifests/fineweb_edu_100_v1/` (100 training shards,
+  the validation shard, and D0). Every `train` start and resume through the launcher
+  hashes all shards against that manifest (about 30 s) and stops on any difference, so
+  every cell of the study is guaranteed to read identical bytes. A resumed run also
+  confirms that its shard list and tokenizer match the checkpoint. If the data ever
+  changes, build a new D0 and a new manifest version; do not mix versions in one study.
 
-Example cell:
+Example cell preview (0.004 is the Muon sweep center, not a selected final LR):
 
-```
-torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
+```bash
+RUN_NAME=moe-e8-muon-s42 bash runs/pretrain_study.sh dry-run \
     --depth=10 --ffn-type=moe --n-experts=8 --optimizer-name=muon \
-    --muon-matrix-lr=<swept> --train-tokens=3000238080 --save-every=1000 \
-    --eval-tokens=10485760 --core-metric-every=-1 --seed=42
+    --muon-matrix-lr=0.004 --train-tokens=3000238080 --save-every=1000 \
+    --eval-tokens=1048576 --core-metric-every=-1 --seed=42
 ```
+
+Use `train` instead of `dry-run` only after the chosen learning rate and
+remaining protocol defaults have been confirmed and the dataset staged.

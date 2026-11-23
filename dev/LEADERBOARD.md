@@ -6,7 +6,9 @@ The primary metric we care about is "time to GPT-2" - the wall clock time needed
 
 ## How to
 
-The script [runs/speedrun.sh](../runs/speedrun.sh) always implements the current state of the art on the leaderboard.
+This page records upstream nanochat runs from earlier commits. Its historical
+commands may require checking out their corresponding commits; they are not
+the launch procedure for the optimizer-mismatch study.
 
 In practice, I tune the base_train command a little bit. For example, once all the setup is configured and a tokenizer is trained, I like to do something like:
 
@@ -152,7 +154,9 @@ The big change here is that the batch size was doubled from 0.5M to 1M, which wo
 
 Achived Mar 3 2026 on commit `324e69c`. The big change is the switch from HuggingFace FineWeb-EDU to NVIDIA ClimbMix dataset. `@karpathy` has tried to swap the dataset many times, each time with a negative result (FineWeb, DCLM, Olmo), but ClimbMix produced clear and immediate gains. Credit to `@ddudek` for originally discovering ClimbMix for nanochat and reporting the improvements, which kicked off the followup investigation.
 
-To reproduce, use the commit above, download at least 150 data shards, train the tokenizer:
+To reproduce this historical run, use the commit above, which still contains
+the tokenizer-training script. Download at least 150 data shards, then train
+the tokenizer:
 
 ```
 python -m nanochat.dataset -n 150

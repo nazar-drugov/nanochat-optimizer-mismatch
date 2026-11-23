@@ -359,6 +359,20 @@ class TestOverrideMechanism:
         assert fa_module.USE_FA3 == HAS_FA3
 
 
+def test_explicit_sdpa_skips_fa3_loading(monkeypatch):
+    monkeypatch.setenv("NANOCHAT_ATTENTION_BACKEND", "sdpa")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: pytest.fail("GPU probing should be skipped"))
+    assert fa_module._load_flash_attention_3() is None
+
+
+def test_unsupported_cuda_architecture_uses_sdpa(monkeypatch):
+    monkeypatch.delenv("NANOCHAT_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    assert fa_module._load_flash_attention_3() is None
+
+
 if __name__ == "__main__":
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
