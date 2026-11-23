@@ -21,13 +21,14 @@ import torch
 from nanochat.gpt import BALANCERS, FFN_TYPES
 from nanochat.optim import MUON_VARIANTS
 
-# Default matrix learning rate per Muon variant. "plain" uses Moonlight's
+# Default matrix learning rate per Muon variant. "moonlight" uses Moonlight's
 # update scaling, which matches AdamW's update RMS, so its learning rate is on
-# the AdamW scale (the spec centers the sweep on Hernanz's 4e-3 for Muon and
-# 2e-3 for AdamW). "keller" uses the original aspect-ratio
+# the AdamW scale. The study still sweeps Muon's LR separately from AdamW's
+# rather than copying it: the sweep is centered on Hernanz's 4e-3 for Muon and
+# 2e-3 * E^-0.25 for AdamW. "keller" uses the original aspect-ratio
 # scaling, whose learning rates are ~10x larger. Every default is only the
 # center of a sweep; record the value actually used.
-MUON_MATRIX_LR_DEFAULTS = {"plain": 4e-3, "keller": 0.02}
+MUON_MATRIX_LR_DEFAULTS = {"moonlight": 4e-3, "keller": 0.02}
 ADAMW_MATRIX_LR_DEFAULT = 2e-3
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,8 +67,8 @@ def add_optimizer_args(parser, *, weight_decay_default, require_optimizer=False)
     group.add_argument("--adamw-beta1", type=float, default=0.9, help="AdamW beta1 for every AdamW parameter group")
     group.add_argument("--adamw-beta2", type=float, default=0.95, help="AdamW beta2 for every AdamW parameter group")
     group.add_argument("--adamw-eps", type=float, default=1e-8, help="AdamW epsilon for every AdamW parameter group")
-    group.add_argument("--muon-variant", choices=MUON_VARIANTS, default="plain",
-                       help="plain: Nesterov + Newton-Schulz + Moonlight 0.2*sqrt(max(m,n)) scaling + decoupled WD; "
+    group.add_argument("--muon-variant", choices=MUON_VARIANTS, default="moonlight",
+                       help="moonlight: Nesterov + Newton-Schulz + Moonlight 0.2*sqrt(max(m,n)) scaling + decoupled WD (arXiv:2502.16982); "
                             "keller: original aspect-ratio scaling sqrt(max(1, m/n))")
     group.add_argument("--muon-matrix-lr", type=float, default=None,
                        help=f"learning rate for transformer matrices in Muon mode (default per variant: {MUON_MATRIX_LR_DEFAULTS})")

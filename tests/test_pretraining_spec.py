@@ -315,7 +315,7 @@ def test_mixed_model_forward_probe_and_optimizer():
     assert probe.shape == (2,) + tuple(idx.shape)
     # The probe records the routes actually used (with the bias), not raw argmax
     torch.testing.assert_close(probe, torch.stack([entry["choices"] for entry in captured]))
-    optimizer = model.setup_optimizer(optimizer_name="muon", muon_variant="plain")
+    optimizer = model.setup_optimizer(optimizer_name="muon", muon_variant="moonlight")
     loss.backward()
     optimizer.step()
     record = add_router_log_fields({}, accumulate_router_stats(None, stats, 1), None,

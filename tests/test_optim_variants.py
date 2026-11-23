@@ -1,7 +1,7 @@
 """
 Optimizer behaviour needed for the pretraining runs, on CPU (or CUDA if present):
 
-- Muon "plain" (Moonlight scaling + decoupled weight decay) and "keller" (original
+- Muon "moonlight" (Moonlight scaling + decoupled weight decay) and "keller" (original
   scaling) match torch.optim.Muon with adjust_lr_fn="match_rms_adamw" / "original".
 - Global gradient clipping matches torch.nn.utils.clip_grad_norm_ and reports the
   pre-clip norm.
@@ -42,11 +42,11 @@ def make_params(shape, n, seed):
 
 
 def test_muon_lr_scale_values():
-    assert muon_lr_scale("plain", (3 * 640, 640)) == pytest.approx(0.2 * math.sqrt(1920))
-    assert muon_lr_scale("plain", (640, 1920)) == pytest.approx(0.2 * math.sqrt(1920))
+    assert muon_lr_scale("moonlight", (3 * 640, 640)) == pytest.approx(0.2 * math.sqrt(1920))
+    assert muon_lr_scale("moonlight", (640, 1920)) == pytest.approx(0.2 * math.sqrt(1920))
     assert muon_lr_scale("keller", (1920, 640)) == pytest.approx(math.sqrt(3))
     assert muon_lr_scale("keller", (640, 1920)) == 1.0
-    assert MUON_VARIANTS == ("plain", "keller")
+    assert MUON_VARIANTS == ("moonlight", "keller")
     with pytest.raises(ValueError):
         muon_lr_scale("nanochat", (4, 4))
 
@@ -58,10 +58,10 @@ def test_unknown_muon_variant_is_rejected():
 
 
 @pytest.mark.parametrize("shape", [WIDE, TALL])
-@pytest.mark.parametrize("variant, adjust_lr_fn", [("plain", "match_rms_adamw"), ("keller", "original")])
+@pytest.mark.parametrize("variant, adjust_lr_fn", [("moonlight", "match_rms_adamw"), ("keller", "original")])
 @pytest.mark.parametrize("weight_decay", [0.0, 0.1])
 def test_muon_variant_matches_torch_reference(shape, variant, adjust_lr_fn, weight_decay):
-    lr = 4e-3 if variant == "plain" else 0.02
+    lr = 4e-3 if variant == "moonlight" else 0.02
     ours = make_params(shape, 3, seed=2026)
     ref = [torch.nn.Parameter(p.detach().clone()) for p in ours]
     opt_ours = DistributedOptimizer([dict(kind="muon", params=ours, lr=lr, momentum=0.95, ns_steps=5,
@@ -81,23 +81,23 @@ def test_muon_variant_matches_torch_reference(shape, variant, adjust_lr_fn, weig
     # two orderings (torch-vs-torch with a 1e-6 input perturbation: ~0.3%), and five
     # optimizer steps differ by 1.3-2.1%. The test still discriminates: a wrong
     # weight decay changes these updates by 35-50%, a wrong shape scaling by >2x
-    # (and the exact plain/keller ratio is tested below).
+    # (and the exact moonlight/keller ratio is tested below).
     assert_updates_close([p.detach() for p in ours], [p.detach() for p in ref],
                          [p.detach() for p in make_params(shape, 3, seed=2026)], rel=5e-2)
 
 
-def test_plain_and_keller_differ_only_by_per_shape_scale():
+def test_moonlight_and_keller_differ_only_by_per_shape_scale():
     """Same direction, different step size: one step from zero momentum."""
     results = {}
-    for variant in ("plain", "keller"):
+    for variant in ("moonlight", "keller"):
         params = make_params(TALL, 1, seed=7)
         p0 = params[0].detach().clone()
         params[0].grad = torch.randn(TALL, generator=torch.Generator(device=DEVICE).manual_seed(1), device=DEVICE)
         DistributedOptimizer([dict(kind="muon", params=params, lr=1.0, momentum=0.0, ns_steps=5,
                                    variant=variant, weight_decay=0.0)]).step()
         results[variant] = params[0].detach() - p0
-    ratio = muon_lr_scale("plain", TALL) / muon_lr_scale("keller", TALL)
-    torch.testing.assert_close(results["plain"], ratio * results["keller"], rtol=1e-5, atol=1e-6)
+    ratio = muon_lr_scale("moonlight", TALL) / muon_lr_scale("keller", TALL)
+    torch.testing.assert_close(results["moonlight"], ratio * results["keller"], rtol=1e-5, atol=1e-6)
 
 
 def make_mixed_groups(seed, max_grad_norm=None):
@@ -109,7 +109,7 @@ def make_mixed_groups(seed, max_grad_norm=None):
     groups = [
         dict(kind="adamw", params=params[0:1], lr=0.02, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0),
         dict(kind="adamw", params=params[1:2], lr=0.02, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
-        dict(kind="muon", params=params[2:5], lr=4e-3, momentum=0.95, ns_steps=5, variant="plain", weight_decay=0.1),
+        dict(kind="muon", params=params[2:5], lr=4e-3, momentum=0.95, ns_steps=5, variant="moonlight", weight_decay=0.1),
         dict(kind="muon", params=params[5:7], lr=0.02, momentum=0.95, ns_steps=5, variant="keller", weight_decay=0.0),
     ]
     return params, DistributedOptimizer(groups, max_grad_norm=max_grad_norm, track_grad_norm=True)

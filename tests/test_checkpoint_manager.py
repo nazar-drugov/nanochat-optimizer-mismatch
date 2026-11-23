@@ -29,7 +29,7 @@ def make_experiment_args(**overrides):
         "warmup_steps": 40,
         "warmdown_ratio": 0.65,
         "router_optimizer": "same",
-        "muon_variant": "plain",
+        "muon_variant": "moonlight",
         "moe_layers": "all",
         "balancer": "aux",
         "grad_clip": 1.0,
@@ -48,7 +48,7 @@ def test_base_experiment_name_includes_training_identity():
 
 
 @pytest.mark.parametrize("overrides, fragment", [
-    ({"optimizer_name": "muon"}, "-muon-plain-"),
+    ({"optimizer_name": "muon"}, "-muon-moonlight-"),
     ({"optimizer_name": "muon", "muon_variant": "keller"}, "-muon-keller-"),
     ({"router_optimizer": "adamw", "optimizer_name": "muon"}, "-radamw-"),
     ({"balancer": "bias"}, "-balbias-"),

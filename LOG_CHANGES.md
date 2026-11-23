@@ -217,7 +217,7 @@
 Decisions and the learning-rate sweep protocol are in `PRETRAINING_PROTOCOL.md`.
 
 - **Router optimizer:** `--router-optimizer same|adamw|muon`, default `same`, so routers use the run's matrix optimizer as the spec decides. The router LR defaults to that optimizer's matrix LR. The hidden 1/√(d/768) scaling now applies only to the embedding and lm_head groups.
-- **Muon variants:** `plain` (default: Moonlight 0.2·√max(m,n) update scaling plus decoupled weight decay) and `keller` (the previous original-Muon scaling). Weight decay applies in both. Muon momentum is constant 0.95 by default; nanochat's schedule is available with `--muon-momentum-schedule nanochat`.
+- **Muon variants:** `moonlight` (default; renamed from `plain` after the first version of this entry: Moonlight 0.2·√max(m,n) update scaling plus decoupled weight decay) and `keller` (the previous original-Muon scaling). Weight decay applies in both. Muon momentum is constant 0.95 by default; nanochat's schedule is available with `--muon-momentum-schedule nanochat`.
 - **Gradient clipping:** global-norm clipping (`--grad-clip`, default 1.0) on the reduced gradient, correct across ranks. The pre-clip norm and clip coefficient are logged.
 - **Bug fix:** the optimizer waited on `Work.get_future()`, which gloo lacks, and gloo re-copies reduce-scatter outputs on every `wait()`. It now waits on work handles once, so the multi-rank path runs on CPU and clipping is not undone on sharded tensors.
 - **Load balancing:** `--balancer aux|bias|none` with configurable `--balance-coef`, `--z-coef` and `--bias-update-rate`. The bias changes selection only, never the gate value. Bias updates use step loads summed over micro-batches and ranks.

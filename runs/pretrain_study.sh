@@ -44,7 +44,7 @@ WHAT THE EXAMPLE RUN USES (including defaults from scripts/base_train.py):
   Data/model:     FineWeb-Edu training shards on scratch (currently 100), GPT-2
                   tokenizer, depth 10 (width 640), 8-expert top-1 MoE in every block;
                   sequence length 2048. Two GPU processes by default.
-  Optimizer:      plain Muon for matrices and routers, matrix/router peak LR
+  Optimizer:      Moonlight-variant Muon for matrices and routers, matrix/router peak LR
                   0.004; AdamW for embeddings (LR 0.3) and output head (LR 0.008).
                   Auxiliary balance coefficient 0.01, router z-loss coefficient 0.001,
                   matrix weight decay 0.1, gradient clipping norm 1.0.

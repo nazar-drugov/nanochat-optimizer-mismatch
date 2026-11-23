@@ -136,7 +136,7 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name, r
         adamw_matrix_lr=3e-3,
         muon_matrix_lr=0.03,
         muon_ns_steps=3,
-        muon_variant="plain",
+        muon_variant="moonlight",
         weight_decay=0.1,
     )
 
@@ -155,7 +155,7 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name, r
             assert group["eps"] == 2e-8
         else:
             assert group["ns_steps"] == 3
-            assert group["variant"] == "plain"
+            assert group["variant"] == "moonlight"
 
     # Embeddings and lm_head are AdamW in every cell; matrices use the run's optimizer.
     roles = {}
@@ -183,7 +183,7 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name, r
 def test_router_optimizer_same_puts_routers_in_muon_and_steps():
     """The spec's decision: routers follow the run's matrix optimizer."""
     model = make_model(ffn_type="moe")
-    optimizer = model.setup_optimizer(optimizer_name="muon", router_optimizer="same", muon_variant="plain")
+    optimizer = model.setup_optimizer(optimizer_name="muon", router_optimizer="same", muon_variant="moonlight")
     router_groups = [g for g in optimizer.param_groups if g["role"] == "router"]
     assert router_groups and all(g["kind"] == "muon" for g in router_groups)
     before = [block.mlp.router.weight.detach().clone() for block in model.transformer.h]

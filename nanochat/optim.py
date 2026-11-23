@@ -88,19 +88,20 @@ where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hu
 performance at all relative to UV^T, where USV^T = G is the SVD.
 """
 
-MUON_VARIANTS = ("plain", "keller")
+MUON_VARIANTS = ("moonlight", "keller")
 
 
 def muon_lr_scale(variant: str, shape) -> float:
     """Shape-dependent multiplier applied to a Muon group's learning rate.
 
-    plain:    Moonlight update scaling 0.2 * sqrt(max(m, n)), which matches the
-              update RMS of AdamW (Liu et al. 2025, arXiv:2502.16982).
+    moonlight: Moonlight update scaling 0.2 * sqrt(max(m, n)), which matches the
+              update RMS of AdamW (Liu et al. 2025, arXiv:2502.16982). Equivalent
+              to torch.optim.Muon(adjust_lr_fn="match_rms_adamw").
     keller:   original Muon aspect-ratio scaling sqrt(max(1, m / n)).
     Weights are stored (out_features, in_features), so m = shape[-2], n = shape[-1].
     """
     m, n = shape[-2], shape[-1]
-    if variant == "plain":
+    if variant == "moonlight":
         return 0.2 * max(m, n) ** 0.5
     if variant == "keller":
         return max(1.0, m / n) ** 0.5
@@ -118,9 +119,9 @@ def muon_step_fused(
     ns_steps: int,           # 5 - number of Newton-Schulz iterations
 ) -> None:
     """
-    Plain/original Muon update: Nesterov momentum, fixed-coefficient Newton-Schulz
-    orthogonalization, decoupled weight decay, then the parameter update. The
-    variant's shape scaling is included in lr_t by the caller.
+    Muon update shared by every variant: Nesterov momentum, fixed-coefficient
+    Newton-Schulz orthogonalization, decoupled weight decay, then the parameter
+    update. The variant's shape scaling is included in lr_t by the caller.
     """
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)

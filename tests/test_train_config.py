@@ -25,7 +25,7 @@ def test_defaults_follow_the_agreed_settings():
     kwargs = resolve_optimizer_args(args)
     moe = resolve_moe_args(args)
     assert kwargs["optimizer_name"] == "adamw" and kwargs["router_optimizer"] == "same"
-    assert kwargs["muon_variant"] == "plain" and args.muon_matrix_lr == MUON_MATRIX_LR_DEFAULTS["plain"] == 4e-3
+    assert kwargs["muon_variant"] == "moonlight" and args.muon_matrix_lr == MUON_MATRIX_LR_DEFAULTS["moonlight"] == 4e-3
     assert kwargs["adamw_matrix_lr"] == ADAMW_MATRIX_LR_DEFAULT == 2e-3
     assert kwargs["weight_decay"] == 0.1 and kwargs["router_weight_decay"] == 0.0
     assert kwargs["muon_momentum"] == 0.95 and args.muon_momentum_schedule == "constant"
@@ -37,7 +37,7 @@ def test_defaults_follow_the_agreed_settings():
 
 @pytest.mark.parametrize("argv, expected_lr", [
     (["--muon-variant", "keller"], 0.02),
-    (["--muon-variant", "plain"], 4e-3),
+    (["--muon-variant", "moonlight"], 4e-3),
     (["--muon-variant", "keller", "--muon-matrix-lr", "0.01"], 0.01),
 ])
 def test_muon_lr_default_depends_on_variant_unless_given(argv, expected_lr):
