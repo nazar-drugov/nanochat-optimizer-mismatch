@@ -344,3 +344,10 @@ One limit remains: if you start a run with the training code directly (not throu
 - Run the CUDA-only tests and the two-GPU training checks from `CHANGES_PLAN.md`.
 - Confirm the settings listed as "Defaults that still need team confirmation" in `PRETRAINING_PROTOCOL.md`.
 - Fix the reference to `EXPERIMENT_SPEC.md`, which is not in this checkout.
+
+## GPU test fixes (2026-11-23)
+
+Found by running the full suite and a short CUDA `base_train` on an RTX 5080 (sm_120): 209 passed, 13 skipped.
+
+- **Bug fix:** Flash Attention 3 was loaded from the kernel hub on any CUDA GPU that had a build, including Blackwell (sm_100 B200, sm_120 RTX 50xx), where the first attention call aborts the process ("no kernel image is available for execution on the device"). The data-preparation work above fixed the same bug independently; the rebased code keeps that version (FA3 only on compute capability 8.0, 8.6, 8.9 and 9.0, plus `NANOCHAT_ATTENTION_BACKEND=sdpa`). `test_unsupported_cuda_architecture_uses_sdpa` now covers sm_100, sm_120 and sm_75 and checks that the kernel hub is never queried.
+- **Environment:** the `gpu` extra now installs `setuptools`, which torch inductor imports when compiling CPU code (several tests failed without it; the data-preparation branch added the same line).

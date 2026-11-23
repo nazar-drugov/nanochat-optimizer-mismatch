@@ -366,10 +366,18 @@ def test_explicit_sdpa_skips_fa3_loading(monkeypatch):
     assert fa_module._load_flash_attention_3() is None
 
 
-def test_unsupported_cuda_architecture_uses_sdpa(monkeypatch):
+@pytest.mark.parametrize("capability", [(10, 0), (12, 0), (7, 5)])
+def test_unsupported_cuda_architecture_uses_sdpa(monkeypatch, capability):
+    """Blackwell (B200 sm100, RTX 50xx sm120) and older GPUs must fall back to SDPA without
+    touching the kernel hub: the hub's FA3 build loads there but aborts on its first call."""
+    import kernels
     monkeypatch.delenv("NANOCHAT_ATTENTION_BACKEND", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    def fail(*args, **kwargs):
+        raise AssertionError("kernel hub queried on an unsupported GPU")
+    monkeypatch.setattr(kernels, "get_kernel", fail)
+    monkeypatch.setattr(kernels, "has_kernel", fail)
     assert fa_module._load_flash_attention_3() is None
 
 
