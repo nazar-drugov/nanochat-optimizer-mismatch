@@ -5,6 +5,14 @@ launch the pretraining comparison. `PRETRAINING_PROTOCOL.md` contains the curren
 settings and learning-rate sweep. Fine-tuning and the optimizer-switch analysis
 follow after the pretraining path is reliable.
 
+
+## 0. Optimize MoEMLP implementation
+The implementation is slow for E > 1. MoEMLP.forward loops over experts and uses boolean-mask indexing (x[mask]), so each expert sees a data-dependent number of tokens. Two consequences follow:
+
+Every mask index forces a GPU-to-CPU sync, and the loop has up to E syncs per MoE layer. I think the compiled model (torch.compile(model, dynamic=False)) will graph-break there, but I haven't tested that.
+The expert matmuls are small and uneven, so throughput could fall as E grows. Tokens per second and wall-clock comparisons across E would then mix routing and kernel overhead with optimizer effects.
+Run the throughput benchmark (spec §8.8) at E = 1, 4, 8 and 16 before fixing the token budget, and report the wall-clock time per cell.
+
 ## 1. Settle the protocol before spending GPU time
 
 - Confirm the settings marked "Defaults that still need team confirmation" in
@@ -27,7 +35,7 @@ follow after the pretraining path is reliable.
 - Run the full test suite and the two-GPU CUDA Muon parity test on an allocated
   GPU node. CPU tests passed during development, but the CUDA-only tests and
   NCCL path were not verified in `0ed4cd4`.
-- Run short, two-GPU training jobs for both AdamW and plain Muon with the
+- Run short, two-GPU training jobs for both AdamW and Moonlight-variant Muon with the
   intended MoE architecture, tokenizer, data path, and precision. Check that
   the jobs compile, finish optimizer steps, and produce finite losses and
   usable throughput and peak-memory measurements. Repeat for the E=1 control
