@@ -4,7 +4,8 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- feed-forward: relu^2 MLP (ffn_type="dense"), SwiGLU MLP ("swiglu"), or a
+  top-1 Switch-style MoE of SwiGLU experts ("moe")
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -33,8 +34,44 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
-    ffn_type: str = "dense" # dense | moe
+    # dense:  nanochat ReLU^2 MLP, 4x width (legacy dense model)
+    # swiglu: dense SwiGLU MLP, 3x width, identical to one MoE expert
+    # moe:    top-1 MoE of SwiGLU experts in the layers named by moe_layers;
+    #         the other layers use a dense SwiGLU MLP
+    ffn_type: str = "dense"
     n_experts: int = 4
+    moe_layers: str = "all" # "all" | "every:K" (layers K-1, 2K-1, ...) | "0,2,5"
+    # Load balancing (MoE only)
+    # aux:  Switch auxiliary loss balance_coef * E * sum_i f_i P_i
+    # bias: auxiliary-loss-free bias on selection only (Wang et al. 2024)
+    # none: no balancing
+    balancer: str = "aux"
+    balance_coef: float = 0.01
+    z_coef: float = 0.001
+    bias_update_rate: float = 0.001
+
+
+FFN_TYPES = ("dense", "swiglu", "moe")
+BALANCERS = ("aux", "bias", "none")
+
+
+def moe_layer_indices(config):
+    """Indices of the blocks whose feed-forward layer is an MoE layer."""
+    if config.ffn_type != "moe":
+        return []
+    n_layer = config.n_layer
+    spec = config.moe_layers.strip()
+    if spec == "all":
+        return list(range(n_layer))
+    if spec.startswith("every:"):
+        k = int(spec.split(":", 1)[1])
+        if k <= 0:
+            raise ValueError(f"moe_layers every:K needs K >= 1, got {spec!r}")
+        return [i for i in range(n_layer) if (i + 1) % k == 0]
+    indices = sorted({int(part) for part in spec.split(",") if part.strip()})
+    if not indices or indices[0] < 0 or indices[-1] >= n_layer:
+        raise ValueError(f"moe_layers {spec!r} must name layers in [0, {n_layer})")
+    return indices
 
 
 def make_gpt_config(
@@ -46,6 +83,11 @@ def make_gpt_config(
     vocab_size,
     ffn_type,
     n_experts,
+    moe_layers="all",
+    balancer="aux",
+    balance_coef=0.01,
+    z_coef=0.001,
+    bias_update_rate=0.001,
 ):
     """Build the GPT configuration shared by training and planning scripts."""
     # Nudge the model dimension up to a multiple of head_dim so every attention
@@ -56,6 +98,11 @@ def make_gpt_config(
     return GPTConfig(
         ffn_type=ffn_type,
         n_experts=n_experts,
+        moe_layers=moe_layers,
+        balancer=balancer,
+        balance_coef=balance_coef,
+        z_coef=z_coef,
+        bias_update_rate=bias_update_rate,
         sequence_len=max_seq_len,
         vocab_size=vocab_size,
         n_layer=depth,
@@ -161,18 +208,32 @@ class SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 class MoEMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
 
         self.router = Linear(config.n_embd, config.n_experts, bias=False, dtype=torch.float32)
 
         # Each expert has its own expansion and projection layer
         self.experts = nn.ModuleList(
                 SwiGLUMLP(config) for _ in range(config.n_experts)
-            ) 
+            )
 
-    def forward(self, x):
+        # Selection-only balancing bias (balancer="bias"). It is a buffer, not a
+        # parameter: no optimizer touches it; GPT.update_expert_bias() does.
+        # It is persistent so checkpoints carry the balancer state.
+        self.register_buffer("expert_bias", torch.zeros(config.n_experts, dtype=torch.float32))
+
+    def forward(self, x, forced_idx=None, capture=None):
+        """Top-1 Switch-style MoE.
+
+        forced_idx: optional (batch, seq_len) expert indices that replace this
+            layer's own selection (route replay). The gate value is still the
+            current router's own softmax probability for the forced expert.
+        capture: optional list; if given, a dict with this layer's router
+            inputs, logits and the routes actually used is appended to it.
+        """
         # x is (batch, seq_len, n_embd)
         total_num_tokens = x.shape[0] * x.shape[1]
         total_num_experts = self.config.n_experts
@@ -180,7 +241,22 @@ class MoEMLP(nn.Module):
         with torch.autocast(device_type=x.device.type, enabled=False):
             router_logits = self.router(x.float()) # (batch, seq_len, n_experts)
             router_probs = F.softmax(router_logits, dim=-1) # (batch, seq_len, n_experts)
-        router_choices = torch.argmax(router_probs, dim=-1) # (batch, seq_len)
+        if forced_idx is not None:
+            if forced_idx.shape != router_probs.shape[:2]:
+                raise ValueError(f"forced_idx has shape {tuple(forced_idx.shape)}, expected {tuple(router_probs.shape[:2])}")
+            router_choices = forced_idx.to(device=x.device, dtype=torch.long)
+        elif self.config.balancer == "bias":
+            # The bias only changes which expert is selected, never the gate value.
+            router_choices = torch.argmax(router_probs + self.expert_bias, dim=-1)
+        else:
+            router_choices = torch.argmax(router_probs, dim=-1) # (batch, seq_len)
+        if capture is not None:
+            capture.append({
+                "layer": self.layer_idx,
+                "inputs": x.detach(),
+                "logits": router_logits.detach(),
+                "choices": router_choices.detach(),
+            })
 
         # Entropy of each token's distribution over experts.
         router_entropy = -(router_probs * F.log_softmax(router_logits, dim=-1)).sum(dim=-1) # (batch, seq_len)
@@ -191,7 +267,9 @@ class MoEMLP(nn.Module):
         output = torch.zeros_like(x) # (batch, seq_len, n_embd)
 
         mean_expert_probs = router_probs.mean(dim=(0, 1)) # (n_experts)
-        expert_shares = torch.zeros_like(mean_expert_probs)
+        # Integer token counts per expert (the load). one_hot keeps shapes static.
+        expert_counts = F.one_hot(router_choices, total_num_experts).sum(dim=(0, 1))
+        expert_shares = expert_counts.float() / total_num_tokens
 
         for idx, expert in enumerate(self.experts):
             # Create a mask that's 1 for positions current expert will process, and 0
@@ -220,42 +298,50 @@ class MoEMLP(nn.Module):
             # Put the current expert's outputs into relevant positions of output tensor
             output[mask] = curr_expert_output
 
-            # Compute the average frequency of this expert
-            expert_shares[idx] = (router_choices == idx).sum() / total_num_tokens
-
-
         # The raw z-loss also serves as a routing diagnostic.
         L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
+        # Switch balance loss: f_i (expert_shares) carries no gradient; P_i does.
         L_balance = total_num_experts * (expert_shares * mean_expert_probs).sum()
         router_stats = {
             "expert_shares": expert_shares.detach(),
+            "expert_counts": expert_counts.detach(),
             "router_entropy": mean_router_entropy.detach(),
             "mean_expert_probs": mean_expert_probs.detach(),
+            "max_vio": (total_num_experts * expert_shares.max() - 1).detach(),
             "z_loss": L_z.detach(),
         }
         return output, {"balance": L_balance, "z": L_z}, router_stats
 
 
-class Block(nn.Module):#
+class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.attn = CausalSelfAttention(config, layer_idx)
+        if config.ffn_type not in FFN_TYPES:
+            raise ValueError(f"Unknown ffn_type {config.ffn_type!r} (expected one of {FFN_TYPES})")
+        if config.balancer not in BALANCERS:
+            raise ValueError(f"Unknown balancer {config.balancer!r} (expected one of {BALANCERS})")
 
+        self.is_moe = layer_idx in moe_layer_indices(config)
         if config.ffn_type == "dense":
             self.mlp = DenseMLP(config)
-        elif config.ffn_type == "moe":
-            self.mlp = MoEMLP(config)
+        elif self.is_moe:
+            self.mlp = MoEMLP(config, layer_idx)
+        else:
+            # ffn_type="swiglu", or a non-MoE layer of an MoE model
+            self.mlp = SwiGLUMLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin, kv_cache, forced_idx=None, capture=None):
+        """Returns (x, moe) where moe is None for non-MoE layers and
+        (aux_losses, router_stats) for MoE layers."""
         x = x + self.attn(norm(x), cos_sin, kv_cache)
         mlp_input = norm(x)
 
-        if self.config.ffn_type == "dense":
-            x = x + self.mlp(mlp_input)
-            return x
-        mlp_output, aux_losses, router_stats = self.mlp(mlp_input)
-        return x + mlp_output, aux_losses, router_stats
+        if not self.is_moe:
+            return x + self.mlp(mlp_input), None
+        mlp_output, aux_losses, router_stats = self.mlp(mlp_input, forced_idx=forced_idx, capture=capture)
+        return x + mlp_output, (aux_losses, router_stats)
 
 
 class GPT(nn.Module):
@@ -334,29 +420,34 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s, generator=shared_rng)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
 
-        # Next, initialize the MLPs
+        def init_swiglu(mlp):
+            for weight in (mlp.up.weight, mlp.gate.weight, mlp.down.weight):
+                fan_in = weight.shape[1]
+                std = (0.1 / fan_in) ** 0.5
+                torch.nn.init.trunc_normal_(
+                    weight, mean=0.0, std=std,
+                    a=-2 * std, b=2 * std,
+                    generator=ffn_rng,
+                )
+
+        # Next, initialize the MLPs. A dense SwiGLU layer draws exactly what
+        # expert 0 of an MoE layer draws, so with the same seed an E=1 MoE and a
+        # dense SwiGLU model start from identical weights.
         for block in self.transformer.h:
-            # Case 1: dense transformer
             if self.config.ffn_type == "dense":
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4, generator=ffn_rng)  # 0.4x init scale for c_fc
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-            # Case 2: MoE transformer
-            elif self.config.ffn_type == "moe":
+            elif block.is_moe:
                 for expert in block.mlp.experts:
-                    for weight in (expert.up.weight, expert.gate.weight, expert.down.weight):
-                        fan_in = weight.shape[1]
-                        std = (0.1 / fan_in) ** 0.5
-                        torch.nn.init.trunc_normal_(
-                            weight, mean=0.0, std=std,
-                            a=-2 * std, b=2 * std,
-                            generator=ffn_rng,
-                        )
+                    init_swiglu(expert)
+            else:
+                init_swiglu(block.mlp)
 
-        # Finally, initialize the MoE routers
-        if self.config.ffn_type == "moe": 
-            for block in self.transformer.h:
+        # Finally, initialize the MoE routers and the selection bias
+        for block in self.transformer.h:
+            if block.is_moe:
                 torch.nn.init.uniform_(block.mlp.router.weight, -s * 0.1, s * 0.1, generator=router_rng) # 0.1x init scale for the router
+                torch.nn.init.zeros_(block.mlp.expert_bias)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -416,13 +507,74 @@ class GPT(nn.Module):
         layer, so exclude the other experts while retaining shared projections.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
-        if self.config.ffn_type == "moe":
-            for block in self.transformer.h:
+        for block in self.transformer.h:
+            if block.is_moe:
                 for expert in block.mlp.experts[1:]:
                     matmul_params -= sum(
                         m.weight.numel() for m in expert.modules() if isinstance(m, Linear)
                     )
         return matmul_params
+
+    @property
+    def moe_layer_indices(self):
+        return [i for i, block in enumerate(self.transformer.h) if block.is_moe]
+
+    def parameter_counts(self):
+        """Parameter counts under the conventions the experiment needs to state.
+
+        embedding:          input token embedding (a lookup, no matmul FLOPs)
+        unembedding:        lm_head
+        router:             all MoE routers (E x d per MoE layer)
+        active_non_embedding: per-token active block parameters (attention,
+                            one expert per MoE layer, routers)
+        active_with_unembedding: active_non_embedding + lm_head
+                            (= num_matmul_params; the FLOP-count convention)
+        active_with_embeddings: + input embedding as well (the joint MoE
+                            scaling-law paper's N_act, arXiv:2502.05172 App. A.1)
+        total:              every parameter, all experts included
+        """
+        embedding = sum(p.numel() for p in self.transformer.wte.parameters())
+        unembedding = sum(p.numel() for p in self.lm_head.parameters())
+        router = sum(block.mlp.router.weight.numel() for block in self.transformer.h if block.is_moe)
+        active_with_unembedding = self.num_matmul_params()
+        total = sum(p.numel() for p in self.parameters())
+        return {
+            "embedding": embedding,
+            "unembedding": unembedding,
+            "router": router,
+            "active_non_embedding": active_with_unembedding - unembedding,
+            "active_with_unembedding": active_with_unembedding,
+            "active_with_embeddings": active_with_unembedding + embedding,
+            "total": total,
+        }
+
+    @torch.no_grad()
+    def update_expert_bias(self, expert_counts, rate=None):
+        """Auxiliary-loss-free balancing step (Wang et al. 2024, arXiv:2408.15664).
+
+        expert_counts: (n_moe_layers, n_experts) token counts for the last
+        optimizer step, already summed over micro-batches and ranks so every
+        rank applies the identical update. b_i <- b_i + u * sign(mean - load_i).
+        """
+        if self.config.balancer != "bias":
+            return
+        rate = self.config.bias_update_rate if rate is None else rate
+        moe_blocks = [block for block in self.transformer.h if block.is_moe]
+        if expert_counts.shape != (len(moe_blocks), self.config.n_experts):
+            raise ValueError(f"expert_counts has shape {tuple(expert_counts.shape)}, "
+                             f"expected {(len(moe_blocks), self.config.n_experts)}")
+        counts = expert_counts.float()
+        mean_load = counts.mean(dim=-1, keepdim=True)
+        updates = rate * torch.sign(mean_load - counts)
+        for block, update in zip(moe_blocks, updates):
+            block.mlp.expert_bias.add_(update.to(block.mlp.expert_bias.device))
+
+    def expert_bias_state(self):
+        """(n_moe_layers, n_experts) copy of the selection biases."""
+        moe_blocks = [block for block in self.transformer.h if block.is_moe]
+        if not moe_blocks:
+            return None
+        return torch.stack([block.mlp.expert_bias.detach().clone() for block in moe_blocks])
 
     def estimate_decode_flops(self, context_len):
         """
@@ -483,87 +635,92 @@ class GPT(nn.Module):
     def setup_optimizer(
         self,
         optimizer_name="adamw",
+        router_optimizer="same",
         unembedding_lr=0.004,
         embedding_lr=0.2,
         muon_matrix_lr=0.02,
-        adamw_matrix_lr=6e-4,
-        router_lr=0.004,
+        adamw_matrix_lr=2e-3,
+        router_lr=None,
         adamw_beta1=0.9,
         adamw_beta2=0.95,
         adamw_eps=1e-8,
         muon_momentum=0.95,
         muon_ns_steps=5,
+        muon_variant="keller",
         weight_decay=0.0,
+        router_weight_decay=0.0,
+        max_grad_norm=None,
+        track_grad_norm=False,
     ):
+        """Build the optimizer. Only the transformer-matrix (and router) optimizer
+        differs between AdamW and Muon cells; the embedding and lm_head AdamW
+        groups are identical in every cell.
+
+        optimizer_name:   optimizer for attention and feed-forward matrices.
+        router_optimizer: "same" (the spec's decision: routers use the run's
+                          matrix optimizer), "adamw" or "muon".
+        router_lr:        None = the matrix learning rate of whichever
+                          optimizer the router uses.
+        weight_decay:     decoupled weight decay on the matrices, for AdamW and
+                          for every Muon variant.
+        Learning rates of the matrix and router groups are used as given; only
+        the embedding and lm_head groups keep nanochat's 1/sqrt(d/768) scaling.
+        """
+        if optimizer_name not in ("adamw", "muon"):
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+        if router_optimizer not in ("same", "adamw", "muon"):
+            raise ValueError(f"Unsupported router optimizer: {router_optimizer}")
+        resolved_router_optimizer = optimizer_name if router_optimizer == "same" else router_optimizer
+
         model_dim = self.config.n_embd
         adamw_betas = (adamw_beta1, adamw_beta2)
 
-        # STEP 1: add to param_groups parameters that always use AdamW
+        def adamw_group(role, params, lr, wd):
+            return dict(kind="adamw", role=role, params=params, lr=lr, betas=adamw_betas, eps=adamw_eps, weight_decay=wd)
 
-        # Separate out all parameters into groups
+        def muon_groups(role, params, lr, wd):
+            # Muon stacks parameters of identical shape into one group
+            return [
+                dict(kind="muon", role=role, params=[p for p in params if p.shape == shape],
+                     lr=lr, momentum=muon_momentum, ns_steps=muon_ns_steps,
+                     variant=muon_variant, weight_decay=wd)
+                for shape in sorted({p.shape for p in params})
+            ]
+
+        # STEP 1: embeddings and lm_head always use AdamW, identically in every cell.
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        # Scale the LR for these AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
-
-        # Build param_groups with all required fields explicit
+        print0(f"Scaling the embedding/lm_head AdamW LR ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            # AdamW groups (embeddings and lm_head)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adamw_betas, eps=adamw_eps, weight_decay=0.01),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adamw_betas, eps=adamw_eps, weight_decay=0.001),
+            adamw_group("unembedding", lm_head_params, unembedding_lr * dmodel_lr_scale, 0.01),
+            adamw_group("embedding", embedding_params, embedding_lr * dmodel_lr_scale, 0.001),
         ]
 
-        # STEP 2:
-        # If we're training an MoE, assign router weights to AdamW regardless of the optimizer choice
-        router_params = []
-        if self.config.ffn_type == "moe":
-            router_params = [parameter
-                             for block in self.transformer.h
-                             for parameter in block.mlp.router.parameters()]
+        # STEP 2: routers
+        router_params = [parameter
+                         for block in self.transformer.h if block.is_moe
+                         for parameter in block.mlp.router.parameters()]
+        if router_params:
+            if router_lr is None:
+                router_lr = adamw_matrix_lr if resolved_router_optimizer == "adamw" else muon_matrix_lr
+            if resolved_router_optimizer == "adamw":
+                param_groups.append(adamw_group("router", router_params, router_lr, router_weight_decay))
+            else:
+                param_groups.extend(muon_groups("router", router_params, router_lr, router_weight_decay))
 
-            param_groups.append(dict(
-                kind='adamw',
-                params=router_params,
-                lr=router_lr * dmodel_lr_scale,
-                betas=adamw_betas,
-                eps=adamw_eps,
-                weight_decay=0.0
-            ))
-
-        # STEP 3: Collect all matrix params, excluding router params
-        # Assign them to the selected optimizer
+        # STEP 3: attention and feed-forward matrices
         router_param_ids = {id(param) for param in router_params}
-
         matrix_params = [
             parameter
             for parameter in self.transformer.h.parameters()
-            if id(parameter) not in router_param_ids # Exclude router params from matrix_params
+            if id(parameter) not in router_param_ids
         ]
-
         if optimizer_name == "adamw":
-            param_groups.append(
-                dict(
-                    kind="adamw",
-                    params=matrix_params,
-                    lr=adamw_matrix_lr * dmodel_lr_scale,
-                    betas=adamw_betas,
-                    eps=adamw_eps,
-                    weight_decay=weight_decay,
-                )
-            )
-
-        elif optimizer_name == "muon":
-            # Muon groups (matrix params, grouped by shape for stacking)
-            for shape in sorted({p.shape for p in matrix_params}):
-                group_params = [p for p in matrix_params if p.shape == shape]
-                param_groups.append(dict(
-                    kind='muon', params=group_params, lr=muon_matrix_lr,
-                    momentum=muon_momentum, ns_steps=muon_ns_steps,
-                ))
+            param_groups.append(adamw_group("matrix", matrix_params, adamw_matrix_lr, weight_decay))
         else:
-            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+            param_groups.extend(muon_groups("matrix", matrix_params, muon_matrix_lr, weight_decay))
 
         # Verify that we have assigned every parameter to exactly one group
         model_param_ids = {id(parameter) for parameter in self.parameters()}
@@ -573,16 +730,25 @@ class GPT(nn.Module):
         assert len(grouped_param_ids) == len(model_param_ids)
         assert set(grouped_param_ids) == model_param_ids
 
-        # STEP 4: Instantiate optimizer object, conditional on the selected optimizer
-        optimizer = DistributedOptimizer(param_groups)
+        # STEP 4: Instantiate the optimizer
+        optimizer = DistributedOptimizer(param_groups, max_grad_norm=max_grad_norm, track_grad_norm=track_grad_norm)
 
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
 
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_metrics=False):
-        B, T = idx.size()
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_metrics=False,
+                forced_routes=None, routing_capture=None):
+        """
+        forced_routes: optional per-layer expert indices for route replay; a
+            dict {layer_idx: (B, T) tensor} or a sequence/tensor indexed by layer
+            (entries may be None). Non-MoE layers ignore it.
+        routing_capture: optional list that MoE layers append their router
+            inputs, logits and used routes to (see MoEMLP.forward). Use with the
+            uncompiled model and modest batches; nothing is stored otherwise.
+        """
+        _, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -602,15 +768,19 @@ class GPT(nn.Module):
 
         # Per-token losses are used as log probabilities by evaluation and RL,
         # so auxiliary losses are only added to scalar training objectives.
-        for block in self.transformer.h:
-            if self.config.ffn_type == "moe":
-                x, aux_losses, router_stats = block(x, cos_sin, kv_cache)
-                if targets is not None and loss_reduction != 'none':
-                    aux_losses_list.append(aux_losses)
-                    if return_metrics:
-                        router_stats_list.append(router_stats)
-            else:
-                x = block(x, cos_sin, kv_cache)
+        for layer_idx, block in enumerate(self.transformer.h):
+            forced_idx = None
+            if forced_routes is not None and block.is_moe:
+                if isinstance(forced_routes, dict):
+                    forced_idx = forced_routes.get(layer_idx)
+                else:
+                    forced_idx = forced_routes[layer_idx]
+            x, moe = block(x, cos_sin, kv_cache, forced_idx=forced_idx, capture=routing_capture)
+            if moe is not None and targets is not None and loss_reduction != 'none':
+                aux_losses, router_stats = moe
+                aux_losses_list.append(aux_losses)
+                if return_metrics:
+                    router_stats_list.append(router_stats)
 
         x = norm(x)
 
@@ -624,15 +794,21 @@ class GPT(nn.Module):
             # TODO experiment with chunked cross-entropy?
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            if self.config.ffn_type == "moe" and loss_reduction != 'none':
+            if aux_losses_list:
+                # Per-layer losses are averaged over MoE layers, then weighted.
                 balance_loss = torch.stack([a["balance"] for a in aux_losses_list]).mean()
                 z_loss = torch.stack([a["z"] for a in aux_losses_list]).mean()
-                loss = ce_loss + 0.01 * balance_loss + 0.001 * z_loss
+                balance_coef = self.config.balance_coef if self.config.balancer == "aux" else 0.0
+                loss = ce_loss
+                if balance_coef:
+                    loss = loss + balance_coef * balance_loss
+                if self.config.z_coef:
+                    loss = loss + self.config.z_coef * z_loss
             else:
                 loss = ce_loss
             if return_metrics:
                 metrics = {"ce": ce_loss.detach(), "total": loss.detach()}
-                if self.config.ffn_type == "moe" and loss_reduction != 'none':
+                if aux_losses_list:
                     metrics.update({"balance": balance_loss.detach(), "z": z_loss.detach()})
                 return loss, metrics, router_stats_list
             return loss

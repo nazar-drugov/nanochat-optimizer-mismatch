@@ -21,11 +21,20 @@ def log0(message):
         logger.info(message)
 
 def make_base_experiment_name(args):
+    """Name a pretraining run by every factor that differs between cells.
+
+    Call after nanochat.train_config.resolve_optimizer_args/resolve_moe_args so
+    defaults that depend on other options are filled in.
+    """
     matrix_lr = (
         args.adamw_matrix_lr
         if args.optimizer_name == "adamw"
         else args.muon_matrix_lr
     )
+    router_optimizer = getattr(args, "router_optimizer", "same")
+    muon_variant = getattr(args, "muon_variant", "keller")
+    moe_layers = getattr(args, "moe_layers", "all")
+    balancer = getattr(args, "balancer", "aux")
 
     parts = [
         f"d{args.depth}",
@@ -34,9 +43,17 @@ def make_base_experiment_name(args):
 
     if args.ffn_type == "moe":
         parts.append(f"e{args.n_experts}")
+        if moe_layers != "all":
+            parts.append("ml" + moe_layers.replace(":", "").replace(",", "."))
+        parts.append(f"bal{balancer}")
+
+    parts.append(args.optimizer_name)
+    if args.optimizer_name == "muon":
+        parts.append(muon_variant)
+    if args.ffn_type == "moe" and router_optimizer != "same":
+        parts.append(f"r{router_optimizer}")
 
     parts.extend([
-        args.optimizer_name,
         f"s{args.seed}",
         f"tok{args.train_tokens}",
         f"bs{args.total_batch_size}",
@@ -45,13 +62,15 @@ def make_base_experiment_name(args):
         f"ulr{args.unembedding_lr:g}",
     ])
 
-    if args.ffn_type == "moe":
+    if args.ffn_type == "moe" and args.router_lr is not None:
         parts.append(f"rlr{args.router_lr:g}")
 
-    if args.optimizer_name == "adamw":
-        parts.append(f"wd{args.weight_decay:g}")
-    else:
+    parts.append(f"wd{args.weight_decay:g}")
+    if args.optimizer_name == "muon":
         parts.append(f"ns{args.muon_ns_steps}")
+    grad_clip = getattr(args, "grad_clip", None)
+    if grad_clip is not None:
+        parts.append(f"clip{grad_clip:g}" if grad_clip > 0 else "noclip")
 
     parts.extend([
         f"wu{args.warmup_steps}",
@@ -123,6 +142,22 @@ def validate_checkpoint_seed(meta_data, seed):
         )
 
 
+def checkpoint_tokenizer_name(meta_data):
+    """Tokenizer recorded in checkpoint metadata; checkpoints from before the
+    tokenizer option used nanochat's trained BPE."""
+    return meta_data.get("tokenizer") or meta_data.get("user_config", {}).get("tokenizer") or "nanochat"
+
+
+def patch_missing_expert_bias(model, model_data):
+    """MoE checkpoints written before the bias balancer existed have no
+    expert_bias buffers. Zero bias is exactly the old selection rule."""
+    for name, buffer in model.named_buffers():
+        if name.endswith("mlp.expert_bias") and name not in model_data:
+            model_data[name] = torch.zeros_like(buffer)
+            log0(f"Patching missing {name} with zeros (checkpoint predates the bias balancer)")
+    return model_data
+
+
 def build_model(checkpoint_dir, step, device, phase):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
@@ -149,14 +184,15 @@ def build_model(checkpoint_dir, step, device, phase):
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    patch_missing_expert_bias(model, model_data)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
     else:
         model.train()
-    # Load the Tokenizer
-    tokenizer = get_tokenizer()
+    # Load the Tokenizer the checkpoint was trained with (older checkpoints: nanochat's BPE)
+    tokenizer = get_tokenizer(checkpoint_tokenizer_name(meta_data))
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
     return model, tokenizer, meta_data

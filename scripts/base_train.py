@@ -1,11 +1,14 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train --train-tokens=125829120 --total-batch-size=524288
+python -m scripts.base_train --train-tokens=3000238080
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.base_train --train-tokens=125829120 --total-batch-size=524288
+torchrun --nproc_per_node=2 -m scripts.base_train --train-tokens=3000238080
+
+The total batch size defaults to 262,144 tokens (see the note at --total-batch-size);
+--train-tokens must be a multiple of it.
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --train-tokens=10240
@@ -26,10 +29,15 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, make_gpt_config
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name
+from nanochat.tokenizer import get_tokenizer, get_token_bytes, tokenizer_dir_for, TOKENIZERS
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name, patch_missing_expert_bias
 from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_routing_snapshot, snapshot_change_rates
-from nanochat.training_stats import accumulate_router_stats, expert_gradient_squared_norms, add_router_log_fields, write_train_stats_jsonl
+from nanochat.training_stats import accumulate_router_stats, expert_gradient_squared_norms, add_router_log_fields, write_train_stats_jsonl, update_batch_fingerprint
+from nanochat.train_config import (
+    add_moe_args, add_optimizer_args, resolve_optimizer_args, resolve_moe_args,
+    muon_momentum_at, wsd_lr_multiplier, write_run_record, tokenizer_identity,
+)
+from nanochat.dataset import resolve_data_dir
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -50,31 +58,34 @@ parser.add_argument(
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--seed", type=int, default=42, help="seed for model initialization")
 # Model architecture
-parser.add_argument("--ffn-type", choices=("dense", "moe"), default="dense")
-parser.add_argument("--n-experts", type=int, default=4)
+add_moe_args(parser)
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+# Data
+parser.add_argument("--tokenizer", choices=TOKENIZERS, default="gpt2",
+                    help="gpt2: GPT-2 BPE via tiktoken (team decision 2026-11-23; matches Ludziejewski et al.); nanochat: <base_dir>/tokenizer")
+parser.add_argument("--dataset", type=str, default=None, help="pretraining dataset name (default: the registry default, FineWeb-Edu-100B)")
+parser.add_argument("--data-dir", type=str, default=None, help="directory of nanochat-format parquet shards (overrides --dataset)")
 # Training horizon
 parser.add_argument("--train-tokens", type=int, required=True, help="total number of training tokens")
 # Optimization
-parser.add_argument("--optimizer-name", choices=("adamw", "muon"), default="adamw")
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-parser.add_argument("--total-batch-size", type=int, required=True, help="total batch size in tokens across all ranks")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--router-lr", type=float, default=0.004, help="learning rate for MoE router parameters (AdamW)")
-parser.add_argument("--adamw-matrix-lr", type=float, default=6e-4, help="learning rate for transformer matrices in AdamW mode")
-parser.add_argument("--adamw-beta1", type=float, default=0.9, help="AdamW beta1 for every AdamW parameter group")
-parser.add_argument("--adamw-beta2", type=float, default=0.95, help="AdamW beta2 for every AdamW parameter group")
-parser.add_argument("--adamw-eps", type=float, default=1e-8, help="AdamW epsilon for every AdamW parameter group")
-parser.add_argument("--muon-matrix-lr", type=float, default=0.02, help="learning rate for transformer matrices in Muon mode")
-parser.add_argument("--muon-ns-steps", type=int, default=5, help="Muon Newton-Schulz iteration count")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay for transformer matrices in AdamW mode; original Muon does not use weight decay")
-parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
+# Default 256K tokens (2^18). Rationale (2026-11-23): Ludziejewski et al. (arXiv:2502.05172)
+# end their batch ramp at 256K for models of this size (~118M active), and DeepSeek LLM's
+# fit B_opt = 0.292 * C^0.327 gives ~240K for depth-10 at 3B tokens. Larger batches waste
+# tokens under a fixed token budget and are reported to favor Muon over AdamW, which would
+# widen the gap between AdamW- and Muon-pretrained base models. Keep it fixed across every
+# cell and run the LR sweep at this batch: the optimal LR shifts with batch size.
+parser.add_argument("--total-batch-size", type=int, default=262144, help="total batch size in tokens across all ranks (default 256K; keep identical across cells, see note above)")
+add_optimizer_args(parser, weight_decay_default=0.1)
+# Schedule: warmup, constant, then linear decay over the last warmdown_ratio of steps (spec §5)
+parser.add_argument("--warmup-tokens", type=int, default=130_000_000,
+                    help="tokens of linear LR warmup (default 130M, as in Ludziejewski et al. Sec. 5.1.3); rounded up to whole steps")
+parser.add_argument("--warmup-steps", type=int, default=None, help="LR warmup in optimizer steps (overrides --warmup-tokens)")
+parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of iterations for the final linear LR decay")
+parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -97,9 +108,21 @@ if args.train_tokens % args.total_batch_size != 0:
 if args.train_stats_every <= 0:
     parser.error("--train-stats-every must be greater than zero")
 
+# Fill defaults that depend on other options (Muon LR per variant, z-loss per balancer, warmup)
+if args.warmup_steps is None:
+    args.warmup_steps = -(-args.warmup_tokens // args.total_batch_size)  # ceil
+optimizer_kwargs = resolve_optimizer_args(args)
+moe_config_kwargs = resolve_moe_args(args)
+data_dir = resolve_data_dir(args.dataset, args.data_dir)
+
 total_batch_size = args.total_batch_size
 total_tokens = args.train_tokens
 num_iterations = total_tokens // total_batch_size
+if args.warmup_steps < 0 or not 0 <= args.warmdown_ratio <= 1:
+    parser.error("--warmup-steps must be >= 0 and --warmdown-ratio in [0, 1]")
+if args.warmup_steps + round(args.warmdown_ratio * num_iterations) > num_iterations:
+    parser.error(f"warmup ({args.warmup_steps} steps) plus decay ({round(args.warmdown_ratio * num_iterations)} steps) "
+                 f"exceeds the run ({num_iterations} steps); lower --warmup-tokens/--warmup-steps or --warmdown-ratio")
 
 user_config = vars(args).copy()  # for logging
 
@@ -156,8 +179,8 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+tokenizer = get_tokenizer(args.tokenizer)
+token_bytes = get_token_bytes(device=device, name=args.tokenizer)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -171,14 +194,18 @@ model_config = make_gpt_config(
     head_dim=args.head_dim,
     max_seq_len=args.max_seq_len,
     vocab_size=vocab_size,
-    ffn_type=args.ffn_type,
-    n_experts=args.n_experts,
+    **moe_config_kwargs,
 )
 with torch.device("meta"):
     model = GPT(model_config) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+parameter_counts = model.parameter_counts()
+print0("Parameter counts:\n" + "\n".join(f"  {k}: {v:,}" for k, v in parameter_counts.items()))
+moe_layer_indices = model.moe_layer_indices
+if moe_layer_indices:
+    print0(f"MoE layers: {moe_layer_indices}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights(seed=args.seed) # 3) All tensors get initialized
 
@@ -194,6 +221,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     validate_checkpoint_seed(meta_data, args.seed)
+    patch_missing_expert_bias(model, model_data)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -205,33 +233,30 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 
 # -----------------------------------------------------------------------------
 # Use the explicit optimizer settings without parameter- or FLOP-based scaling.
-matrix_weight_decay = args.weight_decay if args.optimizer_name == "adamw" else 0.0
-
 print0(f"Total batch size: {total_batch_size:,} tokens")
 print0(f"Number of iterations: {num_iterations:,}")
 print0(f"Total training tokens: {total_tokens:,}")
-if args.optimizer_name == "muon":
-    print0("Original Muon does not apply weight decay to transformer matrices")
 
 # -----------------------------------------------------------------------------
-# Initialize the selected optimizer. Muon mode uses AdamW for embeddings, the lm_head, and routers.
-optimizer = model.setup_optimizer(
-    optimizer_name=args.optimizer_name,
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    router_lr=args.router_lr,
-    adamw_matrix_lr=args.adamw_matrix_lr,
-    adamw_beta1=args.adamw_beta1,
-    adamw_beta2=args.adamw_beta2,
-    adamw_eps=args.adamw_eps,
-    muon_matrix_lr=args.muon_matrix_lr,
-    muon_ns_steps=args.muon_ns_steps,
-    weight_decay=matrix_weight_decay,
-)
+# Initialize the selected optimizer. Embeddings and the lm_head use AdamW in every
+# cell; matrices use --optimizer-name; routers use --router-optimizer.
+optimizer = orig_model.setup_optimizer(**optimizer_kwargs)
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+# Full run record next to the checkpoints (spec §0 rule 1)
+if master_process:
+    record_name = "config.json" if not resuming else f"config_resume_{args.resume_from_step:06d}.json"
+    write_run_record(
+        os.path.join(checkpoint_dir, record_name),
+        args=args, model=orig_model, optimizer=optimizer,
+        device_type=device_type, world_size=ddp_world_size, compute_dtype=COMPUTE_DTYPE,
+        data={"train_data_dir": data_dir, "tokenizer_name": args.tokenizer,
+              "tokenizer": tokenizer_identity(tokenizer_dir_for(args.tokenizer))},
+        extra={"experiment_name": experiment_name, "stage": "pretrain", "num_iterations": num_iterations},
+    )
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -242,34 +267,31 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=data_dir)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=data_dir)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# Learning rate schedule (linear warmup, constant, linear decay over the last warmdown_ratio)
+warmdown_iters = round(args.warmdown_ratio * num_iterations)
 def get_lr_multiplier(it):
-    warmup_iters = args.warmup_steps
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+    return wsd_lr_multiplier(it, num_iterations, args.warmup_steps, warmdown_iters, args.final_lr_frac)
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
+# Muon momentum: constant by default (spec), or nanochat's schedule
 def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
+    return muon_momentum_at(it, num_iterations, args.warmdown_ratio, args)
+
+# Cumulative per-(MoE layer, expert) token counts over the whole run (all ranks)
+n_moe_layers = len(moe_layer_indices)
+cumulative_expert_counts = torch.zeros((n_moe_layers, model_config.n_experts), dtype=torch.long, device=device) if n_moe_layers else None
+if resuming and cumulative_expert_counts is not None and meta_data.get("cumulative_expert_counts") is not None:
+    cumulative_expert_counts.copy_(torch.tensor(meta_data["cumulative_expert_counts"], dtype=torch.long))
+
+# Running hash of every training batch this rank consumes (see training_stats).
+# Saved per rank in checkpoints; identical across optimizer cells and across resumes.
+data_fingerprint = torch.zeros((), dtype=torch.long, device=device)
+fingerprint_weights = None
+if resuming and meta_data.get("data_fingerprints") is not None:
+    data_fingerprint.fill_(meta_data["data_fingerprints"][ddp_rank])
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -363,13 +385,19 @@ while True:
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
+            tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
             sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if step != args.resume_from_step and (last_step or (step > 0 and args.save_every > 0 and step % args.save_every == 0)):
+        if is_ddp_initialized():
+            gathered_fingerprints = [torch.zeros_like(data_fingerprint) for _ in range(ddp_world_size)]
+            dist.all_gather(gathered_fingerprints, data_fingerprint)
+            data_fingerprints = [int(fp.item()) for fp in gathered_fingerprints]
+        else:
+            data_fingerprints = [int(data_fingerprint.item())]
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -384,6 +412,11 @@ while True:
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
                 "train_tokens": total_tokens,
+                "tokenizer": args.tokenizer,
+                "data_dir": data_dir,
+                "parameter_counts": parameter_counts,
+                "cumulative_expert_counts": None if cumulative_expert_counts is None else cumulative_expert_counts.cpu().tolist(),
+                "data_fingerprints": data_fingerprints,  # per rank, over all batches trained so far
                 # x/y have already been prefetched. Replay them first on resume,
                 # then continue from the saved document buffer and cursor.
                 "dataloader_state_dict": {
@@ -435,6 +468,7 @@ while True:
     metrics_sums = {}
     router_stats_sums = None
     for micro_step in range(grad_accum_steps):
+        data_fingerprint, fingerprint_weights = update_batch_fingerprint(data_fingerprint, x, fingerprint_weights)
         loss, metrics, router_stats = model(x, y, return_metrics=True)
 
         # Divide the loss by the number of gradient accumulation steps
@@ -484,6 +518,15 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # MoE load for this step, summed over micro-batches and ranks. It drives the
+    # bias balancer (identical update on every rank) and the run's cumulative counts.
+    if router_stats_sums is not None:
+        step_expert_counts = router_stats_sums.pop("expert_counts")
+        if is_ddp_initialized():
+            dist.all_reduce(step_expert_counts, op=dist.ReduceOp.SUM)
+        cumulative_expert_counts += step_expert_counts
+        orig_model.update_expert_bias(step_expert_counts)
     train_loss_f = metrics_sums["total"].item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -528,7 +571,14 @@ while True:
             f"train/{key}_loss": value.item()
             for key, value in metrics_sums.items()
         })
-        add_router_log_fields(log_data, router_stats_sums, expert_grad_norms)
+        if optimizer.last_grad_norm is not None:
+            log_data["train/grad_norm"] = optimizer.last_grad_norm.item()  # pre-clip global norm
+            log_data["train/grad_clip_coef"] = optimizer.last_clip_coef.item()  # < 1 means clipped
+        add_router_log_fields(
+            log_data, router_stats_sums, expert_grad_norms,
+            layer_indices=moe_layer_indices,
+            expert_bias=orig_model.expert_bias_state() if model_config.balancer == "bias" else None,
+        )
         wandb_run.log(log_data)
         write_train_stats_jsonl(args.train_stats_jsonl, log_data, master_process)
 

@@ -6,50 +6,38 @@ import torch
 
 
 def routing_probe(model, probe_tokens):
-    """Return expert IDs with shape (layer, batch, position).
+    """Return the expert IDs actually used, shape (moe_layer, batch, position).
 
-    The full model processes the tokens normally. Hooks only observe each
-    router's logits; they do not feed embeddings into later layers or change
-    the model's output.
+    The full model processes the tokens normally; the MoE layers report the
+    routes they used (including any balancing bias) through the model's
+    routing_capture path. Rows follow model.moe_layer_indices.
     """
     if probe_tokens.ndim != 2 or probe_tokens.numel() == 0:
         raise ValueError("probe_tokens must be a nonempty (batch, position) tensor")
     if model.config.ffn_type != "moe":
         raise ValueError("routing_probe requires an MoE model")
 
-    blocks = model.transformer.h
-    choices = [None] * len(blocks)
-    hooks = []
+    moe_layers = model.moe_layer_indices
+    captured = []
     was_training = model.training
     previous_matmul_precision = torch.get_float32_matmul_precision()
-
-    def capture_router(layer_idx):
-        def hook(_router, _inputs, logits):
-            if choices[layer_idx] is not None:
-                raise RuntimeError(f"router in layer {layer_idx} ran more than once")
-            choices[layer_idx] = logits.argmax(dim=-1).detach().cpu()
-        return hook
 
     try:
         # Training configures CUDA matmuls to "high" in compute_init. Keep
         # checkpoint replay independent of the caller's ambient precision.
         if probe_tokens.is_cuda:
             torch.set_float32_matmul_precision("high")
-        for layer_idx, block in enumerate(blocks):
-            hooks.append(block.mlp.router.register_forward_hook(capture_router(layer_idx)))
         model.eval()
         with torch.inference_mode():
-            model(probe_tokens)
+            model(probe_tokens, routing_capture=captured)
     finally:
-        for hook in hooks:
-            hook.remove()
         model.train(was_training)
         if probe_tokens.is_cuda:
             torch.set_float32_matmul_precision(previous_matmul_precision)
 
-    if any(choice is None for choice in choices):
-        raise RuntimeError("the probe forward pass did not visit every router")
-    return torch.stack(choices)
+    if [entry["layer"] for entry in captured] != moe_layers:
+        raise RuntimeError("the probe forward pass did not visit every MoE layer exactly once")
+    return torch.stack([entry["choices"].cpu() for entry in captured])
 
 
 def per_layer_change_rates(previous_choices, current_choices):

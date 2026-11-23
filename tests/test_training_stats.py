@@ -51,7 +51,7 @@ def test_expert_gradient_norm_from_known_parameter_gradients():
     experts = nn.ModuleList([nn.Linear(2, 2, bias=True) for _ in range(4)])
     model = SimpleNamespace(
         config=SimpleNamespace(n_layer=1, n_experts=4),
-        transformer=SimpleNamespace(h=[SimpleNamespace(mlp=SimpleNamespace(experts=experts))]),
+        transformer=SimpleNamespace(h=[SimpleNamespace(is_moe=True, mlp=SimpleNamespace(experts=experts))]),
     )
     experts[0].weight.grad = torch.tensor([[3., 4.], [0., 0.]])
     experts[0].bias.grad = torch.tensor([12., 0.])

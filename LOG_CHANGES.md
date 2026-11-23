@@ -211,3 +211,22 @@
 - Rank 0 selects one validation batch for a new run, runs the probe at each checkpoint, and logs the per-layer change rates to W&B. On resume it reloads the saved inputs and choices for the requested checkpoint; a missing snapshot fails explicitly instead of silently selecting a new batch. Resuming from the final step does not rewrite its checkpoint or snapshot.
 - Added focused tests for capture shape and expert range, evaluation and training mode restoration, hook cleanup after failure, per-layer rates, snapshot round trips, changed-probe rejection, and dense-model rejection. The routing-probe and GPT suites passed: 25 tests.
 - `--save-every=-1` creates only a final baseline. A positive checkpoint interval is required for a pretraining stability time series. Full training and distributed probe execution remain unverified.
+
+## Pretraining readiness (2026-11-23)
+
+Decisions and the learning-rate sweep protocol are in `PRETRAINING_PROTOCOL.md`.
+
+- **Router optimizer:** `--router-optimizer same|adamw|muon`, default `same`, so routers use the run's matrix optimizer as the spec decides. The router LR defaults to that optimizer's matrix LR. The hidden 1/√(d/768) scaling now applies only to the embedding and lm_head groups.
+- **Muon variants:** `plain` (default: Moonlight 0.2·√max(m,n) update scaling plus decoupled weight decay) and `keller` (the previous original-Muon scaling). Weight decay applies in both. Muon momentum is constant 0.95 by default; nanochat's schedule is available with `--muon-momentum-schedule nanochat`.
+- **Gradient clipping:** global-norm clipping (`--grad-clip`, default 1.0) on the reduced gradient, correct across ranks. The pre-clip norm and clip coefficient are logged.
+- **Bug fix:** the optimizer waited on `Work.get_future()`, which gloo lacks, and gloo re-copies reduce-scatter outputs on every `wait()`. It now waits on work handles once, so the multi-rank path runs on CPU and clipping is not undone on sharded tensors.
+- **Load balancing:** `--balancer aux|bias|none` with configurable `--balance-coef`, `--z-coef` and `--bias-update-rate`. The bias changes selection only, never the gate value. Bias updates use step loads summed over micro-batches and ranks.
+- **MoE layers:** `--moe-layers all|every:K|i,j,...`. Non-MoE layers in an MoE model, and the new `--ffn-type swiglu`, use a dense SwiGLU MLP identical to one expert.
+- **Analysis hooks:** `GPT.forward(forced_routes=..., routing_capture=...)` for route replay and capture of router inputs, logits and the routes actually used. `routing_probe` now records the routes actually used, including the bias.
+- **Data:** a dataset registry with FineWeb-Edu-100B as the default. `--dataset`/`--data-dir` reach the loader, which also gains seeded shuffling with exact resume. `scripts/make_heldout.py` builds a MinHash-deduplicated held-out D0.
+- **Tokenizer:** `--tokenizer gpt2|nanochat`, default `gpt2`, recorded in checkpoints and used on reload. The engine tolerates tokenizers without chat tokens, and pretraining samples use the BOS id.
+- **Schedule:** `--warmup-tokens` (default 130M) and `--warmdown-ratio 0.2` decaying to 0. The default batch is 256K tokens. Runs whose warmup plus decay exceed the run are rejected.
+- **Records:** `config.json` (and `config_resume_<step>.json`) contain every argument, the model config, parameter counts under each convention, every optimizer group, data and tokenizer identity, git commit and dirty state, and hardware. Checkpoints store cumulative expert counts and per-rank data fingerprints.
+- **Tests:** 200 passed and 18 CUDA-only tests skipped (`uv run --group dev python -m pytest -q`). They include spec §8 tests 1–7, optimizer parity with `torch.optim.Muon`, a two-rank gloo test, and end-to-end CPU runs of `base_train.py`. Those runs show that AdamW and Muon cells see identical data and that resuming is bit-exact. The only failure is the known macOS `test_execution.py::test_memory_limit`.
+- **Not yet verified:** CUDA throughput, the two-GPU NCCL path and the CUDA-only optimizer tests. They need the cluster.
+- **Parked:** the fine-tuning data scripts, the LM fine-tuning script and the evaluation pipeline. `chat_sft.py` and `base_eval.py` were not updated for GPT-2 checkpoints.

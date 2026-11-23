@@ -98,9 +98,11 @@ def test_moe_auxiliary_objective_and_router_gradients():
     assert model(idx).shape == (2, 8, model.config.vocab_size)
     assert len(router_stats) == model.config.n_layer
     for layer in router_stats:
-        assert set(layer) == {"expert_shares", "router_entropy", "mean_expert_probs", "z_loss"}
+        assert set(layer) == {"expert_shares", "expert_counts", "router_entropy",
+                              "mean_expert_probs", "max_vio", "z_loss"}
         assert all(not value.requires_grad for value in layer.values())
         torch.testing.assert_close(layer["expert_shares"].sum(), torch.tensor(1.0))
+        assert layer["expert_counts"].sum().item() == idx.numel()
 
     full_loss.backward()
     for ce_grad, block in zip(ce_router_grads, model.transformer.h):
@@ -120,16 +122,22 @@ def test_dense_model_reports_only_cross_entropy():
     torch.testing.assert_close(loss.detach(), metrics["ce"])
 
 
-@pytest.mark.parametrize("ffn_type", ["dense", "moe"])
+@pytest.mark.parametrize("ffn_type", ["dense", "swiglu", "moe"])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
+@pytest.mark.parametrize("router_optimizer", ["same", "adamw", "muon"])
+def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name, router_optimizer):
     model = make_model(ffn_type=ffn_type)
     optimizer = model.setup_optimizer(
         optimizer_name=optimizer_name,
+        router_optimizer=router_optimizer,
         adamw_beta1=0.81,
         adamw_beta2=0.93,
         adamw_eps=2e-8,
+        adamw_matrix_lr=3e-3,
+        muon_matrix_lr=0.03,
         muon_ns_steps=3,
+        muon_variant="plain",
+        weight_decay=0.1,
     )
 
     model_parameter_ids = [id(parameter) for parameter in model.parameters()]
@@ -138,12 +146,8 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
         for group in optimizer.param_groups
         for parameter in group["params"]
     ]
-
     assert len(optimizer_parameter_ids) == len(set(optimizer_parameter_ids))
     assert set(optimizer_parameter_ids) == set(model_parameter_ids)
-
-    expected_kinds = {"adamw"} if optimizer_name == "adamw" else {"adamw", "muon"}
-    assert {group["kind"] for group in optimizer.param_groups} == expected_kinds
 
     for group in optimizer.param_groups:
         if group["kind"] == "adamw":
@@ -151,22 +155,43 @@ def test_optimizer_groups_cover_every_parameter_once(ffn_type, optimizer_name):
             assert group["eps"] == 2e-8
         else:
             assert group["ns_steps"] == 3
-            assert "beta2" not in group
-            assert "weight_decay" not in group
+            assert group["variant"] == "plain"
+
+    # Embeddings and lm_head are AdamW in every cell; matrices use the run's optimizer.
+    roles = {}
+    for group in optimizer.param_groups:
+        roles.setdefault(group["role"], set()).add(group["kind"])
+    assert roles["embedding"] == {"adamw"} and roles["unembedding"] == {"adamw"}
+    assert roles["matrix"] == {optimizer_name}
+    matrix_groups = [g for g in optimizer.param_groups if g["role"] == "matrix"]
+    assert all(g["lr"] == (3e-3 if optimizer_name == "adamw" else 0.03) for g in matrix_groups)
+    assert all(g["weight_decay"] == 0.1 for g in matrix_groups)
 
     if ffn_type == "moe":
-        adamw_parameter_ids = {
-            id(parameter)
-            for group in optimizer.param_groups
-            if group["kind"] == "adamw"
-            for parameter in group["params"]
-        }
-        router_parameter_ids = {
-            id(parameter)
-            for block in model.transformer.h
-            for parameter in block.mlp.router.parameters()
-        }
-        assert router_parameter_ids <= adamw_parameter_ids
+        expected_router_kind = optimizer_name if router_optimizer == "same" else router_optimizer
+        assert roles["router"] == {expected_router_kind}
+        router_groups = [g for g in optimizer.param_groups if g["role"] == "router"]
+        router_parameter_ids = {id(p) for block in model.transformer.h for p in block.mlp.router.parameters()}
+        assert {id(p) for g in router_groups for p in g["params"]} == router_parameter_ids
+        # Router LR defaults to the matrix LR of the optimizer the router uses; no weight decay.
+        expected_lr = 3e-3 if expected_router_kind == "adamw" else 0.03
+        assert all(g["lr"] == expected_lr and g["weight_decay"] == 0.0 for g in router_groups)
+    else:
+        assert "router" not in roles
+
+
+def test_router_optimizer_same_puts_routers_in_muon_and_steps():
+    """The spec's decision: routers follow the run's matrix optimizer."""
+    model = make_model(ffn_type="moe")
+    optimizer = model.setup_optimizer(optimizer_name="muon", router_optimizer="same", muon_variant="plain")
+    router_groups = [g for g in optimizer.param_groups if g["role"] == "router"]
+    assert router_groups and all(g["kind"] == "muon" for g in router_groups)
+    before = [block.mlp.router.weight.detach().clone() for block in model.transformer.h]
+    idx = torch.arange(16).reshape(2, 8) % model.config.vocab_size
+    model(idx, (idx + 1) % model.config.vocab_size).backward()
+    optimizer.step()
+    for old, block in zip(before, model.transformer.h):
+        assert not torch.equal(old, block.mlp.router.weight)
 
 
 def test_dense_state_dict_round_trip():

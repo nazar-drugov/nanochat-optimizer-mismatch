@@ -165,6 +165,14 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
 
+    def _special_or_none(self, text):
+        """Special token id, or None if this tokenizer does not define it
+        (tiktoken raises KeyError for an unknown special token)."""
+        try:
+            return self.tokenizer.encode_special(text)
+        except (KeyError, ValueError):
+            return None
+
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
@@ -176,7 +184,9 @@ class Engine:
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
+        # Tokenizers without nanochat's chat tokens (e.g. GPT-2) get None for them,
+        # which never matches a sampled token, so plain completion still works.
+        get_special = self._special_or_none
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
         output_start = get_special("<|output_start|>")
@@ -273,7 +283,7 @@ class Engine:
         Returns a list of token sequences (list of lists of ints).
         Terminal tokens (assistant_end, bos) are not included in the results.
         """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        assistant_end = self._special_or_none("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]

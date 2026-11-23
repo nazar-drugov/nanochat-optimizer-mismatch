@@ -75,19 +75,39 @@ where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hu
 performance at all relative to UV^T, where USV^T = G is the SVD.
 """
 
+MUON_VARIANTS = ("plain", "keller")
+
+
+def muon_lr_scale(variant: str, shape) -> float:
+    """Shape-dependent multiplier applied to a Muon group's learning rate.
+
+    plain:    Moonlight update scaling 0.2 * sqrt(max(m, n)), which matches the
+              update RMS of AdamW (Liu et al. 2025, arXiv:2502.16982).
+    keller:   original Muon aspect-ratio scaling sqrt(max(1, m / n)).
+    Weights are stored (out_features, in_features), so m = shape[-2], n = shape[-1].
+    """
+    m, n = shape[-2], shape[-1]
+    if variant == "plain":
+        return 0.2 * max(m, n) ** 0.5
+    if variant == "keller":
+        return max(1.0, m / n) ** 0.5
+    raise ValueError(f"Unknown Muon variant: {variant!r} (expected one of {MUON_VARIANTS})")
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,   # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,  # (12, 768, 3072) - stacked parameters
     momentum_buffer: Tensor, # (12, 768, 3072) - momentum buffer
     momentum_t: Tensor,      # () - 0-D CPU tensor, momentum coefficient
-    lr_t: Tensor,            # () - 0-D CPU tensor, aspect-ratio-adjusted learning rate
+    lr_t: Tensor,            # () - 0-D CPU tensor, shape-adjusted learning rate
+    decay_t: Tensor,         # () - 0-D CPU tensor, lr * weight_decay (decoupled)
     ns_steps: int,           # 5 - number of Newton-Schulz iterations
 ) -> None:
     """
-    Original Muon update: Nesterov momentum, fixed-coefficient Newton-Schulz
-    orthogonalization, then the parameter update. The aspect-ratio adjustment is
-    included in lr_t by the caller.
+    Plain/original Muon update: Nesterov momentum, fixed-coefficient Newton-Schulz
+    orthogonalization, decoupled weight decay, then the parameter update. The
+    variant's shape scaling is included in lr_t by the caller.
     """
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
@@ -107,7 +127,9 @@ def muon_step_fused(
 
     if g.size(-2) > g.size(-1):
         X = X.mT
+    stacked_params.mul_(1 - decay_t.to(stacked_params.dtype))
     stacked_params.sub_(lr_t.to(stacked_params.dtype) * X.to(stacked_params.dtype))
+
 
 # -----------------------------------------------------------------------------
 
@@ -140,6 +162,10 @@ class DistributedOptimizer(torch.optim.Optimizer):
     - Overlap communication with computation (async ops)
     - Minimize memory by sharding optimizer states across ranks (ZeRO-2 style)
     - Batch small tensors into single comm ops where possible
+
+    Async collectives are waited on through their Work handles (work.wait()), which
+    NCCL and gloo both support; gloo does not implement Work.get_future(), and the
+    handles let the multi-rank path be tested on CPU (tests/test_optim_variants.py).
 
     Communication Pattern (3-phase async):
     We use a 3-phase structure to maximize overlap between communication and compute:
@@ -187,8 +213,10 @@ class DistributedOptimizer(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps'
     """
-    def __init__(self, param_groups: list[dict]):
+    def __init__(self, param_groups: list[dict], max_grad_norm: float | None = None, track_grad_norm: bool = False):
         super().__init__(param_groups, defaults={})
+        if max_grad_norm is not None and max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive or None")
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -198,6 +226,20 @@ class DistributedOptimizer(torch.optim.Optimizer):
         self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_decay_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        for group in self.param_groups:
+            if group["kind"] == "muon":
+                variant = group.setdefault("variant", "keller")
+                if variant not in MUON_VARIANTS:
+                    raise ValueError(f"Unknown Muon variant: {variant!r} (expected one of {MUON_VARIANTS})")
+                group.setdefault("weight_decay", 0.0)
+        # Global gradient-norm clipping across every parameter group, computed on
+        # the reduced (averaged) gradient. None disables clipping. The pre-clip
+        # norm of the last step is kept in last_grad_norm when tracking is on.
+        self.max_grad_norm = max_grad_norm
+        self.track_grad_norm = track_grad_norm or max_grad_norm is not None
+        self.last_grad_norm = None
+        self.last_clip_coef = None
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -209,14 +251,14 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 param_infos[p] = dict(future=None, grad_slice=grad, is_small=True)
             elif p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True)
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
                 # Large params: reduce_scatter
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True)
                 param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
         return dict(param_infos=param_infos)
 
@@ -241,7 +283,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
         # Reduce_scatter to get this rank's chunk
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True)
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
 
@@ -284,7 +326,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
             # Large params need all_gather
             if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                future = dist.all_gather_into_tensor(p, p_slice, async_op=True)
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
@@ -300,6 +342,8 @@ class DistributedOptimizer(torch.optim.Optimizer):
         # How many params does this rank own?
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        variant = group.get("variant", "keller")
+        weight_decay = group.get("weight_decay", 0.0)
 
         # Get or create group-level state
         state = self.state[p]
@@ -313,11 +357,14 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_lr_t.fill_(group["lr"] * muon_lr_scale(variant, shape))
+            # Decoupled weight decay uses the unscaled learning rate, as in
+            # Moonlight: W <- W - lr * (0.2 sqrt(max(m, n)) O + wd * W).
+            self._muon_decay_t.fill_(group["lr"] * weight_decay)
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, group["ns_steps"],
+                self._muon_momentum_t, self._muon_lr_t, self._muon_decay_t, group["ns_steps"],
             )
 
         if info['stacked_grads'] is None:
@@ -334,7 +381,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
         # Reuse stacked_grads buffer for all_gather output
         stacked_params = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
+        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True)
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     def _finish_gathers(self, gather_list: list) -> None:
@@ -345,6 +392,52 @@ class DistributedOptimizer(torch.optim.Optimizer):
             if info["params"] is not None:
                 # Muon: copy from stacked buffer back to individual params
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
+
+    def _clip_reduced_grads(self, reduce_infos: list, rank: int, world_size: int) -> None:
+        """Compute the global L2 norm of the averaged gradient and clip in place.
+
+        Each rank sums squares over the gradient entries it owns after the
+        reduce: AdamW shards and Muon chunks are disjoint across ranks, while
+        small all-reduced AdamW gradients are replicated and counted on rank 0.
+        """
+        local_sq = None
+        tensors_to_scale = []
+        for group, info in zip(self.param_groups, reduce_infos):
+            if group['kind'] == 'adamw':
+                for pinfo in info['param_infos'].values():
+                    if pinfo['future'] is not None:
+                        pinfo['future'].wait()
+                        # Mark complete: some backends (gloo's reduce_scatter_tensor)
+                        # copy the result into the output again on every wait(),
+                        # which would overwrite the clipping applied below.
+                        pinfo['future'] = None
+                    grad = pinfo['grad_slice']
+                    tensors_to_scale.append(grad)
+                    if pinfo['is_small'] and world_size > 1 and rank != 0:
+                        continue
+                    sq = grad.float().square().sum()
+                    local_sq = sq if local_sq is None else local_sq + sq
+            else:
+                if info['future'] is not None:
+                    info['future'].wait()
+                    info['future'] = None  # see above
+                grad = info['grad_chunk']  # zero padding contributes nothing
+                tensors_to_scale.append(grad)
+                sq = grad.float().square().sum()
+                local_sq = sq if local_sq is None else local_sq + sq
+        if local_sq is None:
+            return
+        if world_size > 1:
+            dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
+        grad_norm = local_sq.sqrt()
+        self.last_grad_norm = grad_norm
+        if self.max_grad_norm is None:
+            self.last_clip_coef = torch.ones_like(grad_norm)
+            return
+        clip_coef = torch.clamp(self.max_grad_norm / (grad_norm + 1e-6), max=1.0)
+        self.last_clip_coef = clip_coef
+        for grad in tensors_to_scale:
+            grad.mul_(clip_coef.to(grad.dtype))
 
     @torch.no_grad()
     def step(self):
@@ -365,6 +458,12 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 reduce_infos.append(self._reduce_muon(group, world_size))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
+        # Optional: global gradient norm (and clipping) on the reduced gradients.
+        # This waits for every reduce before any update, trading a little
+        # communication overlap for a correct global norm across ranks.
+        if self.track_grad_norm:
+            self._clip_reduced_grads(reduce_infos, rank, world_size)
 
         # Phase 2: wait for reduces, compute updates, launch gathers
         gather_list: list[dict] = []

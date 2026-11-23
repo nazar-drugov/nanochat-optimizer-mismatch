@@ -16,27 +16,45 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import numpy as np
 import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None, shuffle_seed=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and exact resume for states with a document-batch cursor.
     Older states without that cursor retain approximate row-group resume.
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
+    Yields (text_batch, cursor): text_batch is a list of document strings and
+    cursor = (pq_idx, rg_idx, epoch, batch_idx) tracks position for resumption;
+    epoch counts how many times we've cycled through the dataset (starts at 1).
+    With shuffle_seed set, cursor has a fifth entry: the position in this rank's
+    permuted list of (file, row group) units for the current epoch.
+
+    data_dir: directory of nanochat-format parquet shards ('text' column, last file = val);
+              None = the default pretraining dataset's directory.
+    shuffle_seed: None = fixed file/row-group order (pretraining default);
+              int = seeded shuffled order, see _shuffled_document_batches.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
+    parquet_paths = list_parquet_files(data_dir=data_dir)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+    if split == "train" and len(parquet_paths) < 2:
+        raise ValueError(f"Need >= 2 parquet files (train shard(s), then the val shard last), found {parquet_paths}")
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    if shuffle_seed is not None:
+        yield from _shuffled_document_batches(
+            parquet_paths, resume_state_dict, tokenizer_batch_size, shuffle_seed, ddp_rank, ddp_world_size,
+        )
+        return
+    if resume_state_dict is not None and resume_state_dict.get("shuffle_seed") is not None:
+        raise ValueError("resume state was produced by a shuffled loader; pass the same shuffle_seed")
 
     resume_pq_idx = resume_state_dict.get("next_pq_idx", resume_state_dict["pq_idx"]) if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict.get("next_rg_idx", resume_state_dict["rg_idx"]) if resume_state_dict is not None else None
@@ -47,6 +65,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     epoch = resume_epoch
 
     while True:  # iterate infinitely (multi-epoch)
+        yielded_this_pass = False
         pq_idx = resume_pq_idx if first_pass else 0
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
@@ -70,12 +89,64 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
                 first_batch = resume_batch_idx if resume_rg_idx == rg_idx else 0
                 for batch_idx in range(first_batch, (len(batch) + tokenizer_batch_size - 1) // tokenizer_batch_size):
                     i = batch_idx * tokenizer_batch_size
+                    yielded_this_pass = True
                     yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch, batch_idx)
                 resume_rg_idx = None  # apply the saved cursor only once
                 resume_batch_idx = None
                 rg_idx += ddp_world_size
             pq_idx += 1
+        if not first_pass and not yielded_this_pass:
+            # a complete pass gave this rank nothing: fail loudly instead of spinning forever
+            raise RuntimeError(f"rank {ddp_rank} got no documents from the {split} split; every rank needs "
+                               f">= 1 row group in some file (world_size={ddp_world_size})")
         first_pass = False
+        epoch += 1
+
+
+def _shuffled_document_batches(parquet_paths, resume_state_dict, tokenizer_batch_size, shuffle_seed, ddp_rank, ddp_world_size):
+    """
+    Seeded, shuffled variant of the _document_batches loop (e.g. fine-tuning data orders).
+
+    Each epoch, the list of all (pq_idx, rg_idx) units is permuted with
+    np.random.default_rng([shuffle_seed, epoch]); rank r takes every world_size-th unit
+    of that permutation (disjoint across ranks). Documents inside a row group are permuted
+    with np.random.default_rng([shuffle_seed, epoch, pq_idx, rg_idx]). No global RNG state
+    is used. Exact resume uses (epoch, next_unit_pos, next_batch_idx) from the saved state.
+    """
+    if isinstance(shuffle_seed, bool) or not isinstance(shuffle_seed, (int, np.integer)) or shuffle_seed < 0:
+        raise ValueError(f"shuffle_seed must be a non-negative int or None, got {shuffle_seed!r}")
+    shuffle_seed = int(shuffle_seed)
+    rg_counts = [pq.ParquetFile(path).metadata.num_row_groups for path in parquet_paths]
+    units = [(pq_idx, rg_idx) for pq_idx, count in enumerate(rg_counts) for rg_idx in range(count)]
+    if len(units) < ddp_world_size:
+        raise RuntimeError(f"only {len(units)} row groups for world_size={ddp_world_size}; "
+                           "every rank needs >= 1 row group (write smaller row groups)")
+
+    if resume_state_dict is not None:
+        if resume_state_dict.get("shuffle_seed") != shuffle_seed or "next_unit_pos" not in resume_state_dict:
+            raise ValueError(f"resume state (shuffle_seed={resume_state_dict.get('shuffle_seed')!r}) does not match "
+                             f"this loader (shuffle_seed={shuffle_seed}); exact resume needs the same seed")
+        epoch = resume_state_dict["epoch"]
+        unit_pos = resume_state_dict["next_unit_pos"]
+        first_batch = resume_state_dict["next_batch_idx"]
+    else:
+        epoch, unit_pos, first_batch = 1, 0, 0
+
+    while True:  # iterate infinitely (multi-epoch)
+        permutation = np.random.default_rng([shuffle_seed, epoch]).permutation(len(units))
+        rank_units = permutation[ddp_rank::ddp_world_size]
+        while unit_pos < len(rank_units):
+            pq_idx, rg_idx = units[rank_units[unit_pos]]
+            rg = pq.ParquetFile(parquet_paths[pq_idx]).read_row_group(rg_idx, columns=['text'])
+            texts = rg.column('text').to_pylist()
+            order = np.random.default_rng([shuffle_seed, epoch, pq_idx, rg_idx]).permutation(len(texts))
+            texts = [texts[i] for i in order]
+            for batch_idx in range(first_batch, (len(texts) + tokenizer_batch_size - 1) // tokenizer_batch_size):
+                i = batch_idx * tokenizer_batch_size
+                yield texts[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch, batch_idx, unit_pos)
+            first_batch = 0
+            unit_pos += 1
+        unit_pos = 0
         epoch += 1
 
 
@@ -83,7 +154,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, data_dir=None, shuffle_seed=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -100,11 +171,18 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
     - Approximately 35% of all tokens are discarded due to cropping
+
+    data_dir: directory of nanochat-format parquet shards ('text' column, last file = val);
+              None = the default pretraining dataset's dir (nanochat.dataset.get_data_dir()).
+    shuffle_seed: None = fixed file/row-group order (pretraining). int = seeded shuffle of the
+              row-group order and of documents within each row group, re-drawn every epoch; the
+              same seed (and world size) gives the same batch sequence. Its states carry
+              "shuffle_seed" and "next_unit_pos" and must be resumed with the same seed.
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir, shuffle_seed=shuffle_seed)
     bos_token = tokenizer.get_bos_token_id()
     exact_resume = resume_state_dict is not None and "doc_buffer" in resume_state_dict
     doc_buffer = [list(tokens) for tokens in resume_state_dict["doc_buffer"]] if exact_resume else []
@@ -112,11 +190,15 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     next_pq_idx = resume_state_dict["next_pq_idx"] if exact_resume else 0
     next_rg_idx = resume_state_dict["next_rg_idx"] if exact_resume else 0
     next_batch_idx = resume_state_dict["next_batch_idx"] if exact_resume else 0
+    next_unit_pos = resume_state_dict.get("next_unit_pos", 0) if exact_resume else 0
 
     def refill_buffer():
-        nonlocal pq_idx, rg_idx, epoch, next_pq_idx, next_rg_idx, next_batch_idx
-        doc_batch, (pq_idx, rg_idx, epoch, batch_idx) = next(batches)
+        nonlocal pq_idx, rg_idx, epoch, next_pq_idx, next_rg_idx, next_batch_idx, next_unit_pos
+        doc_batch, cursor = next(batches)
+        pq_idx, rg_idx, epoch, batch_idx = cursor[:4]
         next_pq_idx, next_rg_idx, next_batch_idx = pq_idx, rg_idx, batch_idx + 1
+        if shuffle_seed is not None:
+            next_unit_pos = cursor[4]
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
             doc_buffer.append(tokens)
@@ -185,6 +267,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
             "next_batch_idx": next_batch_idx,
             "doc_buffer": doc_buffer.copy(),
         }
+        if shuffle_seed is not None:
+            state_dict["shuffle_seed"] = int(shuffle_seed)
+            state_dict["next_unit_pos"] = next_unit_pos
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)

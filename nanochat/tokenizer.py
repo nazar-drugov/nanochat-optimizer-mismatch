@@ -261,14 +261,52 @@ class RustBPETokenizer:
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
-def get_tokenizer():
+# Tokenizers selectable by name:
+#   "nanochat": the BPE trained by scripts/tok_train.py, stored in <base_dir>/tokenizer
+#   "gpt2":     OpenAI's GPT-2 BPE via tiktoken (50,257 tokens; <|endoftext|> is the BOS),
+#               the tokenizer of Ludziejewski et al. (arXiv:2502.05172). It has none of
+#               nanochat's chat special tokens, so it supports pretraining and plain
+#               language-model fine-tuning but not chat SFT.
+TOKENIZERS = ("nanochat", "gpt2")
+
+
+def _tiktoken_cache_dir():
+    """tiktoken downloads the GPT-2 BPE files on first use. Cache them under the
+    nanochat base dir (persistent, shared by jobs) unless TIKTOKEN_CACHE_DIR is set.
+    On a cluster, load the tokenizer once on a node with internet access."""
+    from nanochat.common import get_base_dir
+    cache_dir = os.environ.get("TIKTOKEN_CACHE_DIR") or os.path.join(get_base_dir(), "tiktoken_cache")
+    os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
+    return cache_dir
+
+
+def get_tokenizer(name="nanochat"):
+    if name not in TOKENIZERS:
+        raise ValueError(f"Unknown tokenizer {name!r}; choose one of {TOKENIZERS}")
+    if name == "gpt2":
+        _tiktoken_cache_dir()
+        return RustBPETokenizer.from_pretrained("gpt2")
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
-def get_token_bytes(device="cpu"):
+
+def compute_token_bytes(tokenizer):
+    """Byte length of every token id (0 for special tokens), for bits-per-byte."""
     import torch
+    enc = tokenizer.enc
+    special_ids = {enc.encode_single_token(s) for s in tokenizer.get_special_tokens()}
+    lengths = [0 if i in special_ids else len(enc.decode_single_token_bytes(i)) for i in range(enc.n_vocab)]
+    return torch.tensor(lengths, dtype=torch.int32)
+
+
+def get_token_bytes(device="cpu", name="nanochat"):
+    import torch
+    if name not in TOKENIZERS:
+        raise ValueError(f"Unknown tokenizer {name!r}; choose one of {TOKENIZERS}")
+    if name == "gpt2":
+        return compute_token_bytes(get_tokenizer("gpt2")).to(device)
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
@@ -277,3 +315,11 @@ def get_token_bytes(device="cpu"):
     with open(token_bytes_path, "rb") as f:
         token_bytes = torch.load(f, map_location=device)
     return token_bytes
+
+
+def tokenizer_dir_for(name):
+    """Directory whose files identify the tokenizer, for run records."""
+    from nanochat.common import get_base_dir
+    if name == "gpt2":
+        return _tiktoken_cache_dir()
+    return os.path.join(get_base_dir(), "tokenizer")
