@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from nanochat.gpt import BALANCERS, FFN_TYPES
+from nanochat.gpt import BALANCERS, FFN_TYPES, MOE_DISPATCH
 from nanochat.optim import MUON_VARIANTS
 
 # Default matrix learning rate per Muon variant. "moonlight" uses Moonlight's
@@ -49,6 +49,8 @@ def add_moe_args(parser):
     group.add_argument("--z-coef", type=float, default=None,
                        help="router z-loss weight (default: 0.001 with balancer=aux, 0 otherwise)")
     group.add_argument("--bias-update-rate", type=float, default=0.001, help="bias balancer step size u (balancer=bias)")
+    group.add_argument("--moe-dispatch", choices=MOE_DISPATCH, default="auto",
+                       help="auto: grouped GEMM for bf16 on CUDA, else loop; grouped; loop (reference). Same maths, different speed")
     return group
 
 
@@ -125,6 +127,7 @@ def resolve_moe_args(args):
         balance_coef=args.balance_coef,
         z_coef=args.z_coef,
         bias_update_rate=args.bias_update_rate,
+        moe_dispatch=args.moe_dispatch,
     )
 
 

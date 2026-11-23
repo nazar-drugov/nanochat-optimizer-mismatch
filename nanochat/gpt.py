@@ -49,10 +49,38 @@ class GPTConfig:
     balance_coef: float = 0.01
     z_coef: float = 0.001
     bias_update_rate: float = 0.001
+    # How tokens reach their expert (same routing and maths either way):
+    # grouped: sort tokens by expert and run all experts in one torch._grouped_mm per
+    #          projection; static shapes, no CPU sync, so the model compiles as one graph
+    # loop:    boolean-mask gather per expert (data-dependent shapes; breaks torch.compile)
+    # auto:    grouped for bf16 activations on CUDA, loop otherwise
+    moe_dispatch: str = "auto"
 
 
 FFN_TYPES = ("dense", "swiglu", "moe")
 BALANCERS = ("aux", "bias", "none")
+MOE_DISPATCH = ("auto", "grouped", "loop")
+GROUPED_MM_ALIGN = 16  # each expert's segment starts at a multiple of this many rows
+
+
+def grouped_dispatch_supported(n_embd, dtype):
+    """torch._grouped_mm needs bf16 operands and 16-byte aligned rows."""
+    return hasattr(torch, "_grouped_mm") and dtype == torch.bfloat16 and n_embd % 8 == 0
+
+
+def resolve_moe_dispatch(config, device_type, dtype):
+    """The dispatch an MoE layer will use for activations of this device type and dtype."""
+    if config.moe_dispatch not in MOE_DISPATCH:
+        raise ValueError(f"Unknown moe_dispatch {config.moe_dispatch!r} (expected one of {MOE_DISPATCH})")
+    supported = grouped_dispatch_supported(config.n_embd, dtype)
+    if config.moe_dispatch == "grouped":
+        if not supported:
+            raise RuntimeError(f"moe_dispatch='grouped' needs torch._grouped_mm, bf16 activations and n_embd % 8 == 0 "
+                               f"(got dtype {dtype}, n_embd {config.n_embd})")
+        return "grouped"
+    if config.moe_dispatch == "auto" and supported and device_type == "cuda":
+        return "grouped"
+    return "loop"
 
 
 def moe_layer_indices(config):
@@ -88,6 +116,7 @@ def make_gpt_config(
     balance_coef=0.01,
     z_coef=0.001,
     bias_update_rate=0.001,
+    moe_dispatch="auto",
 ):
     """Build the GPT configuration shared by training and planning scripts."""
     # Nudge the model dimension up to a multiple of head_dim so every attention
@@ -103,6 +132,7 @@ def make_gpt_config(
         balance_coef=balance_coef,
         z_coef=z_coef,
         bias_update_rate=bias_update_rate,
+        moe_dispatch=moe_dispatch,
         sequence_len=max_seq_len,
         vocab_size=vocab_size,
         n_layer=depth,
@@ -262,15 +292,67 @@ class MoEMLP(nn.Module):
         router_entropy = -(router_probs * F.log_softmax(router_logits, dim=-1)).sum(dim=-1) # (batch, seq_len)
         mean_router_entropy = router_entropy.mean()  # one scalar for this MoE layer
 
-        # Prepare an output tensor. We will modify distinct inputs at each iteration of 
-        # the loop
-        output = torch.zeros_like(x) # (batch, seq_len, n_embd)
-
         mean_expert_probs = router_probs.mean(dim=(0, 1)) # (n_experts)
         # Integer token counts per expert (the load). one_hot keeps shapes static.
         expert_counts = F.one_hot(router_choices, total_num_experts).sum(dim=(0, 1))
         expert_shares = expert_counts.float() / total_num_tokens
 
+        if resolve_moe_dispatch(self.config, x.device.type, x.dtype) == "grouped":
+            output = self._dispatch_grouped(x, router_probs, router_choices, expert_counts)
+        else:
+            output = self._dispatch_loop(x, router_probs, router_choices)
+
+        # The raw z-loss also serves as a routing diagnostic.
+        L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
+        # Switch balance loss: f_i (expert_shares) carries no gradient; P_i does.
+        L_balance = total_num_experts * (expert_shares * mean_expert_probs).sum()
+        router_stats = {
+            "expert_shares": expert_shares.detach(),
+            "expert_counts": expert_counts.detach(),
+            "router_entropy": mean_router_entropy.detach(),
+            "mean_expert_probs": mean_expert_probs.detach(),
+            "max_vio": (total_num_experts * expert_shares.max() - 1).detach(),
+            "z_loss": L_z.detach(),
+        }
+        return output, {"balance": L_balance, "z": L_z}, router_stats
+
+    def _dispatch_grouped(self, x, router_probs, router_choices, expert_counts):
+        """y_t = p_{t,e} * Expert_e(x_t) for each token's expert e, with all experts in one
+        grouped GEMM per projection. Static shapes and no host sync, so it compiles into the
+        surrounding graph. Same maths as _dispatch_loop (up to bf16 GEMM rounding)."""
+        B, T, D = x.shape
+        E = self.config.n_experts
+        N = B * T
+        A = GROUPED_MM_ALIGN
+        flat_x = x.reshape(N, D)
+        flat_choices = router_choices.reshape(N)
+        gate = router_probs.reshape(N, E).gather(1, flat_choices[:, None]) # (N, 1) fp32, carries the router gradient
+        # Sort tokens by expert. Expert e's tokens go to rows [seg_start_e, seg_start_e + count_e)
+        # of a buffer with N + E*A rows, where every segment starts at a multiple of A.
+        order = torch.argsort(flat_choices, stable=True)
+        sorted_choices = flat_choices[order]
+        padded = (expert_counts + A - 1) // A * A
+        seg_end = torch.cumsum(padded, 0)
+        seg_start = seg_end - padded
+        first_sorted = torch.cumsum(expert_counts, 0) - expert_counts # position of each expert's first token in `order`
+        rank_in_expert = torch.arange(N, device=x.device) - first_sorted[sorted_choices]
+        rows = seg_start[sorted_choices] + rank_in_expert # buffer row of the i-th sorted token
+        buf = x.new_zeros(N + E * A, D).index_copy(0, rows, flat_x[order])
+        offs = seg_end.to(torch.int32)
+
+        def stacked(name): # (E, in, out) view of the experts' weights, in the activation dtype
+            return torch.stack([getattr(e, name).weight for e in self.experts]).to(x.dtype).transpose(1, 2)
+
+        h = F.silu(torch._grouped_mm(buf, stacked("gate"), offs=offs)) * torch._grouped_mm(buf, stacked("up"), offs=offs)
+        y = torch._grouped_mm(h, stacked("down"), offs=offs).index_select(0, rows) # (N, D), sorted order
+        y = y * gate[order].to(y.dtype)
+        return torch.empty_like(y).index_copy(0, order, y).view(B, T, D)
+
+    def _dispatch_loop(self, x, router_probs, router_choices):
+        """Reference dispatch: one boolean-mask gather per expert."""
+        # Prepare an output tensor. We will modify distinct inputs at each iteration of
+        # the loop
+        output = torch.zeros_like(x) # (batch, seq_len, n_embd)
         for idx, expert in enumerate(self.experts):
             # Create a mask that's 1 for positions current expert will process, and 0
             # for all other positions
@@ -297,20 +379,7 @@ class MoEMLP(nn.Module):
 
             # Put the current expert's outputs into relevant positions of output tensor
             output[mask] = curr_expert_output
-
-        # The raw z-loss also serves as a routing diagnostic.
-        L_z = torch.logsumexp(router_logits, dim=-1).square().mean()
-        # Switch balance loss: f_i (expert_shares) carries no gradient; P_i does.
-        L_balance = total_num_experts * (expert_shares * mean_expert_probs).sum()
-        router_stats = {
-            "expert_shares": expert_shares.detach(),
-            "expert_counts": expert_counts.detach(),
-            "router_entropy": mean_router_entropy.detach(),
-            "mean_expert_probs": mean_expert_probs.detach(),
-            "max_vio": (total_num_experts * expert_shares.max() - 1).detach(),
-            "z_loss": L_z.detach(),
-        }
-        return output, {"balance": L_balance, "z": L_z}, router_stats
+        return output
 
 
 class Block(nn.Module):
@@ -322,6 +391,8 @@ class Block(nn.Module):
             raise ValueError(f"Unknown ffn_type {config.ffn_type!r} (expected one of {FFN_TYPES})")
         if config.balancer not in BALANCERS:
             raise ValueError(f"Unknown balancer {config.balancer!r} (expected one of {BALANCERS})")
+        if config.moe_dispatch not in MOE_DISPATCH:
+            raise ValueError(f"Unknown moe_dispatch {config.moe_dispatch!r} (expected one of {MOE_DISPATCH})")
 
         self.is_moe = layer_idx in moe_layer_indices(config)
         if config.ffn_type == "dense":

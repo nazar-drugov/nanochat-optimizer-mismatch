@@ -118,7 +118,10 @@ if the transfer check fails.
 - Build the held-out set D0 (~2M tokens, MinHash-deduplicated against training shards):
   `python -m scripts.make_heldout --dataset fineweb-edu-100b --tokenizer gpt2 --workers 32` (CPU job).
 - Run the throughput benchmark (spec §8.8) and the two-GPU CUDA optimizer test
-  (`tests/test_optim.py::test_two_rank_muon_matches_torch_reference`) on the cluster.
+  (`tests/test_optim.py::test_two_rank_muon_matches_torch_reference`) on the cluster:
+  `python -m scripts.bench_moe_throughput --depth 10 --experts 1,4,8,16 --dispatch grouped,loop --device-batch-size 32 --out bench.jsonl`.
+  Check that `grouped` has 0 graph breaks and that `torch._grouped_mm` does not fall back to a per-expert
+  loop on the B200 (on an RTX 5080 it does, with one host sync per call).
 - On ORCD, use `runs/pretrain_study.sh` to download to pool and stage to
   scratch once per dataset version, then launch many runs using that scratch
   copy. Downloads and staging are not part of each training run. See
@@ -129,6 +132,11 @@ if the transfer check fails.
   every cell of the study is guaranteed to read identical bytes. A resumed run also
   confirms that its shard list and tokenizer match the checkpoint. If the data ever
   changes, build a new D0 and a new manifest version; do not mix versions in one study.
+- MoE layers use the grouped-GEMM dispatch on CUDA (`--moe-dispatch auto`). The per-expert loop is kept
+  as the reference (`--moe-dispatch loop`); it breaks `torch.compile` and was 1.4–2.4× slower than dense at E ≤ 8 on an RTX 5080.
+- GPU runs are not bitwise reproducible (two identical runs differ after a few steps, with either
+  dispatch); the data stream is identical across runs and cells, and resume restores the exact state,
+  but the continuation is only statistically equivalent.
 
 Example cell preview (0.004 is the Muon sweep center, not a selected final LR):
 

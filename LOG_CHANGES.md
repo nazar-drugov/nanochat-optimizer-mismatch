@@ -351,3 +351,21 @@ Found by running the full suite and a short CUDA `base_train` on an RTX 5080 (sm
 
 - **Bug fix:** Flash Attention 3 was loaded from the kernel hub on any CUDA GPU that had a build, including Blackwell (sm_100 B200, sm_120 RTX 50xx), where the first attention call aborts the process ("no kernel image is available for execution on the device"). The data-preparation work above fixed the same bug independently; the rebased code keeps that version (FA3 only on compute capability 8.0, 8.6, 8.9 and 9.0, plus `NANOCHAT_ATTENTION_BACKEND=sdpa`). `test_unsupported_cuda_architecture_uses_sdpa` now covers sm_100, sm_120 and sm_75 and checks that the kernel hub is never queried.
 - **Environment:** the `gpu` extra now installs `setuptools`, which torch inductor imports when compiling CPU code (several tests failed without it; the data-preparation branch added the same line).
+
+## Grouped-GEMM MoE dispatch (2026-11-23)
+
+- **Problem:** the per-expert loop gathers tokens with `x[mask]`, whose size depends on the data. Under `torch.compile` this breaks the graph inside the layer loop of `GPT.forward`, so the whole forward ran uncompiled (embedding, lm_head and the fp32 cross-entropy included), and each expert was compiled separately, recompiling for every new token count until the recompile limit. Peak memory doubled (fused cross-entropy lost) and the step slowed down by 1.4× (E=1) to 2.4× (E=8) relative to a dense SwiGLU model with the same active FLOPs.
+- **Fix:** `MoEMLP` sorts tokens by expert and runs all experts with one `torch._grouped_mm` per projection on the stacked expert weights, with each expert's segment padded to 16 rows. Shapes are static and nothing syncs with the host, so the model compiles as one graph. Routing, gates, losses, statistics, route replay and capture are unchanged, and so are parameters and checkpoints.
+- **Option:** `--moe-dispatch auto|grouped|loop` (`GPTConfig.moe_dispatch`). `auto` picks grouped for bf16 on CUDA and the loop otherwise (CPU tests, fp32). The resolved choice is printed and stored in `config.json` (`moe_dispatch_resolved`).
+- **Tests (`tests/test_moe_dispatch.py`):** grouped equals the loop on outputs and all gradients (bitwise on CPU, ≤2e-3 relative on CUDA) for E ∈ {1, 4, 8}, empty experts, unaligned counts, a single token and the bias balancer; zero graph breaks; on CUDA, full-model loss and gradients match, results are deterministic across calls, and a compiled training step is one graph. Mutating the gate or the scatter makes 4–5 tests fail.
+- **Benchmark:** `scripts/bench_moe_throughput.py` (spec §8.8) times compiled forward+backward and optimizer steps separately and projects a 262,144-token step. RTX 5080, depth 10, micro-batch 4×2048, time relative to dense:
+
+  | | E=1 | E=4 | E=8 | E=16 |
+  |---|---|---|---|---|
+  | AdamW, grouped | 1.17× | 1.25× | 1.31× | 1.56× |
+  | AdamW, loop | 1.44× | 1.87× | 2.36× | 6.2× (exceeds 16 GB) |
+  | Muon, grouped | 1.13× | 1.24× | 1.31× | — (exceeds 16 GB) |
+  | Muon, loop | 1.36× | 1.81× | 2.25× | — |
+
+  On the 5080 `torch._grouped_mm` has no native kernel and falls back to one GEMM per expert with a host sync per call, which accounts for the remaining E=1 gap (GPU time equals dense). The B200 numbers need the cluster run.
+- **Found while testing:** GPU training is not bitwise reproducible with either dispatch (two identical runs differ after a few steps); the data stream is identical.

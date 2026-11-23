@@ -27,7 +27,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, make_gpt_config
+from nanochat.gpt import GPT, make_gpt_config, resolve_moe_dispatch
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes, tokenizer_dir_for, TOKENIZERS
@@ -234,8 +234,9 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 parameter_counts = model.parameter_counts()
 print0("Parameter counts:\n" + "\n".join(f"  {k}: {v:,}" for k, v in parameter_counts.items()))
 moe_layer_indices = model.moe_layer_indices
+moe_dispatch = resolve_moe_dispatch(model_config, device_type, COMPUTE_DTYPE) if moe_layer_indices else None
 if moe_layer_indices:
-    print0(f"MoE layers: {moe_layer_indices}")
+    print0(f"MoE layers: {moe_layer_indices} | dispatch: {moe_dispatch} (--moe-dispatch {model_config.moe_dispatch})")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights(seed=args.seed) # 3) All tensors get initialized
 
@@ -294,7 +295,7 @@ if master_process:
               "val_data_file": val_data_file, "val_data_sha256": val_data_sha256,
               "tokenizer_name": args.tokenizer,
               "tokenizer": tokenizer_id},
-        extra={"experiment_name": experiment_name, "stage": "pretrain", "num_iterations": num_iterations},
+        extra={"experiment_name": experiment_name, "stage": "pretrain", "num_iterations": num_iterations, "moe_dispatch_resolved": moe_dispatch},
     )
 
 # -----------------------------------------------------------------------------
