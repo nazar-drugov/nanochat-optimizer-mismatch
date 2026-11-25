@@ -262,10 +262,10 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     selection = {"adamw": {"full_lr": 1e-3}, "muon": {"full_lr": 2e-3}}
     (tmp_path / "sel.json").write_text(json.dumps(selection))
     finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s42",
-                        "--dataset", "wikitext103=/data/wt", "--dataset", "codeparrot=/data/cp",
+                        "--dataset", "wikitext103=/data/wt", "--dataset", "starcoderdata=/data/sc",
                         "--d0-file", "/data/d0.parquet", "--out", str(tmp_path / "jobs"), "--repo-dir", str(tmp_path)])
     jobs = sorted(p.name for p in (tmp_path / "jobs").glob("*.sbatch"))
-    assert len(jobs) == 4 and "ft-e8-main-adamw-s42-codeparrot-muon.sbatch" in jobs
+    assert len(jobs) == 4 and "ft-e8-main-adamw-s42-starcoderdata-muon.sbatch" in jobs
     grid = finetune_lr_grid(selection)
     assert grid["muon"] == [2e-3 * f for f in FINETUNE_LR_FRACTIONS]
     # Run one job against a fake python that records its arguments

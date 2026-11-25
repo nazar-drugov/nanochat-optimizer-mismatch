@@ -4,7 +4,7 @@ each running a 5-point LR grid x 5 seeds through scripts/finetune.py on one B200
 
   python -m scripts.finetune_jobs --selection jobs/lr_selection.json \
       --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
-      --dataset wikitext103=<scratch>/finetune_data/wikitext103 --dataset codeparrot=<scratch>/finetune_data/codeparrot \
+      --dataset wikitext103=<scratch>/finetune_data/wikitext103 --dataset starcoderdata=<scratch>/finetune_data/starcoderdata \
       --d0-file <scratch>/heldout/fineweb-edu-100b/d0.parquet --out jobs/
 """
 

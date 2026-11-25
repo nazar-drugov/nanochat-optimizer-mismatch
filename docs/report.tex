@@ -219,8 +219,9 @@ As described in Section~\ref{sec:3.1}, we fine-tune using a near-distribution an
 We take our near-distribution dataset to be WikiText-103 \cite{merity2017iclr-pointer}, a $103$M-token dataset sourced from ``Good Articles'' and ``Featured Articles'' on Wikipedia. This dataset is ``near-distribution'' because it contains English prose with topical overlap with FineWeb-Edu, though in a different style.
 % We note that \cite{zhao2026ephemeral} and \cite{qu2026canmuon} use the Tulu-3 \cite{lambert2025tulu3pushingfrontiers} SFT mixture for fine-tuning, which focuses on instruction-following tasks. We find this dataset unsuitable for models at the scale we investigate, which may be too small to exhibit meaningful instruction-following. 
 
-% NOTE: the implementation defaults to codeparrot-clean (Python; codeparrot-clean-valid as held-out),
-% the experiment spec's recommendation, because StarCoderData is gated and multi-language. Not yet agreed.
+% NOTE: decided 2026-11-25: StarCoderData, implemented for one language (default Python): training from
+% the first parquet file of the language directory, held-out D1 = 20,000 documents sampled from its last file.
+% The text below says 86 languages; either restrict the description to Python or change the subset.
 We take our far-distribution dataset to be StarCoderData \cite{li2023starcoder}. This dataset contains $250$B tokens of GitHub content spanning $86$ programming languages. We consider this dataset to be far from the pre-training distribution, since FineWeb-Edu excludes most code by its filtering rules. 
 
 \subsection{Training procedure}

@@ -18,7 +18,9 @@ import torch
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.dataset import list_parquet_files
 from nanochat.eval_set import EvalSet, build_eval_set, per_doc_sums
-from nanochat.finetune_data import detokenize_wikitext, wikitext_articles, write_manifest, write_shards
+from nanochat.finetune_data import (
+    detokenize_wikitext, hf_request, sample_heldout, wikitext_articles, write_manifest, write_shards,
+)
 from nanochat.finetune_metrics import (
     expert_relative_change, flip_cause_counts, load_shares, maxvio, route_comparison, select_experts, separation,
     top2_margin,
@@ -229,3 +231,19 @@ def test_self_replay_identity_and_unchanged_model_has_no_forgetting(tiny_setup):
     for key in ("normal", "replay", "reverse"):
         torch.testing.assert_close(same["doc_sums"][key], base["doc_sums"], rtol=1e-6, atol=1e-6)
     assert all(stats["flip_rate"] == 0 and stats["cause_flips"] == 0 for stats in same["per_layer"].values())
+
+
+def test_starcoder_heldout_sample_is_seeded_and_shuffled():
+    docs = [f"doc{i}" for i in range(100)]
+    a, b = sample_heldout(docs, 30, seed=0), sample_heldout(docs, 30, seed=0)
+    assert a == b and len(set(a)) == 30 and a != sorted(a, key=lambda d: int(d[3:]))
+    assert sample_heldout(docs, 30, seed=1) != a
+    with pytest.raises(ValueError):
+        sample_heldout(docs, 101, seed=0)
+
+
+def test_hf_token_is_not_forwarded_on_redirect():
+    req = hf_request("https://huggingface.co/datasets/x/resolve/main/f.parquet", token="secret")
+    assert req.get_header("Authorization") == "Bearer secret"
+    assert "Authorization" not in req.headers  # unredirected: dropped when urllib follows a redirect
+    assert hf_request("https://huggingface.co/x").get_header("Authorization") is None

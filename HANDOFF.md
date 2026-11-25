@@ -134,11 +134,11 @@ Optional later gains: device batch 64 (if memory allows), fusing dispatch copies
 7. While they run: prepare fine-tuning data on the login node (network needed; untested against the real
    Hugging Face endpoints):
    `.venv/bin/python -m scripts.make_finetune_data --dataset wikitext103 --out ~/orcd/scratch/public/nanochat-optimizer-mismatch/finetune_data/wikitext103`
-   and the same with `--dataset codeparrot`. Check `manifest.json` (document counts, detokenized text sample).
+   and the same with `--dataset starcoderdata` (gated; reads the HF token). Check `manifest.json` (document counts, detokenized text sample).
 8. GPU smoke of `scripts/finetune.py` before the base models finish: use a finished **sweep** run's final
    checkpoint as `--base-run` (e.g. `e8-sweep-adamw-lr0.002-s42`), 1 LR × 1 seed, to time a cell and check
    outputs; delete that output afterwards. Expected ~1–2 min per cell (15.7M tokens + 10 evaluations).
-9. When the seed-42 pair is done: `.venv/bin/python -m scripts.finetune_jobs --selection ~/jobs/lr_selection.json --base-runs e8-main-adamw-s42 e8-main-muon-s42 --dataset wikitext103=<dir> --dataset codeparrot=<dir> --d0-file <d0> --out ~/jobs`
+9. When the seed-42 pair is done: `.venv/bin/python -m scripts.finetune_jobs --selection ~/jobs/lr_selection.json --base-runs e8-main-adamw-s42 e8-main-muon-s42 --dataset wikitext103=<dir> --dataset starcoderdata=<dir> --d0-file <d0> --out ~/jobs`
    and submit (8 jobs; 25 cells each).
 10. If time remains: other E. Needs (a) a sweep plan for E ∈ {1, 4, 16} with the interleaved grids above,
     (b) the joint fit (not implemented; `nanochat/pretrain_sweep.select_lr` is the E = 8 three-point version).
@@ -148,8 +148,8 @@ Optional later gains: device batch 64 (if memory allows), fusing dispatch copies
 
 ## 8. Open decisions to raise with the team (do not resolve silently)
 
-- Far fine-tuning dataset: implemented codeparrot-clean (spec recommendation, ungated); the report names
-  StarCoderData (gated).
+- Far fine-tuning dataset: **decided 2026-11-25: StarCoderData** (Python subset by default; codeparrot-clean
+  removed). Whether to use more languages is open.
 - Fine-tuning defaults (spec recommendations, `scripts/finetune.py`): 15.7M tokens at 65,536 per step, 3%
   warmup, 20% decay, weight decay 0, embedding/lm_head LR = 0.1× pretraining values in every cell, LR grid
   1/16…1 × the selected pretraining LR of the fine-tuning optimizer, 5 seeds, 10 checkpoints, balancer active
