@@ -1,0 +1,90 @@
+{
+  "base_run": "e8-main-adamw-s42",
+  "A_bestfit": {
+    "nats_per_token": 2.931777123898748,
+    "scored_tokens": 1047756,
+    "bpb": 0.9010323708612603,
+    "bytes_per_token": 4.694237971436098,
+    "unmatched_bos": 138
+  },
+  "B_contiguous": {
+    "nats_per_token": 3.176196336746216,
+    "scored_tokens": 1047645,
+    "documents": 932,
+    "bpb": 1.000769790759776,
+    "bytes_per_token": 4.5787580716750425
+  },
+  "B_smoke_prefix": {
+    "nats_per_token": 3.1056365966796875,
+    "scored_tokens": 235296
+  },
+  "B_context_intact": {
+    "nats_per_token": 2.9820070266723633,
+    "scored_tokens": 532020
+  },
+  "B_context_cut": {
+    "nats_per_token": 3.3765602111816406,
+    "scored_tokens": 515625
+  },
+  "B_by_position_in_row": {
+    "0-15": {
+      "nats_per_token": 7.9911208152771,
+      "scored_tokens": 8187
+    },
+    "16-127": {
+      "nats_per_token": 3.9615707397460938,
+      "scored_tokens": 57292
+    },
+    "128-511": {
+      "nats_per_token": 3.217998743057251,
+      "scored_tokens": 196434
+    },
+    "512-1023": {
+      "nats_per_token": 3.0935044288635254,
+      "scored_tokens": 261896
+    },
+    "1024-2047": {
+      "nats_per_token": 3.0407142639160156,
+      "scored_tokens": 523836
+    }
+  },
+  "B_by_position_in_doc": {
+    "0-15": {
+      "nats_per_token": 3.812922477722168,
+      "scored_tokens": 14912
+    },
+    "16-127": {
+      "nats_per_token": 3.0687358379364014,
+      "scored_tokens": 103949
+    },
+    "128-511": {
+      "nats_per_token": 3.0212152004241943,
+      "scored_tokens": 279818
+    },
+    "512-2047": {
+      "nats_per_token": 3.1391615867614746,
+      "scored_tokens": 351753
+    },
+    "2048-999999999": {
+      "nats_per_token": 3.371574640274048,
+      "scored_tokens": 297213
+    }
+  },
+  "common_pairs": {
+    "pairs": 426985,
+    "A_nats": 2.923451674235306,
+    "B_nats": 3.056305552407565,
+    "intact": {
+      "pairs": 312402,
+      "A_nats": 2.9348870132709344,
+      "B_nats": 2.95123605501719
+    },
+    "cut": {
+      "pairs": 114583,
+      "A_nats": 2.892274075591477,
+      "B_nats": 3.3427696973832512
+    },
+    "A_documents": 926,
+    "B_documents": 932
+  }
+}

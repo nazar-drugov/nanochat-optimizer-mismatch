@@ -1,0 +1,90 @@
+{
+  "base_run": "e8-main-muon-s42",
+  "A_bestfit": {
+    "nats_per_token": 2.8967384062213317,
+    "scored_tokens": 1047756,
+    "bpb": 0.8902637955614757,
+    "bytes_per_token": 4.694237971436098,
+    "unmatched_bos": 138
+  },
+  "B_contiguous": {
+    "nats_per_token": 3.164541482925415,
+    "scored_tokens": 1047645,
+    "documents": 932,
+    "bpb": 0.9970974983661024,
+    "bytes_per_token": 4.5787580716750425
+  },
+  "B_smoke_prefix": {
+    "nats_per_token": 3.0971834659576416,
+    "scored_tokens": 235296
+  },
+  "B_context_intact": {
+    "nats_per_token": 2.9486546516418457,
+    "scored_tokens": 532020
+  },
+  "B_context_cut": {
+    "nats_per_token": 3.3872926235198975,
+    "scored_tokens": 515625
+  },
+  "B_by_position_in_row": {
+    "0-15": {
+      "nats_per_token": 8.80959701538086,
+      "scored_tokens": 8187
+    },
+    "16-127": {
+      "nats_per_token": 4.117525577545166,
+      "scored_tokens": 57292
+    },
+    "128-511": {
+      "nats_per_token": 3.204620599746704,
+      "scored_tokens": 196434
+    },
+    "512-1023": {
+      "nats_per_token": 3.058344602584839,
+      "scored_tokens": 261896
+    },
+    "1024-2047": {
+      "nats_per_token": 3.0101516246795654,
+      "scored_tokens": 523836
+    }
+  },
+  "B_by_position_in_doc": {
+    "0-15": {
+      "nats_per_token": 3.7963573932647705,
+      "scored_tokens": 14912
+    },
+    "16-127": {
+      "nats_per_token": 3.046693801879883,
+      "scored_tokens": 103949
+    },
+    "128-511": {
+      "nats_per_token": 3.002901792526245,
+      "scored_tokens": 279818
+    },
+    "512-2047": {
+      "nats_per_token": 3.1357288360595703,
+      "scored_tokens": 351753
+    },
+    "2048-999999999": {
+      "nats_per_token": 3.3603367805480957,
+      "scored_tokens": 297213
+    }
+  },
+  "common_pairs": {
+    "pairs": 426985,
+    "A_nats": 2.889292450311171,
+    "B_nats": 3.0472009097888195,
+    "intact": {
+      "pairs": 312402,
+      "A_nats": 2.900869899082621,
+      "B_nats": 2.919397047530805
+    },
+    "cut": {
+      "pairs": 114583,
+      "A_nats": 2.857727400076024,
+      "B_nats": 3.395648604273392
+    },
+    "A_documents": 926,
+    "B_documents": 932
+  }
+}
