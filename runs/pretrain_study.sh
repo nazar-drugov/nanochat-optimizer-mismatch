@@ -282,6 +282,9 @@ case "$mode" in
         # W&B files, tokenizer cache, and per-run logs get explicit locations.
         export NANOCHAT_BASE_DIR="$SCRATCH_BASE"
         export WANDB_DIR="${WANDB_DIR:-$SCRATCH_BASE}"
+        # Cluster nodes have no W&B login, and a run without one stops at wandb.init.
+        # The metrics JSONL is the record; offline W&B files can be synced later.
+        export WANDB_MODE="${WANDB_MODE:-offline}"
         export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"
         export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
         log_file="$SCRATCH_BASE/logs/$RUN_NAME.log"
@@ -295,8 +298,8 @@ case "$mode" in
              "--heldout-data-dir=$HELDOUT_DIR" "--train-stats-jsonl=$stats_file")
         if [[ "$mode" == dry-run ]]; then
             # Preview only: do not run torchrun or check that data exists.
-            printf 'NANOCHAT_BASE_DIR=%s\nWANDB_DIR=%s\nTIKTOKEN_CACHE_DIR=%s\n' \
-                "$NANOCHAT_BASE_DIR" "$WANDB_DIR" "$TIKTOKEN_CACHE_DIR"
+            printf 'NANOCHAT_BASE_DIR=%s\nWANDB_DIR=%s\nWANDB_MODE=%s\nTIKTOKEN_CACHE_DIR=%s\n' \
+                "$NANOCHAT_BASE_DIR" "$WANDB_DIR" "$WANDB_MODE" "$TIKTOKEN_CACHE_DIR"
             printf 'Console log: %s\nMetrics JSONL: %s\nCommand: ' "$log_file" "$stats_file"
             printf '%q ' "${cmd[@]}"
             printf '\n'

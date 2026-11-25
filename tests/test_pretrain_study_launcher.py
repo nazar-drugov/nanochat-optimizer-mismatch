@@ -109,6 +109,15 @@ def test_dry_run_does_not_check_the_data(setup):
     assert result.returncode == 0 and "Command:" in result.stdout
 
 
+def test_wandb_is_offline_unless_the_caller_chooses(setup):
+    # Cluster nodes have no W&B login; online mode would stop the run at wandb.init.
+    environ = {k: v for k, v in setup["environ"].items() if k != "WANDB_MODE"}
+    for extra, expected in (({}, "offline"), ({"WANDB_MODE": "online"}, "online")):
+        result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT,
+                                env={**environ, **extra}, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0 and f"WANDB_MODE={expected}\n" in result.stdout
+
+
 def test_validation_uses_the_validation_shard_and_d0_is_only_logged(setup):
     result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT, env=setup["environ"],
                             capture_output=True, text=True, timeout=120)
