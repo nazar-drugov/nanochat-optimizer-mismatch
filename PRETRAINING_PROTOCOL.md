@@ -126,6 +126,15 @@ for it anyway).
 Muon 1e-3 1.0060, 5e-4 1.0278) both optima are interior: AdamW 1.155e-3 at 0.5B → 6.511e-4 at 3B,
 Muon 1.575e-3 at 0.5B → 8.874e-4 at 3B. The base models (seeds 42, 43, 44) use these.
 
+**Transfer check moved forward, at E = 8 (2026-11-25).** The ×(3B/0.5B)^-0.32 transfer is borrowed
+(Bjorck et al. for AdamW, Ren et al. for Muon, via Hernanz), fitted on other setups, assumed equal for
+both optimizers and extrapolated 6×; using the sweep LR unchanged is no better founded. From the
+sweep's curvature (AdamW ~0.017, Muon ~0.008 bpb per octave²), being 0.83 octaves off (the gap between
+those two choices) would cost ~0.012 / ~0.006 bpb, unequally between the optimizers. So before seeds 43
+and 44 (held), seed 42 is run at 3B at ×0.5 and ×2 the transferred LR for both optimizers (×2 ≈ the
+untransferred sweep LR); `scripts.pretrain_sweep transfer-check` fits the three points with the main run.
+If the 3B optimum is more than ~0.25 octave from the transferred LR, the base models are rerun at it.
+
 **Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
 (job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
 at 64 (9% faster); Muon 385 vs 375 ms (3% faster); 64 fits (62 GB reserved). It is not adopted
@@ -135,8 +144,8 @@ so the balancer objective would differ between the sweep and the base models. Me
 3B run at 32: ~81 min (AdamW) and ~73 min (Muon) of training steps plus evaluation; each sweep
 run ~12–14 min.
 
-**Deferred until the first fine-tuning results:** other E; the transfer check (E = 4, 0.5×/1×/2×
-at 3B); batch-size robustness; the weight-decay ablation (one Muon run with λ = 0.1·η_AdamW/η_Muon,
+**Deferred until the first fine-tuning results:** other E; the E = 4 transfer check (the E = 8 one is
+run now, above); batch-size robustness; the weight-decay ablation (one Muon run with λ = 0.1·η_AdamW/η_Muon,
 so that η·λ matches AdamW); seed-noise runs for the sweep.
 
 ### If other E are added: joint fit across E (decided 2026-11-24)
