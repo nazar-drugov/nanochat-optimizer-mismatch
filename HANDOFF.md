@@ -17,10 +17,10 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | E = 8 LR sweep (0.5B tokens) | Done |
 | LR transfer check at 3B tokens | Done; AdamW moved to the 3B optimum |
 | E = 8 base models, AdamW and Muon × seeds 42, 43, 44 (3B tokens) | **All six done** |
-| Fine-tuning data | WikiText-103 built; **StarCoderData (Python) built** 2026-11-25 |
+| Fine-tuning data | **Both built** 2026-11-25: StarCoderData (Python); WikiText-103 rebuilt with a 1.1M-token D1 |
 | Fine-tuning protocol | LR selection, checkpoints, length pilot **decided** 2026-11-25 (§4) |
 | Fine-tuning length pilot (StarCoderData) | **4 jobs queued on the hgo account, not started** (§5) |
-| Fine-tuning main grid | Waits for the pilot (length, seeds) and the WikiText D1 decision |
+| Fine-tuning main grid | Waits for the pilot (length, seeds) |
 | Analysis script | Not built |
 | Other E (1, 4, 16) | Deferred until fine-tuning results |
 
@@ -64,7 +64,7 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
     and base run. From another account, point `scripts/finetune.py --base-checkpoints-dir` here.
   - `base_data_fineweb_edu_100b/`, `heldout/fineweb-edu-100b/d0.parquet` (D0).
   - `finetune_data/wikitext103/`, `finetune_data/starcoderdata/` (each: `train_*.parquet`, `val_00000.parquet` = D1,
-    `manifest.json`). `finetune_data/codeparrot/` is obsolete (deletable).
+    `manifest.json`; the whole `finetune_data/` is world-writable at the user's request). `finetune_data/codeparrot/` is obsolete (deletable).
   - `logs/<run>.jsonl|.log` — pretraining logs.
 - Pool copy of all small outputs: `/orcd/pool/006/hgo/nanochat-optimizer-mismatch/results/`.
   Note: `meta_*.json` files there are 0.4–0.8 GB each (12 GB total); worth slimming.
@@ -73,7 +73,9 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
 
 ## 4. Fine-tuning protocol (decided 2026-11-25; protocol section "Fine-tuning: LR selection, checkpoints and length pilot")
 
-- Datasets: near = WikiText-103 (detokenized articles); far = **StarCoderData, Python only**
+- Datasets: near = WikiText-103 (detokenized articles; D1 = official validation + test + 146 training
+  articles sampled with seed 0 and removed from training: 268 articles, 1,100,545 tokens, shuffled;
+  training 29,298 articles, ~112M tokens); far = **StarCoderData, Python only**
   (train = first file, 218,079 documents, ~490M GPT-2 tokens; D1 = 20,000 documents sampled with
   seed 0 from the last file, ~43M tokens, first 1,048,576 scored). Built by
   `scripts/make_finetune_data.py --dataset starcoderdata` (gated; needs an HF token with the terms
@@ -148,9 +150,9 @@ Expected time per trunk: unmeasured; ~4–6× a 240-step cell (the smoke cell to
 3. Analyse the pilot: per (base, fine-tuning optimizer, length) the D1-selected LR, learning and
    forgetting curves over log-spaced checkpoints, seed spread; record the chosen main length and number
    of seeds in the protocol with the date.
-4. WikiText D1 (user decision pending): official validation + test (~120 articles, ~480K tokens; needs
-   `--eval-tokens` ≤ ~470K for D1, which currently shares one `--eval-tokens` with D0) vs ~250 held-out
-   training articles to reach 1M tokens. Then run the pilot or main grid on WikiText.
+4. WikiText (D1 decided and built 2026-11-25): run the length pilot on WikiText the same way
+   (`--dataset wikitext103=<scratch>/finetune_data/wikitext103`), or fold it into the main grid if the
+   StarCoderData pilot already settles length and seeds.
 5. Main grid: `scripts.finetune_jobs --selection results/e8/lr_selection_3b.json --base-runs e8-main-{adamw,muon}-s{42,43,44} ...`
    at the length the pilot picks. Pilot cells at that length can be reused for seeds 1–3 of the
    seed-42 bases if the length is one of the pilot lengths (same warmup, same data order).
@@ -162,7 +164,6 @@ Expected time per trunk: unmeasured; ~4–6× a 240-step cell (the smoke cell to
 
 ## 7. Open decisions (raise with the team; do not resolve silently)
 
-- WikiText D1 split (above).
 - StarCoderData: Python only is agreed; the report text still says "86 languages" (fix the wording).
 - ℓ0 for forgetting at matched learning; the number of fine-tuning seeds and main length (from the pilot).
 - Transfer check at other E (proposal above).

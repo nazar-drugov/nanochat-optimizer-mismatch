@@ -180,6 +180,11 @@ if a transfer check fails.
   Python split is 59 files, ~28B tokens). D1 = 20,000 documents sampled (seed 0) from the last file,
   which training never reads. GPT-2 tokenizes code at ~2.1 characters per token (FineWeb-Edu ~4.7),
   so D1 losses are not comparable with D0 losses.
+- **WikiText D1: official validation + test + sampled training articles** (user decision,
+  2026-11-25). 60 validation and 62 test articles plus 146 training articles drawn with seed 0 (and
+  removed from training) until D1 holds ≥ 1.1M GPT-2 tokens: 268 articles, 1,100,545 tokens, in shuffled
+  order. The default evaluation (1,048,576 scored tokens) then touches 260 of them. Training: 29,298
+  articles (~112M tokens).
 - **LR selection: (A), conventional** (user decision). Per cell (base model, fine-tuning dataset,
   fine-tuning optimizer, E), the LR with the lowest final D1 loss, mean over fine-tuning seeds, as in
   Zhao et al. (arXiv:2610.22650). The learning–forgetting analysis (forgetting at matched learning
@@ -199,7 +204,7 @@ if a transfer check fails.
   for every length, so each length is the same as a separate run of that length; the 240-step branch
   is the main-grid cell for that seed (tested on CPU: `test_decay_branches_equal_separate_runs`).
   Scope: the seed-42 base models (AdamW, Muon), both fine-tuning optimizers, the 5-point LR grid,
-  fine-tuning seeds 1–3, StarCoderData first (WikiText waits for the D1 decision). Outputs in
+  fine-tuning seeds 1–3, StarCoderData first, then WikiText (D1 decided above). Outputs in
   `$SCRATCH/finetune_pilot`.
   What the pilot decides: (1) the main fine-tuning length (whether learning and forgetting still
   change a lot between 240 and 960 steps); (2) whether the selected LR depends on the length and on
