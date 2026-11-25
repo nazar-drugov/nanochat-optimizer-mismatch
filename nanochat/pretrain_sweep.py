@@ -223,9 +223,9 @@ class SlurmSettings:
     gres: str = "gpu:b200:1"
     cpus: int = 16
     mem: str = "128G"
-    # Nodes to avoid. node5800-c1 mounts /orcd/scratch/orcd/014 but not our directory in it
-    # (found 2026-11-24: job 30416147 could not see the staged data there).
-    exclude: str = "node5800-c1"
+    # Nodes to avoid: they mount /orcd/scratch/orcd/014 but not our directory in it
+    # (node5800-c1: job 30416147, 2026-11-24; node5702-c1: job 30427014, 2026-11-25).
+    exclude: str = "node5800-c1,node5702-c1"
 
 
 def slurm_header(job_name, time_limit, repo_dir, scratch_base=None, slurm=SlurmSettings()):

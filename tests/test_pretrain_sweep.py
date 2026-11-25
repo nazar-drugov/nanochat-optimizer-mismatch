@@ -215,7 +215,7 @@ def test_job_runs_each_run_skips_finished_ones_and_reports_failures(fake_cluster
 def test_job_excludes_bad_nodes_and_stops_when_scratch_is_not_visible(fake_cluster):
     runs = [r for r in sweep_runs() if r.optimizer == "muon"]
     script = render_job("e8-sweep-muon", runs, "03:00:00", repo_dir=fake_cluster["tmp"])
-    assert "#SBATCH --exclude=node5800-c1" in script
+    assert "#SBATCH --exclude=node5800-c1,node5702-c1" in script
     assert "#SBATCH --exclude" not in render_job("j", runs, "03:00:00", repo_dir="/r", slurm=SlurmSettings(exclude=""))
     path = fake_cluster["tmp"] / "job.sbatch"
     path.write_text(script)
