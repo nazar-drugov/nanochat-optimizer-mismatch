@@ -1,0 +1,264 @@
+% Experiment specification: the draft report of 2026-11-24, kept verbatim except for
+% design decisions agreed since (PRETRAINING_PROTOCOL.md has the details and dates):
+%   - Tokenizer: GPT-2 instead of the nanochat tokenizer (2026-11-23).
+%   - Architecture: dropless routing, softmax gate, auxiliary + z-loss balancer summed over layers.
+%   - Hyperparameter tuning: peak learning rate only, on 0.5B-token runs, transferred by T^-0.32;
+%     selection on the held-out validation shard without D0 (2026-11-23/24).
+%   - Training procedure: 118M active parameters (depth 10), 3B tokens for every E, batch 262,144,
+%     WSD schedule; E = 8 first, with 3 pretraining seeds (2026-11-24).
+% Lines marked "% NOTE" record implementation defaults that are not yet agreed.
+\documentclass[11pt,a4paper]{article}
+
+% ACL layout with IEEE-style numbered references; see acl-ieee.sty.
+% Use \usepackage[review]{acl-ieee} for an anonymised copy with line numbers.
+\usepackage{acl-ieee}
+
+% --- Fonts and encoding (as in the official ACL template) ------------
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+
+% --- Maths, figures and lists ----------------------------------------
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{xcolor}
+
+% --- Title and authors -----------------------------------------------
+% Compact title block (ACL default is 5cm). Increase this if you add
+% affiliations and they overlap the first section.
+\setlength\titlebox{2.5cm}
+
+\DeclareMathOperator*{\E}{\mathbb{E}}
+\let\Pr\relax
+\DeclareMathOperator*{\Pr}{\mathbb{P}}
+
+\newcommand{\D}{\mathcal{D}}
+\newcommand{\Loss}{\mathcal{L}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Lpre}{\mathcal{L}_{\mathrm{pre}}}
+\newcommand{\Lft}{\mathcal{L}_{\mathrm{ft}}}
+
+
+\title{Optimizer Mismatch in Mixture-of-Experts Transformers}
+
+% Authors on one line separated by \And, with no affiliations. To add
+% affiliations, put them under each name with \\
+% (e.g. Author One \\ MIT \\ \texttt{email}).
+\author{Nazar Drugov \And Harry Gong}
+
+\begin{document}
+\maketitle
+
+\blfootnote{Draft report. Authors alphabetical. Overleaf available: \\ \url{https://www.overleaf.com/project/6ad97257a4942e9a5c7ff10e/share\#8cbeff211f495070abe7932c40e98dc59f42656b8e4d0dfb}}
+
+\section{Introduction}
+\label{sec:intro}
+\paragraph{Pre-training and fine-tuning.} Large language models (LLMs) are commonly trained in multiple stages. The first stage, called \textit{pre-training}, involves learning to model language using massive amounts of data drawn from a diverse dataset. The model is then \textit{fine-tuned} on a narrower dataset, either to acquire a desired behavior (e.g., instruction-following) or to become competent in a different data distribution. Because of the computational expense of pre-training, it is common practice to fine-tune an existing open-weights pre-trained model. The \textbf{learning--forgetting trade-off} is the balance between gaining new-distribution competence (\textit{learning}) and losing capabilities acquired during pre-training (\textit{forgetting}). This trade-off is important because it is desirable for LLMs to retain general language-modeling capabilities and world knowledge learned during pre-training, as they acquire new capabilities.
+
+\paragraph{Optimizers.}
+Training a deep neural network requires three ingredients: a dataset, an objective, and a method to optimize that objective. The optimizer is an important part of the third ingredient. 
+A classical choice of optimizer is AdamW \cite{loshchilov2019decoupledweightdecayregularization}, an improvement to the Adam optimizer introduced in \cite{kingma2017adammethodstochasticoptimization}. In 2024, Muon, a different optimizer, was introduced \cite{jordan2024muon}. Muon has been shown to have superior pre-training sample efficiency to AdamW \cite{liu2025muon, jordan2024muon}, and it has since been adopted for pre-training several open-source LLMs \cite{kimiteam2026kimik2openagentic, glm5team2026glm5vibecodingagentic}. 
+
+\paragraph{The mismatch phenomenon.}
+Given the demonstrated advantages of Muon, it is natural to ask whether models originally pre-trained with AdamW  can be effectively fine-tuned with Muon.   \cite{liu2025muon} observed that using mismatched optimizers for pre-training and fine-tuning can worsen downstream benchmark performance. Subsequent studies have investigated how optimizer mismatch affects forgetting of knowledge acquired during pre-training (catastrophic forgetting), learning during fine-tuning, and the trade-off between them \cite{zhao2026ephemeral, qu2026canmuon, liu2026consistency}. Together, these studies provide evidence that optimizer mismatch can exacerbate catastrophic forgetting, while their conclusions regarding fine-tuning validation loss and downstream benchmark performance differ. 
+
+\paragraph{Mixture-of-experts.}
+Mixture-of-experts (MoE) is an architectural modification of the traditional Transformer architecture designed to enable more efficient scaling of model parameters. MoE Transformers replace conventional dense feed-forward layers with multiple networks, called experts, and a learned router that assigns each token to a subset of experts. By using only a fraction of their total parameters to process each token, MoEs enable increasing model capacity without a proportional increase in computational cost. 
+
+Importantly, the systematic examinations of the optimizer mismatch problem (\cite{zhao2026ephemeral, liu2026consistency,qu2026canmuon}) focus on dense Transformers, even though \cite{liu2025muon} originally observed this phenomenon in an MoE. We hypothesize that conclusions drawn from studying dense Transformers need not generalize to MoE Transformers. This leaves an important gap, as MoE architectures have become increasingly prominent in frontier LLMs. This gap motivates our first research question: \textbf{To what extent does optimizer mismatch affect the learning--forgetting trade-off in MoE Transformers?} 
+
+\paragraph{MoE Routers.} Our second research question focuses on a specific architectural component of MoE models: the router. In MoE models, a learned router determines which expert processes each input token. 
+Frequent changes in token-to-expert assignments during training, known as router instability, have been shown to reduce training efficiency \cite{dai2022stablemoestableroutingstrategy}. More recent work has shown that frequent changes in routing choices can destabilize reinforcement learning in MoE models \cite{zhang2026stableeffectivereinforcementlearning}. Prior work \cite{qiu2026designqwen38nextarchitectureevaluation} has also reported that Muon and AdamW have different effects on  router stability during pre-training. Together, these findings motivate investigating whether switching optimizers between pre-training and fine-tuning affects routing stability.
+Therefore, our second research question is: \textbf{Does fine-tuning an MoE model with a mismatched optimizer increase router instability compared with fine-tuning with the same optimizer as in pre-training?}
+
+\paragraph{Significance.}
+By quantifying the effect of the mismatch problem on MoE models, we seek to determine whether further research into mitigating these effects is required.
+
+Our findings could contribute to the broader understanding of the interaction between optimization algorithms and neural network architectures. By establishing whether the optimizer mismatch effects observed in dense Transformers generalize to MoEs, we seek to clarify the dependence of this phenomenon on architecture. By examining the relationship between routing stability and catastrophic forgetting, we aim to contribute to the research community's understanding of how fine-tuning disrupts pre-trained knowledge in MoE models. 
+
+Beyond its scientific significance, understanding optimizer mismatch in MoEs has practical implications for LLM training. Our findings could help practitioners make more informed decisions when selecting optimizers for fine-tuning MoE models.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Optimizer mismatch.}
+\cite{liu2025muon} first observed the optimizer mismatch problem in an MoE Transformer, reporting that fine-tuning with a mismatched optimizer can worsen downstream benchmark performance. However, they did not systematically investigate the effects of optimizer mismatch on catastrophic forgetting or how these effects depend on model architecture.
+
+Subsequent studies \cite{liu2026consistency, zhao2026ephemeral, qu2026canmuon} studied optimizer mismatch in dense Transformers, examining its effects on downstream benchmark performance and catastrophic forgetting.
+
+\cite{qu2026canmuon} report that optimizer mismatch can worsen fine-tuning validation performance. They also show that fine-tuning an Adam-pretrained model with Muon can lead to worse downstream benchmark performance and greater forgetting than fine-tuning with Adam.
+Similarly, \cite{liu2026consistency} argue that, at matched levels of fine-tuning learning, using a different optimizer from the one used during pre-training leads to greater forgetting. \cite{zhao2026ephemeral} find that optimizer mismatch exacerbates catastrophic forgetting but has an insignificant effect on downstream benchmark performance. 
+
+\paragraph{MoE router stability.} Prior work has shown that routing stability is important for training MoE models. \cite{dai2022stablemoestableroutingstrategy} identify routing fluctuations as a challenge during MoE pre-training. When the same input is repeatedly assigned to different experts, training efficiency can suffer. More recently, \cite{zhang2026stableeffectivereinforcementlearning} investigate router shift during training of MoE models with reinforcement learning, showing that changes in routing decisions can destabilize training. These findings suggest that router dynamics can influence training behavior, motivating our investigation of whether optimizer mismatch affects routing stability during fine-tuning. 
+
+\section{Methodology}
+\label{sec:methodology}
+We investigate the effect of optimizer mismatch on the learning--forgetting trade-off in MoE models. We also assess to what extent forgetting can be attributed to router dynamics: instability of per-token routing choices and imbalance of expert usage. 
+
+To answer these questions, we conduct three sets of experiments, each of which depends on a previous test:
+\begin{enumerate}[label=\arabic*.]
+    \item \textit{The baseline mismatch effect}: how does optimizer mismatch affect the learning--forgetting trade-off in an MoE setting, and how does this scale with sparsity? This is an important unanswered literature question, and we will quantify the scale of the effect before investigating its mechanism.
+    \item \textit{Stability plots}: how do stability and balance evolve over the course of matched and mismatched fine-tuning? By correlating observables for stability and balance with the learning/forgetting curve, we gain insight into the relevant router dynamics. This finally motivates a causal analysis:
+    \item \textit{Causal intervention}: can ``route replay'' --- adopting the expert routing choices of base models --- partially reverse the forgetting damage? Here we isolate a hypothesized cause of mismatch-induced forgetting and determine the size of this effect.
+\end{enumerate}
+
+We elaborate on these experiments below.
+
+\subsection{Baseline learning--forgetting trade-off}
+\label{sec:3.1}
+To establish an experimental baseline, we measure the trade-off between learning and forgetting with matched and mismatched optimizers. This effect is not \textit{a priori} guaranteed despite the supporting literature \cite{liu2026consistency,qu2026canmuon,zhao2026ephemeral}, because the scale of the effect is heavily architecture-- and dataset--dependent. We control the following independent variables: 
+\begin{enumerate}[label=\alph*)]
+    \item Number of fine-tuning steps, $t$.
+    \item Pre-training and fine-tuning optimizers, $(\Omega_0, \Omega_1) \in \{\text{AdamW}, \text{Muon}\}^2$,
+    \item Sparsity, measured as the number $E$ of experts in each layer, at fixed active parameters.
+    \item Fine-tuning learning rate $\eta_1$, swept separately for each optimizer and sparsity and fixed at its per-cell optimum.
+    \item Fine-tuning dataset $\D_1$, set to either a near-distribution or far-from-distribution corpus (details in Section~\ref{sec:datasets}).
+
+\end{enumerate}
+We report time-parametrized curves of learning and forgetting over the course of fine-tuning, where forgetting is defined as the expected increase in loss in the pre-training distribution:
+\begin{equation}\label{eq:forgetting}
+    \begin{aligned} 
+    \text{Forgetting}(t) := \E_{x \sim \D_0}[\Loss(x; \theta_1(t), r_1(x; t))  \\ - \Loss(x; \theta_0, r_0(x))], \\
+    \text{Learning}(t) := \E_{x \sim \D_1}[\Loss(x; \theta_0, r_0(x)) \\ - \Loss(x; \theta_1(t), r_1(x; t))];
+\end{aligned}
+\end{equation}
+$\theta_1, \theta_0$ are respectively the fine-tuned and base parameters, and $\D_1, \D_0$ refer to the fine-tuning and pre-training data distribution. We further report \textit{forgetting at matched learning},
+\begin{equation} \label{eq:fixed-learning}
+    F :=\min \{\text{Forgetting}(t) \mid \text{Learning}(t) \geq \ell_0\},
+\end{equation}
+and compare it across different combinations of optimizers and sparsity.
+
+\paragraph{Interpretation.} We use $5$ random seeds for each fine-tuning cell, and use a two-sample permutation test to determine if the mismatched-optimizer $F$ exceeds the matched-optimizer $F$. We will further report the logarithmic scaling behavior of $F$ with respect to $E$ under each optimizer regime. This will answer the scientific questions of whether the optimizer mismatch phenomenon is detectable in our learning--forgetting setting (enabling all further analysis) and its general scaling behavior with sparsity, which is a core scientific contribution.
+
+\subsection{Stability plots}
+\label{sec:3.2}
+We next measure how diagnostic metrics related to router stability and balance correlate with the forgetting trend across different optimizers and sparsities.
+
+\textbf{Router instability} describes the extent to which per-token expert routing choices change over the course of fine-tuning; we measure it per-layer as
+\begin{equation} \label{eq:instability}
+    \textrm{Instability}^\ell := \Pr_{x \sim \mathcal{D}}[r^\ell_1(x) \neq r^\ell_0(x)],
+\end{equation}
+where $\mathcal{D}$ is the dataset distribution over prefixes and $r^\ell_1$ and $r^\ell_0$ are the per-layer router choices for the fine-tuned and base models, respectively. \textbf{Expert imbalance} occurs when experts receive unequal shares of tokens (i.e. loads); we measure it using the MaxVio metric \cite{wang2024auxiliarylossfreeloadbalancingstrategy}, defined as 
+\begin{equation} \label{eq:imbalance}
+\begin{aligned} 
+    \text{MaxVio} &:= \dfrac{\max_i \text{Load}_i - \overline{\text{Load}}}{\overline{\text{Load}}}; \\ \text{Load}_i &:= \Pr_{x \sim \mathcal{D}} [x \text{ assigned to expert } i].
+\end{aligned}
+\end{equation}
+
+We choose matched-learning checkpoints (i.e. at $t^\star := \arg \min_t \{\text{Forgetting}(t) \mid \text{Learning}(t) \geq \ell_0\}$) from the fine-tuning run of every choice of optimizer and sparsity, at their optimal learning rate. We report the \textbf{per-layer instability} (Eq.~\ref{eq:instability}) and \textbf{imbalance} (Eq.~\ref{eq:imbalance}), both of which are computed on a held-out set of pre-training-distribution ($\D_0$) tokens. We will present this in a scatter-plot format and calculate the Spearman $\rho$ to determine the size of the correlation.
+
+\paragraph{Interpretation.} A high level of correlation would suggest a relation between changes in routing preferences and the forgetting trade-off.
+
+
+\subsection{Causal intervention}
+\label{sec:3.3}
+We finally seek a causal quantification of the effect of routing choices on forgetting. The question asked here is complementary to the previous section; here we ask the counterfactual --- \textit{if the routing choices had not drifted, would the forgetting be less severe?} And is there a quantifiable difference between matched and mismatched optimizer settings?
+
+Adding and subtracting terms in Eq. \ref{eq:forgetting}, we obtain the following expression for forgetting:
+\begin{equation} \label{eq:decomposition}
+\E_{x \sim \D_0}\left[
+\begin{aligned}
+\underbrace{\Loss(x; \theta_1, r_1(x)) - \textcolor{blue}{\Loss(x; \theta_1, r_0(x))}}_{\propto \,\chi_1 \text{, share accounted for by routing}} \\+ \underbrace{\textcolor{blue}{\Loss(x; \theta_1, r_0(x))} - \Loss(x; \theta_0, r_0(x))}_{\propto\,\chi_2 \text{, share unaccounted for}}
+\end{aligned}
+\right],
+\end{equation}
+where the terms in blue result from ``route replay'' --- that is, applying the routes selected by the base model  to the fine-tuned model, using the same input prefix. We interpret Eq. \ref{eq:decomposition} as a  decomposition of the forgetting as a term accounted for by the routing preferences and a term unaccounted for. 
+
+\paragraph{Justification of route replay.} Route replay is a well-documented technique to measure the effect of routing on model shift, in the context of quantization \cite{chen2025eacmoeexpertselectionawarecompressor} and model merging \cite{wang2026routingdriftdoesdiagnose}.
+
+Though the decomposition in Eq. \ref{eq:decomposition} is exact, it is scientifically informative only if the base-model routes $r_0$ remain ``appropriate'' in the fine-tuned model. This holds if, during fine-tuning, the gradient only significantly affects a fraction of experts, leaving the remainder substantially unchanged from pre-training. Such a form of specialization has been shown to occur when corpora contain significantly different domains, as is the case for our pre-training and fine-tuning datasets (see Section \ref{sec:experiments}). For example, \cite{muennighoff2025olmoeopenmixtureofexpertslanguage} show that in OLMoE, an MoE model pre-trained from scratch, routing statistics strongly separate distinct data domains. 
+
+% appropriate sources:
+% OLMoE (Muennighoff et al. 2024)
+% ESFT (Wang et al. 2024)
+
+In addition to this literature evidence, we will directly test the above hypothesis by measuring the variation in load, taken as a distribution over experts, between the base and fine-tuned models, on held-out pre-training data. That is, we will measure $\operatorname{TV}(p_1, p_0)$, where $p_1, p_0$ are respectively the expert load distributions of the fine-tuned and base models, measured with $\D_0$ tokens. A low variation would justify the assumption underlying route replay.
+
+\paragraph{Interpretation.} We will report the share accounted for by the router ($\chi_1$ normalized as a share of total forgetting) under different optimizer settings and sparsities. A statistically significant $\chi_1 > 0$ would imply a detectable effect from routing. As in previous sections, we will report the significance of the optimizer choice.
+
+
+
+
+
+
+
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Model implementation}
+\label{sec:model-implementation}
+Our implementation builds on the nanochat \cite{karpathy2025nanochat} repository, as it provides a simple and well-tested PyTorch implementation of a GPT-style language model. We extend the repository to support mixture-of-experts (MoE) Transformers, following the architecture used by \cite{ludziejewski2025jointmoescalinglaws} in their study of MoE scaling laws.
+
+\paragraph{Architecture.}
+We adopt the Switch Transformer architecture, in which each expert is a SwiGLU \cite{shazeer2020gluvariantsimprovetransformer} feed-forward network, and a learned router selects a single expert to process each token (top-1 routing). We choose this architecture for two reasons. First, its simple routing mechanism facilitates the measurement of changes in token-to-expert assignments during fine-tuning, which is central to our investigation of router stability. Second, following the architecture studied by \cite{ludziejewski2025jointmoescalinglaws} allows us to use their empirically derived scaling laws to inform our choice of model size and pre-training data budget. Unlike conventional scaling laws for dense Transformers, scaling laws of \cite{ludziejewski2025jointmoescalinglaws} account for the number of active parameters, the number of training tokens, and the number of experts.
+The gate value is the router's softmax probability of the selected expert over all $E$ experts, never renormalized, so the router receives a gradient from the language-modeling loss. Routing is dropless: no token is dropped in training or evaluation. Load is balanced with the Switch auxiliary loss (coefficient $0.01$) and a router $z$-loss (coefficient $0.001$), each summed over the MoE layers, following \cite{ludziejewski2025jointmoescalinglaws}.
+
+\paragraph{Tokenizer.} We use the GPT-2 tokenizer, with a vocabulary of $50{,}257$ tokens, as in \cite{ludziejewski2025jointmoescalinglaws}. It needs no retraining and keeps our setup comparable to theirs.
+
+\paragraph{Hyperparameter tuning.} We tune learning rate separately for each optimizer setting and for each sparsity, before both pre-training and fine-tuning. Learning rates are \textit{not} transferable between Adam and Muon; individual tuning is necessary for a fair comparison of optimizer mismatch. Following \cite{wen2025fantasticpretrainingoptimizers}, we tune only the peak learning rate and use conventional values for everything else: AdamW with $\beta = (0.9, 0.95)$ and $\epsilon = 10^{-8}$; Muon with Nesterov momentum $0.95$, five Newton--Schulz steps and the update scaling $0.2\sqrt{\max(m,n)}$ of \cite{liu2025muon}; decoupled weight decay $0.1$ and gradient clipping at a global norm of $1.0$ for both optimizers. For pre-training, we sweep the learning rate on runs of $0.5$B tokens with the same schedule shape as the full runs and transfer it to the full token budget $T$ by the factor $(T/0.5\,\text{B})^{-0.32}$ \cite{hernanz2026muonmakesmixtureofexpertslayer}. We select learning rates on a held-out validation shard of FineWeb-Edu from which the documents of $\D_0$ are removed, so that $\D_0$ never selects the models it evaluates. For $E=8$ we sweep three learning rates per optimizer and take the vertex of a parabola in log learning rate; for the other sparsities we fit the dependence of the optimal learning rate on $E$ jointly across $E$.
+
+\subsection{Datasets} \label{sec:datasets}
+\paragraph{Pre-training dataset.} We use FineWeb-Edu \cite{penedo2024finewebdatasetsdecantingweb} as our common pre-training dataset. This dataset consists of $1.3$T tokens, filtered from Common Crawl to include only English-language educational content. Our reasons for using this dataset are as follows:
+\begin{enumerate}[label=\alph*)]
+    \item \textit{Well-defined scope.} The dataset is filtered to exclude most code and \LaTeX\ math; this makes it easier to specify fine-tuning datasets as being close to, or far from, the pre-training distribution, as we do below.
+    \item \textit{Consistency with prior literature.} FineWeb-Edu is frequently used in the MoE and optimizer mismatch literature, for instance in \cite{qu2026canmuon, hernanz2026muonmakesmixtureofexpertslayer, ludziejewski2025jointmoescalinglaws}.
+\end{enumerate}
+
+\paragraph{Fine-tuning datasets.}
+As described in Section~\ref{sec:3.1}, we fine-tune using a near-distribution and far-distribution dataset. The degree of distribution shift may affect the learning--forgetting trade-off. To ensure compatibility with the metrics described in Section~\ref{sec:3.2}, the fine-tuning task is only language modeling, \textit{not} question-answering.
+
+We take our near-distribution dataset to be WikiText-103 \cite{merity2017iclr-pointer}, a $103$M-token dataset sourced from ``Good Articles'' and ``Featured Articles'' on Wikipedia. This dataset is ``near-distribution'' because it contains English prose with topical overlap with FineWeb-Edu, though in a different style.
+% We note that \cite{zhao2026ephemeral} and \cite{qu2026canmuon} use the Tulu-3 \cite{lambert2025tulu3pushingfrontiers} SFT mixture for fine-tuning, which focuses on instruction-following tasks. We find this dataset unsuitable for models at the scale we investigate, which may be too small to exhibit meaningful instruction-following. 
+
+% NOTE: the implementation defaults to codeparrot-clean (Python; codeparrot-clean-valid as held-out),
+% the experiment spec's recommendation, because StarCoderData is gated and multi-language. Not yet agreed.
+We take our far-distribution dataset to be StarCoderData \cite{li2023starcoder}. This dataset contains $250$B tokens of GitHub content spanning $86$ programming languages. We consider this dataset to be far from the pre-training distribution, since FineWeb-Edu excludes most code by its filtering rules. 
+
+\subsection{Training procedure}
+We fix the active parameter size to be $118$ million (depth $10$, width $640$, embeddings included; $53$ million active non-embedding parameters) and train with sparsities $E \in \{1,4,8,16\}$. $E=8$ is our main setting: we train it first and with three pre-training seeds. We pre-train with Muon and AdamW, adopting the same optimizer for the routing layer as for the rest of the model. Every model is pre-trained on the same $3$B tokens of FineWeb-Edu in the same order, with a batch of $262{,}144$ tokens, a linear warmup over the first $130$M tokens, a constant learning rate, and a linear decay to zero over the last $20\%$ of tokens \cite{ludziejewski2025jointmoescalinglaws}. 
+
+% NOTE: implementation defaults (scripts/finetune.py), from the experiment spec, not yet agreed:
+% fresh optimizer state in every cell, weight decay 0, 3% warmup, linear decay over the last 20%,
+% 15.7M tokens per run at a 65,536-token batch, 10 checkpoints, embedding/lm_head LRs at 0.1x
+% their pre-training values in every cell, balancer active.
+After learning rate selection, we fine-tune each pre-trained model using Muon and Adam using a warmup--stable--decay learning rate schedule \cite{hu2024minicpmunveilingpotentialsmall}. We use intermediate checkpoints to construct the learning--forgetting curve in \ref{sec:3.1}.
+
+\section{Impact statement}
+This work seeks to advance the fields of Machine Learning and Natural Language Processing by contributing to the scientific understanding of optimizer mismatch. We use datasets that redact personally identifiable information and that (in the case of StarCoder) offer mechanisms to opt out from data inclusion. There are many potential consequences of deep learning optimization research, none of which we deem particularly relevant to highlight here.
+
+
+\section{AI use disclosure}
+\label{sec:ai}
+The authors used GPT-6 Sol from OpenAI and Claude Opus 5.5 and Fable 5.2 from Anthropic to explore the relevant literature, brainstorm project ideas, and ideate experimental interventions. The authors used the named AI models to obtain guidance on adapting the nanochat repository for MoE training, to write unit tests, and to generate a plan for testing the training pipeline. The authors perused all cited literature, designed the full experimental setup, manually implemented most of the code, executed training experiments by hand, and inspected model-generated unit tests to verify their soundness. The authors did not use AI to draft this report. The authors take full responsibility for the content of this paper.
+
+\section{Reflection and acknowledgments}
+\label{sec:reflection}
+We greatly benefited from private conversations with the 6.4610 course staff, which helped develop and frame the project. 
+We are grateful to Paul Liang for suggesting the direction of optimizer mismatch; to Xinyu Zhao for sharing her perspective on the problem and providing us with a pre-release version of her paper \cite{zhao2026ephemeral}; to Nikita Bezrukov for providing 
+helpful feedback on our project proposal; and to Jacob Andreas, Yoon Kim, and Alex Damian for valuable perspectives. 
+
+We arrived at the current problem statement after considering a number of ideas. From the start, we were certain that we wanted to investigate why the literature has produced seemingly conflicting results on the severity of optimizer mismatch. To this end, we considered investigating how the effect of optimizer mismatch depends on model depth or varies across Transformers with different attention mechanisms. We did not proceed with these ideas because we struggled to conceive a mechanism by which these variables might impact mismatch severity in either direction. (We benefited from our discussion with Yoon Kim, who suggested that it may not be productive to investigate a question unless we have a working hypothesis about the expected result.) We chose to study MoE models because the rich literature on routing instability suggested a possible relationship between router instability and catastrophic forgetting.
+
+The optimizer mismatch problem and the interaction between optimizers and MoE architectures are highly active topics, and a number of relevant papers have been released during the course of our project \cite{zhao2026ephemeral, hernanz2026muonmakesmixtureofexpertslayer, li2026pretrainingdatascalereverses}. It has been challenging to steer our project amid this high level of activity, but we are excited to contribute to this field.
+
+It has also been challenging to adjust the scope of our project to accommodate limited computing resources. Initially, we had hoped to run experiments spanning a wide range of model sizes, following prior work on optimizer mismatch. However, we had to limit our scope to a relatively small model due to computational and time constraints.
+
+\emph{
+In this Reflection section, we responded to the questions \emph{
+``Identify some of the writing, research, or other choices you and/or your team made'' 
+} and \emph{``What worked well and why? What didn’t work well and why? What was challenging or frustrating?''}.
+}
+
+
+\bibliography{references}
+
+\end{document}

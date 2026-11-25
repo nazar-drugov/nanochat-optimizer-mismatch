@@ -177,8 +177,9 @@ def fake_cluster(tmp_path):
     launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC)
     scratch = tmp_path / "scratch"
     environ = dict(os.environ, NANOCHAT_LAUNCHER=str(launcher), NANOCHAT_SCRATCH_BASE=str(scratch),
-                   CALL_LOG=str(tmp_path / "calls.log"))
-    return {"tmp": tmp_path, "scratch": scratch, "environ": environ, "calls": tmp_path / "calls.log"}
+                   NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "calls.log"))
+    return {"tmp": tmp_path, "scratch": scratch, "environ": environ, "calls": tmp_path / "calls.log",
+            "pool": tmp_path / "pool"}
 
 
 def test_job_runs_each_run_skips_finished_ones_and_reports_failures(fake_cluster):
@@ -200,6 +201,8 @@ def test_job_runs_each_run_skips_finished_ones_and_reports_failures(fake_cluster
     calls = fake_cluster["calls"].read_text().splitlines()
     assert [c.split()[0] for c in calls] == [runs[0].name, runs[1].name]
     assert calls[0] == f"{runs[0].name} NPROC=1 train " + " ".join(runs[0].base_train_args())
+    # Result files were copied to pool storage (weights would not be)
+    assert (fake_cluster["pool"] / "results" / "base_checkpoints" / runs[0].name / "result.json").exists()
     # Resubmitting runs only what is still missing
     fake_cluster["calls"].unlink()
     result = subprocess.run(["bash", str(path)], env=fake_cluster["environ"], capture_output=True, text=True, timeout=60)
@@ -233,3 +236,29 @@ def test_command_line_from_sweep_jobs_to_main_jobs(tmp_path):
     main_script = (out / "e8-main-muon-s42.sbatch").read_text()
     assert f"--muon-matrix-lr={selection['muon']['full_lr']!r}" in main_script
     assert "#SBATCH -t 04:30:00" in main_script and "--train-tokens=3000238080" in main_script
+
+
+def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
+    from nanochat.pretrain_sweep import FINETUNE_LR_FRACTIONS, finetune_lr_grid
+    from scripts import finetune_jobs
+    selection = {"adamw": {"full_lr": 1e-3}, "muon": {"full_lr": 2e-3}}
+    (tmp_path / "sel.json").write_text(json.dumps(selection))
+    finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s42",
+                        "--dataset", "wikitext103=/data/wt", "--dataset", "codeparrot=/data/cp",
+                        "--d0-file", "/data/d0.parquet", "--out", str(tmp_path / "jobs"), "--repo-dir", str(tmp_path)])
+    jobs = sorted(p.name for p in (tmp_path / "jobs").glob("*.sbatch"))
+    assert len(jobs) == 4 and "ft-e8-main-adamw-s42-codeparrot-muon.sbatch" in jobs
+    grid = finetune_lr_grid(selection)
+    assert grid["muon"] == [2e-3 * f for f in FINETUNE_LR_FRACTIONS]
+    # Run one job against a fake python that records its arguments
+    fake = tmp_path / "fake_python.sh"
+    fake.write_text('#!/bin/bash\necho "$@" > "$CALL_LOG"\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    script = tmp_path / "jobs" / "ft-e8-main-adamw-s42-wikitext103-adamw.sbatch"
+    env = dict(os.environ, NANOCHAT_PYTHON=str(fake), NANOCHAT_SCRATCH_BASE=str(tmp_path / "scratch"),
+               NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "call.log"))
+    assert subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60).returncode == 0
+    call = (tmp_path / "call.log").read_text().split()
+    assert call[:2] == ["-m", "scripts.finetune"] and call[call.index("--ft-name") + 1] == "wikitext103"
+    assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
+    assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]

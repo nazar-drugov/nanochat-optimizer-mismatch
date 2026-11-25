@@ -1,0 +1,47 @@
+"""
+Write the fine-tuning Slurm jobs: one per (base model, dataset, fine-tuning optimizer),
+each running a 5-point LR grid x 5 seeds through scripts/finetune.py on one B200.
+
+  python -m scripts.finetune_jobs --selection jobs/lr_selection.json \
+      --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
+      --dataset wikitext103=<scratch>/finetune_data/wikitext103 --dataset codeparrot=<scratch>/finetune_data/codeparrot \
+      --d0-file <scratch>/heldout/fineweb-edu-100b/d0.parquet --out jobs/
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+from nanochat.pretrain_sweep import FINETUNE_LR_FRACTIONS, FINETUNE_SEEDS, OPTIMIZERS, finetune_lr_grid, render_finetune_job
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--selection", required=True, help="pretraining lr_selection.json (scripts/pretrain_sweep.py)")
+    parser.add_argument("--base-runs", nargs="+", required=True)
+    parser.add_argument("--dataset", action="append", required=True, help="name=directory (repeatable)")
+    parser.add_argument("--d0-file", required=True)
+    parser.add_argument("--lr-fractions", type=float, nargs="+", default=list(FINETUNE_LR_FRACTIONS))
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(FINETUNE_SEEDS))
+    parser.add_argument("--time-limit", default="05:00:00")
+    parser.add_argument("--out", default="jobs")
+    parser.add_argument("--repo-dir", default=str(REPO_ROOT))
+    args = parser.parse_args(argv)
+    grid = finetune_lr_grid(json.loads(Path(args.selection).read_text()), args.lr_fractions)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for base_run in args.base_runs:
+        for spec in args.dataset:
+            name, _, directory = spec.partition("=")
+            for optimizer in OPTIMIZERS:
+                job = f"ft-{base_run}-{name}-{optimizer}"
+                (out / f"{job}.sbatch").write_text(render_finetune_job(
+                    job, base_run, name, directory, args.d0_file, optimizer, grid[optimizer], args.time_limit,
+                    args.repo_dir, seeds=args.seeds))
+                print(f"wrote {out / job}.sbatch  ({optimizer}: " + ", ".join(f"{lr:.3g}" for lr in grid[optimizer]) + ")")
+
+
+if __name__ == "__main__":
+    main()

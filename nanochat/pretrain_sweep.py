@@ -183,16 +183,7 @@ class SlurmSettings:
     mem: str = "128G"
 
 
-def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=SlurmSettings()):
-    """A Slurm batch script that runs `runs` one after another on one GPU.
-
-    A run that already has result.json (completed or diverged) is skipped, so a
-    resubmitted job continues where it stopped. A failed run does not stop the
-    others; the job exits non-zero if any run failed.
-    """
-    for run in runs:
-        if not RUN_NAME_PATTERN.match(run.name):
-            raise ValueError(f"invalid run name {run.name!r}")
+def slurm_header(job_name, time_limit, repo_dir, scratch_base=None, slurm=SlurmSettings()):
     lines = [
         "#!/bin/bash",
         f"#SBATCH -J {job_name}",
@@ -209,9 +200,39 @@ def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=Sl
         lines.append(f"export NANOCHAT_SCRATCH_BASE={shlex.quote(str(scratch_base))}")
     lines += [
         'SCRATCH="${NANOCHAT_SCRATCH_BASE:-$HOME/orcd/scratch/public/nanochat-optimizer-mismatch}"',
+        'POOL="${NANOCHAT_POOL_BASE:-$HOME/orcd/pool/nanochat-optimizer-mismatch}"',
+        "failed=0",
+    ]
+    return lines
+
+
+# Small result files (records, metrics, logs; not weights) are copied from scratch to pool
+# storage at the end of every job, so they survive scratch purges.
+PERSIST_LINES = [
+    'mkdir -p "$POOL/results"',
+    "for d in base_checkpoints logs finetune; do",
+    '    [[ -d "$SCRATCH/$d" ]] || continue',
+    "    rsync -a --prune-empty-dirs --include='*/' --include='*.json' --include='*.jsonl' --include='*.log' \\",
+    "          --include='*.parquet' --exclude='*' \"$SCRATCH/$d\" \"$POOL/results/\" \\",
+    '        || echo "WARNING: could not copy $d results to $POOL/results" >&2',
+    "done",
+]
+
+
+def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=SlurmSettings()):
+    """A Slurm batch script that runs `runs` one after another on one GPU.
+
+    A run that already has result.json (completed or diverged) is skipped, so a
+    resubmitted job continues where it stopped. A failed run does not stop the
+    others; the job exits non-zero if any run failed. Result files are then copied
+    to pool storage.
+    """
+    for run in runs:
+        if not RUN_NAME_PATTERN.match(run.name):
+            raise ValueError(f"invalid run name {run.name!r}")
+    lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [
         'LAUNCHER="${NANOCHAT_LAUNCHER:-runs/pretrain_study.sh}"',
         "export NPROC_PER_NODE=1",
-        "failed=0",
         "run_one() {",
         '    local name="$1"; shift',
         '    if [[ -f "$SCRATCH/base_checkpoints/$name/result.json" ]]; then',
@@ -222,5 +243,38 @@ def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=Sl
     ]
     for run in runs:
         lines.append("run_one " + " ".join(shlex.quote(arg) for arg in [run.name, *run.base_train_args()]))
+    lines += PERSIST_LINES
+    lines.append('exit "$failed"')
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Fine-tuning jobs (scripts/finetune.py)
+
+FINETUNE_SEEDS = (1, 2, 3, 4, 5)
+# Fine-tuning LR grid per fine-tuning optimizer: fractions of that optimizer's selected
+# 3B-token pretraining LR, spaced x2 (EXPERIMENT_SPEC.md §6: 5-point grid per cell).
+FINETUNE_LR_FRACTIONS = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
+
+
+def finetune_lr_grid(selection, fractions=FINETUNE_LR_FRACTIONS):
+    return {o: [selection[o]["full_lr"] * f for f in fractions] for o in OPTIMIZERS}
+
+
+def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optimizer, lrs, time_limit, repo_dir,
+                        seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings()):
+    """One process runs every (LR, seed) cell of one base model, dataset and fine-tuning optimizer."""
+    if not RUN_NAME_PATTERN.match(base_run):
+        raise ValueError(f"invalid run name {base_run!r}")
+    args = ["--base-run", base_run, "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
+            "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds)]
+    lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [
+        'PYTHON="${NANOCHAT_PYTHON:-.venv/bin/python}"',
+        'export NANOCHAT_BASE_DIR="$SCRATCH"',
+        'export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"',
+        'export WANDB_MODE=disabled',
+        '"$PYTHON" -m scripts.finetune ' + " ".join(shlex.quote(a) for a in args) + " || failed=1",
+    ]
+    lines += PERSIST_LINES
     lines.append('exit "$failed"')
     return "\n".join(lines) + "\n"
