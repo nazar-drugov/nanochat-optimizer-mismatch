@@ -146,7 +146,7 @@ puts AdamW's 3B optimum at 1.311e-3, +1.01 octaves from the transferred 6.511e-4
 +0.07). By the rule above, the AdamW base models (seeds 42, 43, 44) are trained at 1.311e-3; Muon's
 stay at the transferred 8.874e-4. The selection is `lr_selection_3b.json`. The first AdamW base model
 (6.511e-4) is kept as the transfer-check ×1 point, not used for fine-tuning. Consequence for the
-report: the −0.32 exponent is not applied blindly at other E; each E gets its own transfer check.
+report (proposed, not yet agreed): the −0.32 exponent should not be applied unchecked at other E; each E would get its own transfer check.
 
 **Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
 (job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
