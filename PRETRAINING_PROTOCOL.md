@@ -180,11 +180,18 @@ if a transfer check fails.
   Python split is 59 files, ~28B tokens). D1 = 20,000 documents sampled (seed 0) from the last file,
   which training never reads. GPT-2 tokenizes code at ~2.1 characters per token (FineWeb-Edu ~4.7),
   so D1 losses are not comparable with D0 losses.
+- **Evaluation packing: best-fit, as in pretraining** (user decision, 2026-11-25, after the D0 gap
+  was traced to packing): D0 and D1 rows are built exactly as the pretraining loader builds them
+  (every row starts with a BOS, no document crosses a row, long documents are cropped), with document
+  IDs kept; each document is read once. The old contiguous packing cut the context of ~49% of the
+  scored tokens. `--eval-packing contiguous` keeps the old version for reference.
 - **WikiText D1: official validation + test + sampled training articles** (user decision,
-  2026-11-25). 60 validation and 62 test articles plus 146 training articles drawn with seed 0 (and
-  removed from training) until D1 holds ≥ 1.1M GPT-2 tokens: 268 articles, 1,100,545 tokens, in shuffled
-  order. The default evaluation (1,048,576 scored tokens) then touches 260 of them. Training: 29,298
-  articles (~112M tokens).
+  2026-11-25). Sized for the best-fit packing: 60 validation and 62 test articles plus 510 training
+  articles drawn with seed 0 (and removed from training) until the packing fills 512 rows: 632
+  articles, 2.5M tokens, shuffled; the evaluation scores the first ≤ 2,048 tokens of 627 of them
+  (1,048,461 tokens). Training: 28,934 articles (110.6M tokens), which give only 49.0M training tokens
+  per pass under best-fit cropping (articles are long), so a 960-step WikiText run would need 1.28
+  passes (open question). StarCoderData: 215.8M per pass, 0.29 passes.
 - **LR selection: (A), conventional** (user decision). Per cell (base model, fine-tuning dataset,
   fine-tuning optimizer, E), the LR with the lowest final D1 loss, mean over fine-tuning seeds, as in
   Zhao et al. (arXiv:2610.22650). The learning–forgetting analysis (forgetting at matched learning

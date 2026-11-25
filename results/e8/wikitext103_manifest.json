@@ -1,0 +1,32 @@
+{
+  "dataset": "wikitext103",
+  "preprocessing": "wikitext-detok-v1",
+  "d1": "validation+test+train-sample-v2 (seed 0, 512 best-fit rows)",
+  "splits": {
+    "train": {
+      "source": "Salesforce/wikitext/wikitext-103-raw-v1/train",
+      "documents": 28934,
+      "characters": 508758819,
+      "articles_moved_to_d1": 510
+    },
+    "val": {
+      "source": "validation + test + training articles sampled with seed 0 until the best-fit evaluation packing fills 512 rows of 2048",
+      "documents": 632,
+      "validation_articles": 60,
+      "test_articles": 62,
+      "training_articles": 510,
+      "gpt2_tokens_incl_bos": 2503186,
+      "characters": 11534088
+    }
+  },
+  "files": {
+    "train_00000.parquet": {
+      "sha256": "f5644d98603366d3fc34ac728442cf4b66c9e3efe7bf9e3ff427c3b9ba7bfd84",
+      "rows": 28934
+    },
+    "val_00000.parquet": {
+      "sha256": "2195d6c4869328e5e8e0d33a4529d4f598ef5bfb31a6d5f3703bf4d49ecb4d0a",
+      "rows": 632
+    }
+  }
+}
