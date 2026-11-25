@@ -140,12 +140,13 @@ The WikiText pilot (all four pairs) is not assigned yet.
 ## 6. Next steps (in order)
 
 1. Run the two matched-pair pilot jobs on Nazar's account (§5).
-2. **Resolve the D0 loss discrepancy before the main grid.** The fine-tuning smoke reported base D0
-   loss 3.1245 nats/token for an AdamW base model whose pretraining D0 bpb converts to ~2.95. Suspects:
-   `nanochat/eval_set.py` packs documents contiguously in file order with BOS (pretraining evaluation
-   uses the best-fit packer, which crops documents), and the smoke scored only 235,520 tokens. Compute
-   both evaluations on the same base model and tokens and explain the gap; it affects how forgetting
-   numbers compare with pretraining numbers, not the within-study comparisons.
+2. **D0 loss gap: explained 2026-11-25** (LOG_CHANGES, `results/e8/d0_eval_gap/`). The fine-tuning
+   evaluation (`nanochat/eval_set.py`) packs documents contiguously, so ~49% of scored tokens sit in a
+   document that started in an earlier row and have lost their earlier context (+0.45 nats on those
+   tokens); that is ~0.2 of the ~0.24-nat gap to the pretraining (best-fit) evaluation. A fix (score
+   document-aligned rows, e.g. reproduce the best-fit rows with document IDs) is **awaiting the user's
+   decision**. Changing the evaluation changes every fine-tuning measurement, so all four pilot pairs
+   must use the same version: do not start the matched-pair pilot jobs until this is decided.
 3. Analyse the pilot: per (base, fine-tuning optimizer, length) the D1-selected LR, learning and
    forgetting curves over log-spaced checkpoints, seed spread; record the chosen main length and number
    of seeds in the protocol with the date.
