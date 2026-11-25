@@ -388,3 +388,18 @@ Decisions in `PRETRAINING_PROTOCOL.md`: λ = 0.1 for both optimizers (option A),
 - **Persistence:** every Slurm job written by `nanochat/pretrain_sweep.py` copies small result files (`*.json`, `*.jsonl`, `*.log`, `*.parquet`) from scratch to `$POOL/results/` at the end.
 - **Fine-tuning** (`scripts/finetune.py`, `nanochat/finetune_metrics.py`, `nanochat/eval_set.py`, `nanochat/finetune_data.py`, `scripts/make_finetune_data.py`, `scripts/finetune_jobs.py`): spec §2/§6/§7 measurements. One process runs every (LR, seed) cell of a base model, dataset and fine-tuning optimizer, restarting from the base weights with fresh optimizer state; paired data order by seed; per checkpoint on D0 and D1: losses, learning/forgetting, replay terms F_route/F_fixed and the reverse order, per-layer loads, MaxVio, flip rate (raw and chance-normalized), TV, churn, flip causes, expert weight change rho and fine-tuning tokens per expert; per-document loss sums and route tables (uint8) for bootstrapping. Base model: separation S, two-halves reference, router margins. Outputs: config.json, metrics.jsonl/parquet, ckpt_*.npz, result.json. Defaults (spec REC, not yet agreed): codeparrot-clean as the far dataset, 15.7M tokens at 65,536 per step, 3% warmup, 20% decay, weight decay 0, embedding/lm_head LRs 0.1x pretraining, LR grid 1/16..1 x the pretraining LR, 5 seeds, 10 checkpoints. Tested on CPU only (`tests/test_finetune.py`).
 - **Report spec:** `docs/report.tex`, the 2026-11-24 draft with the agreed design changes; unagreed implementation defaults are `% NOTE` comments.
+
+## B200 benchmark and E = 8 sweep submission (2026-11-24, night)
+
+- **B200 throughput** (job 30414697, `~/jobs/bench_b200.jsonl` on ORCD, depth 10, grouped dispatch, 0 graph breaks everywhere). ms per 262,144-token step, with time relative to dense in brackets:
+
+  | | E=1 | E=4 | E=8 | E=16 | dense |
+  |---|---|---|---|---|---|
+  | AdamW, device batch 32 | 404 (1.27×) | 388 (1.21×) | 425 (1.33×) | 410 (1.28×) | 320 |
+  | AdamW, device batch 64 | 385 (1.19×) | 374 (1.15×) | 386 (1.19×) | 403 (1.24×) | 325 |
+  | Muon, device batch 32 | 376 (1.32×) | 405 (1.43×) | 385 (1.36×) | 438 (1.54×) | 284 |
+  | Muon, device batch 64 | 366 (1.25×) | 411 (1.41×) | 375 (1.28×) | 430 (1.47×) | 292 |
+
+  Peak reserved memory ≤ 44 GB at 32 and ≤ 65 GB at 64. The overhead relative to dense stays at 1.2–1.5×, more than the ~1.08× expected from the RTX 5080 profile; single measurements, so differences of a few percent (e.g. E = 4 vs E = 8) are within noise.
+- **Device batch stays 32** for the main runs (protocol entry of the same date): 64 would be 9% (AdamW) / 3% (Muon) faster, but the balance loss is computed per micro-batch, so it changes the balancer objective relative to the sweep. The handoff's "numerically equivalent" was wrong for MoE.
+- **E = 8 sweep resubmitted** with the launcher fix: jobs 30416147 (AdamW) and 30416148 (Muon).

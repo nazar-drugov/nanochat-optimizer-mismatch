@@ -116,6 +116,15 @@ Estimated B200 time (central, range): sweep 1.7 GPU-hours (1.1–2.8), ~0.9 h on
 3B run ~1.4–1.5 h; first AdamW/Muon pair ~2.6 h after the sweep starts; all three seeds
 ~10 GPU-hours (7–17).
 
+**Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
+(job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
+at 64 (9% faster); Muon 385 vs 375 ms (3% faster); 64 fits (62 GB reserved). It is not adopted
+because it is not numerically equivalent for MoE: the Switch balance loss is computed per
+micro-batch (expert shares × mean router probabilities over 65,536 tokens at 32, 131,072 at 64),
+so the balancer objective would differ between the sweep and the base models. Measured time per
+3B run at 32: ~81 min (AdamW) and ~73 min (Muon) of training steps plus evaluation; each sweep
+run ~12–14 min.
+
 **Deferred until the first fine-tuning results:** other E; the transfer check (E = 4, 0.5×/1×/2×
 at 3B); batch-size robustness; the weight-decay ablation (one Muon run with λ = 0.1·η_AdamW/η_Muon,
 so that η·λ matches AdamW); seed-noise runs for the sweep.
