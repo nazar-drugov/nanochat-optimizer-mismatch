@@ -19,7 +19,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | E = 8 base models, AdamW and Muon × seeds 42, 43, 44 (3B tokens) | **All six done** |
 | Fine-tuning data | **Both built** 2026-11-25: StarCoderData (Python); WikiText-103 rebuilt with a 1.1M-token D1 |
 | Fine-tuning protocol | LR selection, checkpoints, length pilot **decided** 2026-11-25 (§4) |
-| Fine-tuning length pilot (StarCoderData) | **Restarted with the new evaluation**; hgo runs the mismatched pairs, Nazar the matched (§5) |
+| Fine-tuning length pilot (StarCoderData) | **Done**, all four pairs plus edge extensions; seed-42 LR selection final (LOG_CHANGES 2026-11-25; `results/e8/finetune_pilot_starcoderdata_summary.json`) |
 | Fine-tuning main grid | Waits for the pilot (length, seeds) |
 | Analysis script | **Built** (`scripts/analyze_finetune.py`, §6 step 6); needs all runs on one evaluation packing (best-fit) |
 | Other E (1, 4, 16) | Deferred until fine-tuning results |
