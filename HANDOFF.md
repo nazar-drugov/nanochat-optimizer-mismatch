@@ -189,7 +189,9 @@ pilot (all four pairs) is not assigned yet.
   did not use AI to draft it). D1 composition decided: best-fit, short files (protocol).
 - WikiText beyond ~740 steps (only if the main length goes past that): accept a shorter WikiText length
   or split long articles.
-- ℓ0 for forgetting at matched learning; the number of fine-tuning seeds and main length (from the pilot).
+- Main fine-tuning length (pilot lengths vs adding a longer one). Decided 2026-11-25: 3 fine-tuning seeds,
+  all three base seeds, seeds 43/44 reuse the seed-42 LRs, ℓ0 after the curves (protocol, "Fine-tuning main grid").
+  The seed-42 checkpoint pin in `nanochat/pretrain_sweep.py` must admit seeds 43/44 (with SHA-256) first.
 - Transfer check at other E (proposal above).
 
 ## 8. Code map

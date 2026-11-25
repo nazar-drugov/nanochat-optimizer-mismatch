@@ -229,6 +229,22 @@ if a transfer check fails.
   penalty grows, shrinks or vanishes with length (Zhao et al.'s "ephemeral" claim, here for an MoE).
   What it cannot show: anything across base seeds or E (one base model per pretraining optimizer).
 
+### Fine-tuning main grid (decided 2026-11-25, user)
+
+- **Fine-tuning seeds: 3** (1, 2, 3; the spec's 5 is not needed: pilot seeds agree to ≤ 0.005 nats in
+  learning and mostly ≤ 0.03 in forgetting).
+- **Base models: all three pretraining seeds** (42, 43, 44) for both optimizers at E = 8; that is what
+  the three pretraining seeds are for (base-seed spread of the mismatch effect).
+- **LRs: reuse the seed-42 choice.** The full 5-point grid (plus edge extensions) runs only on the
+  seed-42 base models (the pilot); seeds 43 and 44 run only the LR(s) selected on seed 42 for each
+  (pretraining optimizer, fine-tuning optimizer, dataset) cell, one per length if the selection differs
+  between lengths (all lengths come from one trunk per LR). Selection waits for all four seed-42 pairs.
+- **ℓ0: chosen after seeing the fine-tuning curves** (user). Safeguard: choose it from the learning
+  curves (the range every cell reaches) before computing the forgetting contrast at it, and report the
+  contrast over the whole common learning range as well, so the choice of ℓ0 cannot steer the result.
+- **Main length:** open (see LOG_CHANGES 2026-11-25): the pilot lengths (60 / 240 / 960 steps;
+  WikiText 60 / 240 / 720) are the candidate main lengths; whether to add a longer one is pending.
+
 ## Before the first real run
 
 - Download data: `python -m nanochat.dataset --dataset fineweb-edu-100b -n 100` (3B training
