@@ -139,7 +139,14 @@ If the 3B optimum is more than ~0.25 octave from the transferred LR, the base mo
 (implied exponent −0.34), so the transfer holds. AdamW: ×2 the transferred LR is best (0.9130 vs 0.9180
 at ×1, 0.9280 at ×0.5), so its 3B optimum is at least 1 octave above the transferred LR and at or above
 the 0.5B optimum: the −0.32 exponent does not hold for AdamW here. The check is extended to ×4 and ×8
-for AdamW before the AdamW base models are rerun; the rerun itself awaits confirmation.
+for AdamW before the AdamW base models are rerun.
+
+**AdamW base models at the 3B optimum (2026-11-25).** The extended check (×4 0.9178, ×8 0.9345)
+puts AdamW's 3B optimum at 1.311e-3, +1.01 octaves from the transferred 6.511e-4 (implied exponent
++0.07). By the rule above, the AdamW base models (seeds 42, 43, 44) are trained at 1.311e-3; Muon's
+stay at the transferred 8.874e-4. The selection is `lr_selection_3b.json`. The first AdamW base model
+(6.511e-4) is kept as the transfer-check ×1 point, not used for fine-tuning. Consequence for the
+report: the −0.32 exponent is not applied blindly at other E; each E gets its own transfer check.
 
 **Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
 (job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
