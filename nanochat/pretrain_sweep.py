@@ -354,6 +354,7 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
         'export NANOCHAT_BASE_DIR="$SCRATCH"',
         'export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"',
         'export WANDB_MODE=disabled',
+        'export PYTHONUNBUFFERED=1  # progress lines reach the Slurm log as they happen',
         '"$PYTHON" -m scripts.finetune ' + " ".join(shlex.quote(a) for a in args) + " || failed=1",
     ]
     lines += PERSIST_LINES

@@ -100,47 +100,46 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
   checkpoints catch the first change. It can also show whether a mismatch penalty grows, shrinks or
   vanishes with length (Zhao's "ephemeral" claim, for an MoE). It says nothing across base seeds or E.
 
-## 5. In flight
+## 5. In flight, and what Nazar runs
 
-Pilot jobs on the **hgo** account, submitted 13:48 EST, all PENDING (Priority) at 14:00:
+The pilot is split between the two accounts (user decision, 2026-11-25 14:15 EST):
 
-| Job | Base model | Fine-tuning optimizer |
-|---|---|---|
-| 30493469 | e8-main-adamw-s42 | muon |
-| 30493470 | e8-main-muon-s42 | adamw |
-| 30493471 | e8-main-adamw-s42 | adamw |
-| 30493472 | e8-main-muon-s42 | muon |
+| Job | Base model → fine-tuning optimizer | Account | State |
+|---|---|---|---|
+| 30493469 | e8-main-adamw-s42 → Muon | hgo | running since 13:49 EST, ends ~15:05 |
+| 30493470 | e8-main-muon-s42 → AdamW | hgo | running since 13:51 EST, ends ~15:05 |
+| — | e8-main-adamw-s42 → AdamW | **Nazar** | to run (hgo's copy, 30493471, was cancelled) |
+| — | e8-main-muon-s42 → Muon | **Nazar** | to run (hgo's copy, 30493472, was cancelled) |
 
-Outputs: `$SCRATCH/finetune_pilot/<base>/starcoderdata/<opt>-lr<lr>-s<seed>-T{60,240,960}/`.
-Slurm logs: `/home/hgo/jobs/ft-pilot/<job name>_<id>.out`.
+hgo outputs: `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_pilot/<base>/starcoderdata/<opt>-lr<lr>-s<seed>-T{60,240,960}/`
+(Slurm logs in `/home/hgo/jobs/ft-pilot/`). The decay-branch code works on the B200: every finished
+trunk wrote all three lengths with the expected checkpoints (8, 10, 12) and status "completed".
+Measured: ~4.8 min per 960-step trunk (with its 60- and 240-step branches) on one B200, so one job
+(5 LRs × 3 seeds) takes ~75 min. Seeds agree to ~0.01 nats in learning and forgetting.
 
-**Avoid duplicate compute.** If you run the pilot on Nazar's account instead, ask the user to cancel
-the hgo jobs (`scancel 30493469 30493470 30493471 30493472`); cells are skipped only when their
-`result.json` exists in the same output directory, so two accounts would both run everything.
-To regenerate the same jobs for another account (paths absolute; `$SCRATCH` is not expanded inside
-the quoted arguments):
+To run the two matched pairs on Nazar's account, generate the jobs and submit only the
+`-adamw-s42-starcoderdata-adamw` and `-muon-s42-starcoderdata-muon` scripts:
 
 ```
 .venv/bin/python -m scripts.finetune_jobs --selection results/e8/lr_selection_3b.json \
   --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
   --dataset starcoderdata=/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/starcoderdata \
   --d0-file /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/heldout/fineweb-edu-100b/d0.parquet \
-  --seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root <your scratch>/finetune_pilot \
+  --seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root <Nazar's scratch>/finetune_pilot \
   --job-prefix ftpilot --out <jobs dir>
 ```
 
-and add `--base-checkpoints-dir /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints`
-to the `scripts.finetune` line of each script (`finetune_jobs` has no flag for it yet), or copy the
+Then add `--base-checkpoints-dir /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints`
+to the `scripts.finetune` line of each script (`finetune_jobs` has no flag for it yet), or copy the two
 base checkpoints. Check `--exclude` for your account's bad nodes (ours: node5800-c1, node5702-c1).
-
-**Not yet run on a GPU:** the decay-branch code (CPU-tested only). Watch the first trunk: the log
-should show checkpoint lines for steps 2, 4, …, 48 (branch 60), 54, 60, then 64, 128, 192 (branch 240),
-216, 240, then 256, 512, 768, 864, 960, with no traceback after the optimizer-state restore.
-Expected time per trunk: unmeasured; ~4–6× a 240-step cell (the smoke cell took 104 s).
+Job scripts from commit 5429aa7 on set `PYTHONUNBUFFERED=1`, so progress lines reach the Slurm log
+live (hgo's two running jobs predate it: their logs fill only at the end; results stream to scratch).
+The analysis must read both output roots (hgo's for the mismatched pairs, Nazar's for the matched).
+The WikiText pilot (all four pairs) is not assigned yet.
 
 ## 6. Next steps (in order)
 
-1. Make sure the pilot runs once (hgo jobs or yours, not both); check the first trunk as above.
+1. Run the two matched-pair pilot jobs on Nazar's account (§5).
 2. **Resolve the D0 loss discrepancy before the main grid.** The fine-tuning smoke reported base D0
    loss 3.1245 nats/token for an AdamW base model whose pretraining D0 bpb converts to ~2.95. Suspects:
    `nanochat/eval_set.py` packs documents contiguously in file order with BOS (pretraining evaluation
