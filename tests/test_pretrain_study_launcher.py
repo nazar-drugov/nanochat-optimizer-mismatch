@@ -118,6 +118,18 @@ def test_validation_uses_the_validation_shard_and_d0_is_only_logged(setup):
     assert f"--heldout-data-dir={heldout}" in command
     assert "--val-data-dir" not in command  # base_train then validates on the last shard, shard_01822
     assert "--eval-tokens=10485760" in command
+    # torchrun must not parse base_train's options ("--run=..." is ambiguous with --run-path)
+    assert " -m scripts.base_train -- " in command and command.index(" -- ") < command.index("--run=")
+
+
+def test_torchrun_passes_every_base_train_option_through(tmp_path):
+    """The exact torchrun invocation of the launcher reaches base_train's own argument parser."""
+    torchrun = REPO_ROOT / ".venv" / "bin" / "torchrun"
+    result = subprocess.run([str(torchrun), "--standalone", "--nproc_per_node=1", "-m", "scripts.base_train", "--",
+                             "--run=launcher-probe", f"--data-dir={tmp_path}", "--train-tokens=1"],
+                            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300)
+    assert "ambiguous option" not in result.stderr
+    assert "--train-tokens must be divisible by --total-batch-size" in result.stderr  # base_train parsed it
 
 
 @pytest.mark.parametrize("flag", ["--heldout-data-dir=/elsewhere", "--val-data-dir=/elsewhere"])

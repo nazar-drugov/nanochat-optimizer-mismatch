@@ -288,7 +288,9 @@ case "$mode" in
         stats_file="$SCRATCH_BASE/logs/$RUN_NAME.jsonl"
         # torchrun starts one copy of scripts.base_train per GPU. Arguments in
         # "$@" come from the caller; the final path arguments are fixed here.
-        cmd=("$TORCHRUN" --standalone "--nproc_per_node=$NPROC_PER_NODE" -m scripts.base_train
+        # "--" ends torchrun's own options: without it, torchrun reads "--run=..." as an
+        # abbreviation of its --run-path option and stops ("ambiguous option").
+        cmd=("$TORCHRUN" --standalone "--nproc_per_node=$NPROC_PER_NODE" -m scripts.base_train --
              "${eval_token_args[@]}" "$@" "--run=$RUN_NAME" "--data-dir=$DATA_DIR"
              "--heldout-data-dir=$HELDOUT_DIR" "--train-stats-jsonl=$stats_file")
         if [[ "$mode" == dry-run ]]; then
