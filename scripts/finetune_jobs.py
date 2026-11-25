@@ -12,7 +12,9 @@ import argparse
 import json
 from pathlib import Path
 
-from nanochat.pretrain_sweep import FINETUNE_LR_FRACTIONS, FINETUNE_SEEDS, OPTIMIZERS, finetune_lr_grid, render_finetune_job
+from nanochat.pretrain_sweep import (
+    FINETUNE_LR_FRACTIONS, FINETUNE_SEEDS, OPTIMIZERS, SlurmSettings, finetune_lr_grid, render_finetune_job,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +30,7 @@ def main(argv=None):
     parser.add_argument("--time-limit", default="05:00:00")
     parser.add_argument("--out", default="jobs")
     parser.add_argument("--repo-dir", default=str(REPO_ROOT))
+    parser.add_argument("--exclude", default=SlurmSettings.exclude, help="Slurm nodes to avoid ('' for none)")
     args = parser.parse_args(argv)
     grid = finetune_lr_grid(json.loads(Path(args.selection).read_text()), args.lr_fractions)
     out = Path(args.out)
@@ -39,7 +42,7 @@ def main(argv=None):
                 job = f"ft-{base_run}-{name}-{optimizer}"
                 (out / f"{job}.sbatch").write_text(render_finetune_job(
                     job, base_run, name, directory, args.d0_file, optimizer, grid[optimizer], args.time_limit,
-                    args.repo_dir, seeds=args.seeds))
+                    args.repo_dir, seeds=args.seeds, slurm=SlurmSettings(exclude=args.exclude)))
                 print(f"wrote {out / job}.sbatch  ({optimizer}: " + ", ".join(f"{lr:.3g}" for lr in grid[optimizer]) + ")")
 
 

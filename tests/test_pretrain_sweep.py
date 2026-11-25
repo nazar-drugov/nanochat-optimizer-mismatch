@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from nanochat.pretrain_sweep import (
-    CHECKPOINT_EVERY, FULL_TOKENS, SWEEP_TOKENS, TOTAL_BATCH_SIZE, RunSpec, main_runs, num_steps,
+    CHECKPOINT_EVERY, FULL_TOKENS, SWEEP_TOKENS, TOTAL_BATCH_SIZE, RunSpec, SlurmSettings, main_runs, num_steps,
     parabola_vertex, render_job, select_lr, sweep_points, sweep_runs, transfer_factor, warmup_steps,
 )
 from scripts import pretrain_sweep as cli
@@ -176,6 +176,7 @@ def fake_cluster(tmp_path):
     launcher.write_text(FAKE_LAUNCHER)
     launcher.chmod(launcher.stat().st_mode | stat.S_IEXEC)
     scratch = tmp_path / "scratch"
+    scratch.mkdir()
     environ = dict(os.environ, NANOCHAT_LAUNCHER=str(launcher), NANOCHAT_SCRATCH_BASE=str(scratch),
                    NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "calls.log"))
     return {"tmp": tmp_path, "scratch": scratch, "environ": environ, "calls": tmp_path / "calls.log",
@@ -210,12 +211,28 @@ def test_job_runs_each_run_skips_finished_ones_and_reports_failures(fake_cluster
     assert [c.split()[0] for c in fake_cluster["calls"].read_text().splitlines()] == [runs[1].name]
 
 
+def test_job_excludes_bad_nodes_and_stops_when_scratch_is_not_visible(fake_cluster):
+    runs = [r for r in sweep_runs() if r.optimizer == "muon"]
+    script = render_job("e8-sweep-muon", runs, "03:00:00", repo_dir=fake_cluster["tmp"])
+    assert "#SBATCH --exclude=node5800-c1" in script
+    assert "#SBATCH --exclude" not in render_job("j", runs, "03:00:00", repo_dir="/r", slurm=SlurmSettings(exclude=""))
+    path = fake_cluster["tmp"] / "job.sbatch"
+    path.write_text(script)
+    # On a node without the scratch directory the job stops before any run and names the node.
+    environ = dict(fake_cluster["environ"], NANOCHAT_SCRATCH_BASE=str(fake_cluster["tmp"] / "missing"))
+    result = subprocess.run(["bash", str(path)], env=environ, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1 and "is not visible on" in result.stderr
+    assert not fake_cluster["calls"].exists()
+
+
 def test_command_line_from_sweep_jobs_to_main_jobs(tmp_path):
     out = tmp_path / "jobs"
     root = tmp_path / "checkpoints"
     assert cli.main(["jobs", "--stage", "sweep", "--out", str(out), "--repo-dir", "/repo"]) in (0, None)
     assert sorted(p.name for p in out.glob("*.sbatch")) == ["e8-sweep-adamw.sbatch", "e8-sweep-muon.sbatch"]
     assert (out / "e8-sweep-muon.sbatch").read_text().count("\nrun_one ") == 3
+    assert cli.main(["jobs", "--stage", "sweep", "--out", str(out), "--exclude", "node1,node2"]) in (0, None)
+    assert "#SBATCH --exclude=node1,node2" in (out / "e8-sweep-adamw.sbatch").read_text()
 
     # Muon's best point is at the top edge: select asks for one more point
     for run in sweep_runs():
@@ -255,6 +272,7 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     fake.write_text('#!/bin/bash\necho "$@" > "$CALL_LOG"\n')
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     script = tmp_path / "jobs" / "ft-e8-main-adamw-s42-wikitext103-adamw.sbatch"
+    (tmp_path / "scratch").mkdir()
     env = dict(os.environ, NANOCHAT_PYTHON=str(fake), NANOCHAT_SCRATCH_BASE=str(tmp_path / "scratch"),
                NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "call.log"))
     assert subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60).returncode == 0

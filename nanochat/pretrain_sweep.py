@@ -181,6 +181,9 @@ class SlurmSettings:
     gres: str = "gpu:b200:1"
     cpus: int = 16
     mem: str = "128G"
+    # Nodes to avoid. node5800-c1 mounts /orcd/scratch/orcd/014 but not our directory in it
+    # (found 2026-11-24: job 30416147 could not see the staged data there).
+    exclude: str = "node5800-c1"
 
 
 def slurm_header(job_name, time_limit, repo_dir, scratch_base=None, slurm=SlurmSettings()):
@@ -193,6 +196,10 @@ def slurm_header(job_name, time_limit, repo_dir, scratch_base=None, slurm=SlurmS
         f"#SBATCH --mem={slurm.mem}",
         f"#SBATCH -t {time_limit}",
         "#SBATCH -o %x_%j.out",
+    ]
+    if slurm.exclude:
+        lines.append(f"#SBATCH --exclude={slurm.exclude}")
+    lines += [
         "set -uo pipefail",
         f"cd {shlex.quote(str(repo_dir))}",
     ]
@@ -201,6 +208,11 @@ def slurm_header(job_name, time_limit, repo_dir, scratch_base=None, slurm=SlurmS
     lines += [
         'SCRATCH="${NANOCHAT_SCRATCH_BASE:-$HOME/orcd/scratch/public/nanochat-optimizer-mismatch}"',
         'POOL="${NANOCHAT_POOL_BASE:-$HOME/orcd/pool/nanochat-optimizer-mismatch}"',
+        # Some nodes do not see every scratch directory; fail at once and name the node.
+        'if [[ ! -d "$SCRATCH" ]]; then',
+        '    echo "Scratch directory $SCRATCH is not visible on $(hostname); resubmit with --exclude=$(hostname)" >&2',
+        "    exit 1",
+        "fi",
         "failed=0",
     ]
     return lines
