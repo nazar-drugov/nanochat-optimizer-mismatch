@@ -1,0 +1,49 @@
+{
+  "dataset": "starcoderdata",
+  "language": "python",
+  "preprocessing": "none; D1 = 20000 documents sampled with seed 0",
+  "splits": {
+    "train": {
+      "source": [
+        "bigcode/starcoderdata/python/train-00000-of-00059.parquet"
+      ],
+      "documents_in_source": 218079,
+      "documents": 218079,
+      "characters": 1044004947
+    },
+    "val": {
+      "source": [
+        "bigcode/starcoderdata/python/train-00058-of-00059.parquet"
+      ],
+      "documents_in_source": 218078,
+      "documents": 20000,
+      "characters": 91798975
+    }
+  },
+  "files": {
+    "train_00000.parquet": {
+      "sha256": "63b6de722c4328143a464a060df18c975bf2863eb07f65f273a8e8b39181592a",
+      "rows": 50000
+    },
+    "train_00001.parquet": {
+      "sha256": "832054271ee46a4e063800974207f02ed43e9b3bdd9ccd8977d589802f167c70",
+      "rows": 50000
+    },
+    "train_00002.parquet": {
+      "sha256": "c8ae201d264db1818ea029bece31d4b0abea6ef62da2561d642f3525617269fc",
+      "rows": 50000
+    },
+    "train_00003.parquet": {
+      "sha256": "8b6aca82e1075ca6f6eabb6f2d0a768db1cef2488a36a1f388944383712685ec",
+      "rows": 50000
+    },
+    "train_00004.parquet": {
+      "sha256": "7028e08eba6091e3340873f859103072706283d89c9d0e47671817dfba10e17b",
+      "rows": 18079
+    },
+    "val_00000.parquet": {
+      "sha256": "8f80101d2c4a81f802779402751408289933d8c9b3ad1de351e763687e01474d",
+      "rows": 20000
+    }
+  }
+}

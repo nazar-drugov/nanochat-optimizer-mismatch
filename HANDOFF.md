@@ -1,168 +1,209 @@
-# Handoff: MoE optimizer-mismatch study (state on 2026-11-24, evening)
+# Handoff: MoE optimizer-mismatch study (state on 2026-11-25, 14:00 EST)
 
-Read this first, then `PRETRAINING_PROTOCOL.md` (every pretraining decision, with dates),
-`docs/report.tex` (the experiment spec as a paper draft) and `LOG_CHANGES.md` (what changed, newest last).
-The original design spec, `EXPERIMENT_SPEC.md`, is not in the repo; `docs/report.tex` and the
-protocol supersede it, and its fine-tuning recommendations (§6–§8) are implemented as defaults.
+Written for the agents taking over on Nazar's compute. Read this first, then
+`PRETRAINING_PROTOCOL.md` (every decision with its date, including the fine-tuning decisions near
+the end), `LOG_CHANGES.md` (what changed and every run's outcome, newest last) and `docs/report.tex`
+(the paper draft; `% NOTE` lines mark what is not yet agreed). The original `EXPERIMENT_SPEC.md` is
+not in the repo; the protocol and report supersede it.
 
-## 1. Goal
+## 1. Goal and where we are
 
 Measure whether fine-tuning a top-1 MoE language model with a different optimizer than it was
 pretrained with (AdamW vs Muon) forgets more at matched learning, and how much of that is routing
-(route replay). Current milestone, given by the user (who asked for autonomous work):
+(route replay). E = 8 is the headline cell.
 
-1. Finish the B200 throughput investigation.
-2. Run the E = 8 learning-rate sweep for both optimizers, select the LRs.
-3. Submit the E = 8 pretraining jobs (AdamW and Muon; seed 42 first, then 43 and 44).
-4. While waiting on compute: build and test the fine-tuning infrastructure (done, CPU only).
-5. If time remains: sweep LRs for the other E (1, 4, 16).
-6. Keep logging consistent and persistent.
+| Stage | State |
+|---|---|
+| E = 8 LR sweep (0.5B tokens) | Done |
+| LR transfer check at 3B tokens | Done; AdamW moved to the 3B optimum |
+| E = 8 base models, AdamW and Muon × seeds 42, 43, 44 (3B tokens) | **All six done** |
+| Fine-tuning data | WikiText-103 built; **StarCoderData (Python) built** 2026-11-25 |
+| Fine-tuning protocol | LR selection, checkpoints, length pilot **decided** 2026-11-25 (§4) |
+| Fine-tuning length pilot (StarCoderData) | **4 jobs queued on the hgo account, not started** (§5) |
+| Fine-tuning main grid | Waits for the pilot (length, seeds) and the WikiText D1 decision |
+| Analysis script | Not built |
+| Other E (1, 4, 16) | Deferred until fine-tuning results |
 
-## 2. Agreed design (all recorded in PRETRAINING_PROTOCOL.md)
+## 2. Pretraining: design and results
 
-- Model: nanochat GPT, depth 10, width 640, top-1 Switch MoE of SwiGLU experts (hidden 3d) in every
-  block, softmax gate over all E (never renormalized), dropless, router in fp32. GPT-2 tokenizer.
-  118M active parameters incl. embeddings (53.2M non-embedding). E = 8 is the headline cell.
-- Balancer: auxiliary loss 0.01 + z-loss 0.001, **summed** over MoE layers.
-- Optimizers: AdamW β = (0.9, 0.95), ε = 1e-8; Muon "moonlight" (Nesterov 0.95, 5 Newton–Schulz steps,
-  update scale 0.2·√max(m,n)); weight decay λ = 0.1 for both, applied as 1 − lr·λ (option A); clipping
-  1.0 in every cell; routers use the run's optimizer with weight decay 0; embedding/lm_head always AdamW
-  (nanochat values, identical in every cell).
-- Pretraining: FineWeb-Edu (frozen 100-shard snapshot, `data_manifests/fineweb_edu_100_v1/`), 3,000,238,080
-  tokens (11,445 steps) at 262,144 tokens per step, warmup 130M tokens (496 steps), constant, linear decay
-  to 0 over the last 20%. One B200 per run, device batch 32 (4 micro-batches per step).
-- Validation / LR selection: the held-out validation shard `shard_01822.parquet` **minus the documents D0
-  took from it** (D0 is sampled from that shard). D0 (`heldout/fineweb-edu-100b/d0.parquet`, ~2M tokens)
-  is evaluated alongside as `heldout/bpb` and never used for selection.
-- E = 8 sweep: 0.5B tokens (1,907 steps), warmup 83 steps (4.33%, same fraction as 130M of 3B), AdamW at
-  1e-3/2e-3/4e-3, Muon at 2e-3/4e-3/8e-3; LR = vertex of the parabola in log2(LR) through the best point and
-  its neighbours (one more point ×2 or ×½ if the best is at an edge); ×(3B/0.5B)^-0.32 = 0.5635 for 3B.
-- Other E (later): 5-point grids, AdamW centre 2e-3·E^-0.25, Muon centre 4e-3·2^(−k/4) (k = 0..3 for
-  E = 1, 4, 8, 16); one joint fit per optimizer y = a_E + b(log2 LR − m0 − α log2 E)². **Not implemented.**
-- Deferred until first fine-tuning results: transfer check (E=4, 0.5×/1×/2× at 3B), batch-size robustness,
-  weight-decay ablation (Muon with λ = 0.1·η_AdamW/η_Muon), sweep seed-noise runs, 1B/2B decay branches
-  (main runs checkpoint every 1,526 steps = 400M tokens so the branch points exist).
-- GPU runs are not bitwise reproducible (accepted). Data order is identical across runs and cells.
+Design (details and reasons in the protocol): nanochat GPT, depth 10, width 640, 5 heads of 128,
+sequence 2048; top-1 Switch MoE of SwiGLU experts (hidden 1920) in every block, dropless, softmax
+gate, fp32 router; 118M active parameters (53.3M non-embedding), 376M total at E = 8; GPT-2 tokenizer;
+FineWeb-Edu (frozen 100-shard snapshot). Balancer: aux 0.01 + z-loss 0.001, summed over layers.
+AdamW (0.9, 0.95), ε 1e-8; Muon moonlight (Nesterov 0.95, 5 Newton–Schulz steps, 0.2·√max(m,n));
+weight decay 0.1 on matrices for both (as 1 − lr·λ), router 0; clipping 1.0. 262,144 tokens per step;
+3,000,238,080 tokens (11,445 steps); warmup 130M tokens, constant, linear decay to 0 over the last 20%.
+Validation = `shard_01822.parquet` minus the D0 documents; D0 is never used to select anything.
 
-## 3. Code map
+LR selection (files in `results/e8/`: `lr_selection.json` = 0.5B sweep, `transfer_check.json`,
+`lr_selection_3b.json` = **the LRs the base models use; pass this to `finetune_jobs --selection`**):
+
+| | 0.5B sweep (val bpb) | 0.5B vertex | 3B check (val bpb at ×0.5 / ×1 / ×2 / ×4 / ×8 of the transferred LR) | Final 3B LR |
+|---|---|---|---|---|
+| AdamW | 2.5e-4 1.0797, 5e-4 1.0432, **1e-3 1.0197**, 2e-3 1.0294, 4e-3 1.0579 | 1.155e-3 | 0.9280 / 0.9180 / **0.9130** / 0.9178 / 0.9345 | **1.311e-3** (check vertex, +1.01 octave from the transferred 6.51e-4) |
+| Muon | 5e-4 1.0278, 1e-3 1.0060, **2e-3 1.0034**, 4e-3 1.0176, 8e-3 1.0396 | 1.575e-3 | 0.9043 / **0.9015** / 0.9050 | **8.874e-4** (transferred; check vertex −0.06 octave) |
+
+The borrowed transfer ×(3B/0.5B)^−0.32 held for Muon and failed for AdamW (implied exponent +0.07).
+Sources of the −0.32 (Bjorck et al., Ren et al.) and why they don't match our setup: protocol, LOG.
+
+Base models (final validation bpb; perplexity = 2^(bpb × 4.6788 bytes/token)):
+
+| Run | Val bpb | Val PPL | D0 bpb |
+|---|---|---|---|
+| e8-main-adamw-s42 / s43 / s44 | 0.9126 / 0.9127 / 0.9171 | 19.29 / 19.30 / 19.57 | 0.9010 / 0.9008 / 0.9055 |
+| e8-main-muon-s42 / s43 / s44 | 0.9015 / 0.9010 / 0.9005 | 18.61 / 18.58 / 18.55 | 0.8902 / 0.8896 / 0.8887 |
+
+Muon leads by 0.013 bpb (mean). The superseded AdamW base at 6.51e-4 is kept as
+`e8-xfer-adamw-lr0.000651-s42` (transfer-check ×1 point); do not fine-tune it.
+Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200 each, ~1 h 25 min per 3B run).
+
+## 3. Where everything is (MIT ORCD; all readable by every cluster user)
+
+- Scratch root (`$SCRATCH` in our jobs): `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/`
+  - `base_checkpoints/<run>/` — model weights, `config.json`, `result.json` for every sweep, transfer
+    and base run. From another account, point `scripts/finetune.py --base-checkpoints-dir` here.
+  - `base_data_fineweb_edu_100b/`, `heldout/fineweb-edu-100b/d0.parquet` (D0).
+  - `finetune_data/wikitext103/`, `finetune_data/starcoderdata/` (each: `train_*.parquet`, `val_00000.parquet` = D1,
+    `manifest.json`). `finetune_data/codeparrot/` is obsolete (deletable).
+  - `logs/<run>.jsonl|.log` — pretraining logs.
+- Pool copy of all small outputs: `/orcd/pool/006/hgo/nanochat-optimizer-mismatch/results/`.
+  Note: `meta_*.json` files there are 0.4–0.8 GB each (12 GB total); worth slimming.
+- Job scripts and Slurm outputs: `/home/hgo/jobs/` (pilot scripts in `/home/hgo/jobs/ft-pilot/`).
+- hgo checkout: `/home/hgo/nanochat-optimizer-mismatch` at 756a9fe or later.
+
+## 4. Fine-tuning protocol (decided 2026-11-25; protocol section "Fine-tuning: LR selection, checkpoints and length pilot")
+
+- Datasets: near = WikiText-103 (detokenized articles); far = **StarCoderData, Python only**
+  (train = first file, 218,079 documents, ~490M GPT-2 tokens; D1 = 20,000 documents sampled with
+  seed 0 from the last file, ~43M tokens, first 1,048,576 scored). Built by
+  `scripts/make_finetune_data.py --dataset starcoderdata` (gated; needs an HF token with the terms
+  accepted, read from `$HF_TOKEN` or `~/.cache/huggingface/token`). Run it on `mit_data_transfer`
+  (33 s); `mit_normal` queued it for hours.
+- Per cell (base model × dataset × fine-tuning optimizer): 5 LRs = {1/16, 1/8, 1/4, 1/2, 1} × the
+  fine-tuning optimizer's 3B pretraining LR (AdamW 8.19e-5 … 1.311e-3; Muon 5.55e-5 … 8.87e-4).
+  65,536 tokens per step, 15.7M tokens (240 steps) by default, warmup 8 steps, linear decay over the last
+  20%, weight decay 0, embedding/lm_head LR 0.1× pretraining, balancer active, fresh optimizer state.
+  Seeds set the data order (paired across cells).
+- **LR selection (A):** the LR with the lowest final D1 loss, mean over seeds (as Zhao et al.,
+  arXiv:2610.22650). Edge rule: if it is a grid end, run one more point. The frontier over all LRs is a
+  robustness check only. Never compare forgetting across cells at a shared fixed LR.
+- **Checkpoints: log-spaced** (default): 2, 4, 8, …, end of constant phase, mid-decay, last step
+  (240 steps: 2, 4, 8, 16, 32, 64, 128, 192, 216, 240).
+- **Length pilot first:** lengths 60 / 240 / 960 steps (3.9M / 15.7M / 62.9M tokens) as decay branches
+  of one 960-step trunk per (LR, seed) (`--branch-tokens 3932160 62914560`). Each branch equals a
+  separate run of its length (CPU test `test_decay_branches_equal_separate_runs`); the 240-step branch
+  is the main-grid cell for that seed. Scope: seed-42 base models, both fine-tuning optimizers, 5 LRs,
+  seeds 1–3, StarCoderData. It decides: the main length; whether the selected LR depends on length or
+  optimizer pair and whether the grid brackets it; seed spread (→ number of seeds); whether early
+  checkpoints catch the first change. It can also show whether a mismatch penalty grows, shrinks or
+  vanishes with length (Zhao's "ephemeral" claim, for an MoE). It says nothing across base seeds or E.
+
+## 5. In flight
+
+Pilot jobs on the **hgo** account, submitted 13:48 EST, all PENDING (Priority) at 14:00:
+
+| Job | Base model | Fine-tuning optimizer |
+|---|---|---|
+| 30493469 | e8-main-adamw-s42 | muon |
+| 30493470 | e8-main-muon-s42 | adamw |
+| 30493471 | e8-main-adamw-s42 | adamw |
+| 30493472 | e8-main-muon-s42 | muon |
+
+Outputs: `$SCRATCH/finetune_pilot/<base>/starcoderdata/<opt>-lr<lr>-s<seed>-T{60,240,960}/`.
+Slurm logs: `/home/hgo/jobs/ft-pilot/<job name>_<id>.out`.
+
+**Avoid duplicate compute.** If you run the pilot on Nazar's account instead, ask the user to cancel
+the hgo jobs (`scancel 30493469 30493470 30493471 30493472`); cells are skipped only when their
+`result.json` exists in the same output directory, so two accounts would both run everything.
+To regenerate the same jobs for another account (paths absolute; `$SCRATCH` is not expanded inside
+the quoted arguments):
+
+```
+.venv/bin/python -m scripts.finetune_jobs --selection results/e8/lr_selection_3b.json \
+  --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
+  --dataset starcoderdata=/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/starcoderdata \
+  --d0-file /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/heldout/fineweb-edu-100b/d0.parquet \
+  --seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root <your scratch>/finetune_pilot \
+  --job-prefix ftpilot --out <jobs dir>
+```
+
+and add `--base-checkpoints-dir /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints`
+to the `scripts.finetune` line of each script (`finetune_jobs` has no flag for it yet), or copy the
+base checkpoints. Check `--exclude` for your account's bad nodes (ours: node5800-c1, node5702-c1).
+
+**Not yet run on a GPU:** the decay-branch code (CPU-tested only). Watch the first trunk: the log
+should show checkpoint lines for steps 2, 4, …, 48 (branch 60), 54, 60, then 64, 128, 192 (branch 240),
+216, 240, then 256, 512, 768, 864, 960, with no traceback after the optimizer-state restore.
+Expected time per trunk: unmeasured; ~4–6× a 240-step cell (the smoke cell took 104 s).
+
+## 6. Next steps (in order)
+
+1. Make sure the pilot runs once (hgo jobs or yours, not both); check the first trunk as above.
+2. **Resolve the D0 loss discrepancy before the main grid.** The fine-tuning smoke reported base D0
+   loss 3.1245 nats/token for an AdamW base model whose pretraining D0 bpb converts to ~2.95. Suspects:
+   `nanochat/eval_set.py` packs documents contiguously in file order with BOS (pretraining evaluation
+   uses the best-fit packer, which crops documents), and the smoke scored only 235,520 tokens. Compute
+   both evaluations on the same base model and tokens and explain the gap; it affects how forgetting
+   numbers compare with pretraining numbers, not the within-study comparisons.
+3. Analyse the pilot: per (base, fine-tuning optimizer, length) the D1-selected LR, learning and
+   forgetting curves over log-spaced checkpoints, seed spread; record the chosen main length and number
+   of seeds in the protocol with the date.
+4. WikiText D1 (user decision pending): official validation + test (~120 articles, ~480K tokens; needs
+   `--eval-tokens` ≤ ~470K for D1, which currently shares one `--eval-tokens` with D0) vs ~250 held-out
+   training articles to reach 1M tokens. Then run the pilot or main grid on WikiText.
+5. Main grid: `scripts.finetune_jobs --selection results/e8/lr_selection_3b.json --base-runs e8-main-{adamw,muon}-s{42,43,44} ...`
+   at the length the pilot picks. Pilot cells at that length can be reused for seeds 1–3 of the
+   seed-42 bases if the length is one of the pilot lengths (same warmup, same data order).
+6. Build the analysis script: forgetting at matched learning ℓ0 (interpolated between checkpoints),
+   mismatch penalty, routing share (F_route / forgetting), paired document bootstrap over seeds. ℓ0 is
+   not chosen yet. Per-document sums are stored in `ckpt_<step>.npz` for the bootstrap.
+7. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
+   at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
+
+## 7. Open decisions (raise with the team; do not resolve silently)
+
+- WikiText D1 split (above).
+- StarCoderData: Python only is agreed; the report text still says "86 languages" (fix the wording).
+- ℓ0 for forgetting at matched learning; the number of fine-tuning seeds and main length (from the pilot).
+- Transfer check at other E (proposal above).
+
+## 8. Code map
 
 | What | Where |
 |---|---|
-| Model, MoE, grouped-GEMM dispatch | `nanochat/gpt.py` (`MoEMLP`, `grouped_segment_ends`) |
-| Pretraining | `scripts/base_train.py` (writes `config.json`, checkpoints, `result.json`; divergence stop) |
-| Launcher (data hash checks, paths) | `runs/pretrain_study.sh` (`train`, `dry-run`, `paths`, ...) |
-| E = 8 sweep plan, LR selection, Slurm jobs | `nanochat/pretrain_sweep.py`, `scripts/pretrain_sweep.py` |
-| Throughput benchmark | `scripts/bench_moe_throughput.py` |
-| Fine-tuning data | `nanochat/finetune_data.py`, `scripts/make_finetune_data.py` |
+| Model, MoE, grouped-GEMM dispatch | `nanochat/gpt.py` |
+| Pretraining | `scripts/base_train.py`; launcher `runs/pretrain_study.sh` |
+| Sweep plan, LR selection, transfer check, Slurm jobs | `nanochat/pretrain_sweep.py`, `scripts/pretrain_sweep.py` |
+| Fine-tuning data (WikiText-103, StarCoderData) | `nanochat/finetune_data.py`, `scripts/make_finetune_data.py` |
 | Fixed eval sets with document IDs | `nanochat/eval_set.py` |
-| Fine-tuning metrics (spec §2) | `nanochat/finetune_metrics.py` |
-| Fine-tuning driver | `scripts/finetune.py` |
-| Fine-tuning Slurm jobs | `scripts/finetune_jobs.py` |
-| Tests | `tests/` (CPU: `.venv/bin/python -m pytest -q --deselect tests/test_execution.py::test_memory_limit`) |
+| Fine-tuning metrics | `nanochat/finetune_metrics.py` |
+| Fine-tuning driver (cells, log checkpoints, decay branches) | `scripts/finetune.py` |
+| Fine-tuning Slurm jobs (`--branch-tokens`, `--out-root`, `--job-prefix`) | `scripts/finetune_jobs.py` |
+| LR selections and data manifest | `results/e8/` |
+| Tests | `tests/` (`.venv/bin/python -m pytest -q tests`) |
 
-Output conventions (keep them): every run directory has `config.json` (fully resolved settings, git
-state, data and eval-set SHA-256s) and `result.json` (status + summary). Pretraining metrics stream to
-`<scratch>/logs/<run>.jsonl`; fine-tuning to `<run>/metrics.jsonl` (+ `metrics.parquet`), one row per
-(checkpoint, eval set, layer), layer −1 = whole model. Every job copies `*.json`, `*.jsonl`, `*.log`,
-`*.parquet` to `$HOME/orcd/pool/nanochat-optimizer-mismatch/results/` at the end (weights stay on scratch).
+Tests: `tests/test_finetune.py` and `tests/test_pretrain_sweep.py` pass (32). Locally,
+`tests/test_base_train_smoke.py` fails 6 tests with `ModuleNotFoundError: setuptools` (environment,
+not code); on the B200 the full suite passed at b7edc71.
 
-## 4. Cluster (MIT ORCD) state
+Output conventions (keep them): every run directory has `config.json` (resolved settings, git state,
+data and eval-set SHA-256s) and `result.json` (status and summary). Fine-tuning writes
+`metrics.jsonl`/`metrics.parquet` (one row per checkpoint × eval set × layer; layer −1 = whole model;
+`ft_steps` = the run's length) and `ckpt_<step>.npz` (per-document sums, route tables).
 
-- Access: `ssh -o BatchMode=yes -o ControlPath=$HOME/.ssh/cm_socket/orcd-%C hgo@orcd-login.mit.edu ...`
-  through a ControlMaster socket the **user** opens (Duo):
-  `ssh -fN -o ControlMaster=yes -o ControlPersist=8h -o ControlPath=~/.ssh/cm_socket/orcd-%C hgo@orcd-login.mit.edu`.
-  Check with `ssh -O check -o ControlPath=...`. Use `ssh -n` in loops.
-- Partition `mit_normal_gpu`, `--gres=gpu:b200:1`, max 6 h per job, **2 GPUs per user**. B200 nodes are
-  short of free CPUs; jobs ask for `-c 16 --mem=128G` (lower `-c` if they sit in `Resources`).
-- User's checkout: `~/nanochat-optimizer-mismatch` (submit from here). `.venv` built with
-  `module load miniforge/26.7.2-0; uv sync --extra gpu --group dev` (torch 2.9.1+cu128). GPT-2 tiktoken
-  cache: `~/.cache/nanochat/tiktoken_cache`. **The checkout is at b7edc71: run `git pull` first.**
-- Data (copied from Nazar's scratch, D0 verified against the manifest):
-  `~/orcd/scratch/public/nanochat-optimizer-mismatch/base_data_fineweb_edu_100b/` (100 train shards +
-  `shard_01822.parquet`) and `.../heldout/fineweb-edu-100b/{d0.parquet,d0_report.json}`.
-  `bash runs/pretrain_study.sh paths` prints all paths.
-- Job scripts: `~/jobs/` (`e8-sweep-adamw.sbatch`, `e8-sweep-muon.sbatch`, `bench-b200.sbatch`); Slurm
-  output files land next to them. Scratch test outputs: `~/slurm_smoke/`, `~/fixtest/` (deletable).
-- B200 GPU suite at b7edc71: 267 passed, 13 skipped (FA3, 2-GPU, gloo). `torch._grouped_mm` is native on
-  sm_100 (no host sync), unlike the RTX 5080.
+## 9. Cluster notes
 
-## 5. Progress
+- Partition `mit_normal_gpu`, `--gres=gpu:b200:1`, max 6 h per job, 2 GPUs per user. B200 waits were
+  minutes when under the limit; H200 waits are hours. Jobs ask for `-c 16 --mem=128G`.
+- `.venv`: `module load miniforge/26.7.2-0; uv sync --extra gpu --group dev` (torch 2.9.1+cu128).
+- Credentials: W&B key in `~/.netrc`, HF token in `~/.cache/huggingface/token` (mode 600). Never print
+  or commit them.
 
-Done and pushed (master, latest d47c4a0): sweep/base-model infrastructure, validation-shard selection
-without D0, `result.json`, divergence stop, persistence, B200 empty-expert fix, launcher `--` fix,
-fine-tuning infrastructure (CPU-tested), report spec. CPU suite: 265 passed, 20 skipped.
+## 10. Conventions for agents
 
-Jobs submitted:
-- `30414694` e8-sweep-adamw, `30414695` e8-sweep-muon: **FAILED** in 40 s (launcher bug, fixed in 3a654e4).
-  Nothing was trained; no `config.json` exists, so the same run names can be reused.
-- `30414697` bench-b200: submitted, outcome unknown (it does not use the launcher). Results append to
-  `~/jobs/bench_b200.jsonl` (E = 8, 1, 4, 16 × AdamW/Muon × device batch 32 and 64).
-
-MoE efficiency findings (RTX 5080 profiling, see conversation summary in LOG_CHANGES/protocol):
-dropless costs nothing (≤0.2% padding); MoE overhead is mostly a fixed cost per micro-batch (expert
-weight stack/cast/grad accumulation ∝ total params, ~21.6 ms on the 5080), so larger micro-batches
-dilute it (expected ~1.08× dense at device batch 32 vs the measured 1.31× at 4); the Muon step scales
-with total params (Newton–Schulz 4.7 TFLOP/step at E = 8); the data loader delivers ~3M tokens/s.
-Optional later gains: device batch 64 (if memory allows), fusing dispatch copies (~1.5–2%).
-
-## 6. Blockers
-
-1. **The ORCD SSH socket expired** (2026-11-24 ~22:15). Ask the user to reopen it (command above).
-2. Nothing else blocks the sweep.
-
-## 7. Next steps (in order)
-
-1. On ORCD: `cd ~/nanochat-optimizer-mismatch && git pull --ff-only`.
-2. Check `sacct -j 30414697` and `~/jobs/bench_b200.jsonl`: compare `ms_per_step`/`x_dense` at device batch
-   32 vs 64 for E = 8 (both optimizers) and record the result (LOG_CHANGES + dashboard A9). If 64 fits and is
-   ≥ 5% faster, change `DEVICE_BATCH_SIZE` in `nanochat/pretrain_sweep.py` for the **main** runs (numerically
-   equivalent; the sweep can stay at 32). Redo the wall-clock estimate from measured tokens/s.
-3. Regenerate and submit the sweep:
-   `.venv/bin/python -m scripts.pretrain_sweep jobs --stage sweep --out ~/jobs && cd ~/jobs && sbatch e8-sweep-adamw.sbatch && sbatch e8-sweep-muon.sbatch`.
-4. A few minutes after the first run starts, check `~/orcd/scratch/public/nanochat-optimizer-mismatch/logs/e8-sweep-adamw-lr0.001-s42.log`:
-   finite "Validation bpb" and "Held-out bpb" lines at step 0, tok/sec, and in
-   `base_checkpoints/<run>/config.json`: `data.val_data_file` ends in `shard_01822.parquet`,
-   `data.heldout_data_file` in `d0.parquet`, `data.val_excluded_heldout_rows` > 0 (≈ D0's documents
-   from that shard; D0 has 1,881 documents). Don't wait on a stuck job: if a job sits in `Resources` for
-   long, lower `-c`/`--mem`; if a run crashes, read the log and fix before resubmitting.
-5. When both sweep jobs finish: `.venv/bin/python -m scripts.pretrain_sweep select --out ~/jobs`
-   (exit 3 = an optimizer needs one more point; rerun `jobs --stage sweep --extra-lr <opt>=<lr>` and `select`
-   with the same `--extra-lr`). Sanity-check the curves (`result.json` `eval_history`) and that no run diverged
-   unexpectedly.
-6. Main runs: `.venv/bin/python -m scripts.pretrain_sweep jobs --stage main --selection ~/jobs/lr_selection.json --out ~/jobs --seeds 42 43 44`;
-   submit seed 42 (both optimizers) first, then 43 and 44 (the 2-GPU limit queues them). ~1.4–1.5 h each.
-7. While they run: prepare fine-tuning data on the login node (network needed; untested against the real
-   Hugging Face endpoints):
-   `.venv/bin/python -m scripts.make_finetune_data --dataset wikitext103 --out ~/orcd/scratch/public/nanochat-optimizer-mismatch/finetune_data/wikitext103`
-   and the same with `--dataset starcoderdata` (gated; reads the HF token). Check `manifest.json` (document counts, detokenized text sample).
-8. GPU smoke of `scripts/finetune.py` before the base models finish: use a finished **sweep** run's final
-   checkpoint as `--base-run` (e.g. `e8-sweep-adamw-lr0.002-s42`), 1 LR × 1 seed, to time a cell and check
-   outputs; delete that output afterwards. Expected ~1–2 min per cell (15.7M tokens + 10 evaluations).
-9. When the seed-42 pair is done: `.venv/bin/python -m scripts.finetune_jobs --selection ~/jobs/lr_selection.json --base-runs e8-main-adamw-s42 e8-main-muon-s42 --dataset wikitext103=<dir> --dataset starcoderdata=<dir> --d0-file <d0> --out ~/jobs`
-   and submit (8 jobs; 25 cells each).
-10. If time remains: other E. Needs (a) a sweep plan for E ∈ {1, 4, 16} with the interleaved grids above,
-    (b) the joint fit (not implemented; `nanochat/pretrain_sweep.select_lr` is the E = 8 three-point version).
-11. Still to build: the analysis script (F at matched learning ℓ0 with interpolation between checkpoints,
-    mismatch penalty P, routing share, paired document bootstrap over seeds). Fine-tuning measurements are
-    already stored per document for it.
-
-## 8. Open decisions to raise with the team (do not resolve silently)
-
-- Far fine-tuning dataset: **decided 2026-11-25: StarCoderData** (Python subset by default; codeparrot-clean
-  removed). Whether to use more languages is open.
-- Fine-tuning defaults (spec recommendations, `scripts/finetune.py`): 15.7M tokens at 65,536 per step, 3%
-  warmup, 20% decay, weight decay 0, embedding/lm_head LR = 0.1× pretraining values in every cell, LR grid
-  1/16…1 × the selected pretraining LR of the fine-tuning optimizer, 5 seeds, balancer active.
-  **Decided 2026-11-25** (see PRETRAINING_PROTOCOL.md, "Fine-tuning: LR selection, checkpoints and length
-  pilot"): LR by lowest final D1 loss; log-spaced checkpoints; a length pilot (decay branches) first
-  (`--balancer-mode frozen` for the control arm). ℓ0 not chosen.
-- Fine-tuning stores per-document loss sums (not per-token arrays) for the bootstrap.
-
-## 9. Conventions for agents
-
-- Commit with the attribution lines the session provides; push to `origin master` (the user asked for
-  autonomous work and the cluster pulls from GitHub). Never commit secrets.
-- Keep the tracker dashboard current: https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo (ArtifactData,
-  collections `data/tracker/items`, `data/tracker/implemented`, `data/tracker/plan`; pin writes with
-  `if_version`). Open items of note: A9 (benchmark), A24 (E = 8 sweep and base models).
-- Write prose for humans plainly; record every decision with its date in PRETRAINING_PROTOCOL.md.
+- Commit with the attribution lines your session provides and push to `origin master`.
+- Record every decision with its date in `PRETRAINING_PROTOCOL.md`, every change and run outcome in
+  `LOG_CHANGES.md`. Write prose plainly for humans.
+- Tracker dashboard: https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo (may be stale since 2026-11-24).
+- Summary document of the pretraining (hyperparameters, sweep, transfer check, base models):
+  https://claude.ai/artifact/TP3GZWWwJHK2EqVu3GHdyk (private to the user until shared).
