@@ -118,7 +118,7 @@ To establish an experimental baseline, we measure the trade-off between learning
     \item Number of fine-tuning steps, $t$.
     \item Pre-training and fine-tuning optimizers, $(\Omega_0, \Omega_1) \in \{\text{AdamW}, \text{Muon}\}^2$,
     \item Sparsity, measured as the number $E$ of experts in each layer, at fixed active parameters.
-    \item Fine-tuning learning rate $\eta_1$, swept separately for each optimizer and sparsity and fixed at its per-cell optimum.
+    \item Fine-tuning learning rate $\eta_1$, swept separately for each optimizer and sparsity and fixed at its per-cell optimum, the learning rate with the lowest final fine-tuning validation loss averaged over seeds \\cite{zhao2026ephemeral}.
     \item Fine-tuning dataset $\D_1$, set to either a near-distribution or far-from-distribution corpus (details in Section~\ref{sec:datasets}).
 
 \end{enumerate}
@@ -229,8 +229,11 @@ We fix the active parameter size to be $118$ million (depth $10$, width $640$, e
 
 % NOTE: implementation defaults (scripts/finetune.py), from the experiment spec, not yet agreed:
 % fresh optimizer state in every cell, weight decay 0, 3% warmup, linear decay over the last 20%,
-% 15.7M tokens per run at a 65,536-token batch, 10 checkpoints, embedding/lm_head LRs at 0.1x
+% 15.7M tokens per run at a 65,536-token batch, embedding/lm_head LRs at 0.1x
 % their pre-training values in every cell, balancer active.
+% Decided 2026-11-25: LR chosen by lowest final D1 loss (mean over seeds); 10 log-spaced checkpoints
+% (steps 2, 4, ..., 128, 192, 216, 240); fine-tuning length ablation (3.9M/15.7M/62.9M tokens, decay
+% branches) run first as a pilot on the seed-42 base models.
 After learning rate selection, we fine-tune each pre-trained model using Muon and Adam using a warmup--stable--decay learning rate schedule \cite{hu2024minicpmunveilingpotentialsmall}. We use intermediate checkpoints to construct the learning--forgetting curve in \ref{sec:3.1}.
 
 \section{Impact statement}

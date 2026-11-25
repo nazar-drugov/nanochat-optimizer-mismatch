@@ -173,6 +173,42 @@ E (Eq. 8; fitted at E = 1 and 8, checked at E = 4 and 32) rather than tuning eac
 Option B (decay branches off longer stable phases instead of transferring) is the fallback
 if a transfer check fails.
 
+## Fine-tuning: LR selection, checkpoints and length pilot (decided 2026-11-25)
+
+- **Far dataset: StarCoderData, Python** (user decision). Training reads the first file of
+  `bigcode/starcoderdata/python` (218,079 files, 1.04B characters, ~490M GPT-2 tokens; the whole
+  Python split is 59 files, ~28B tokens). D1 = 20,000 documents sampled (seed 0) from the last file,
+  which training never reads. GPT-2 tokenizes code at ~2.1 characters per token (FineWeb-Edu ~4.7),
+  so D1 losses are not comparable with D0 losses.
+- **LR selection: (A), conventional** (user decision). Per cell (base model, fine-tuning dataset,
+  fine-tuning optimizer, E), the LR with the lowest final D1 loss, mean over fine-tuning seeds, as in
+  Zhao et al. (arXiv:2610.22650). The learning–forgetting analysis (forgetting at matched learning
+  along the time axis, routing statistics at t*) uses the selected LR's runs. The frontier over all
+  LRs (lowest forgetting at each learning level over every LR and checkpoint) is reported as a
+  robustness check only. Edge rule as in pretraining: if the selected LR is the top or bottom grid
+  point, one more point (×2 or ×½) is run. Forgetting is never compared across cells at a shared
+  fixed LR. Known bias: the LR is chosen on the same D1 tokens that measure learning (5 grid points;
+  small).
+- **Checkpoints: log-spaced** (user decision; `--checkpoint-spacing log`, the default): steps 2, 4,
+  8, ... below the end of the constant phase, that end, the middle of the decay and the last step.
+  For the 240-step runs: 2, 4, 8, 16, 32, 64, 128, 192, 216, 240 (10 evaluations, as before).
+- **Fine-tuning length: pilot first** (user decision). Lengths 60, 240 and 960 steps (3.9M, 15.7M,
+  62.9M tokens), run as decay branches of one 960-step trunk per (LR, seed): at the end of each shorter
+  length's constant phase the model, optimizer state and data position are copied, that length's
+  decay (last 20%) is run and measured, and the trunk resumes. Warmup is fixed at 8 steps (3% of 240)
+  for every length, so each length is the same as a separate run of that length; the 240-step branch
+  is the main-grid cell for that seed (tested on CPU: `test_decay_branches_equal_separate_runs`).
+  Scope: the seed-42 base models (AdamW, Muon), both fine-tuning optimizers, the 5-point LR grid,
+  fine-tuning seeds 1–3, StarCoderData first (WikiText waits for the D1 decision). Outputs in
+  `$SCRATCH/finetune_pilot`.
+  What the pilot decides: (1) the main fine-tuning length (whether learning and forgetting still
+  change a lot between 240 and 960 steps); (2) whether the selected LR depends on the length and on
+  the optimizer pair, and whether the 1/16–1× grid brackets it; (3) the seed-to-seed spread of
+  forgetting and learning, which sets the number of fine-tuning seeds; (4) whether the first
+  checkpoints catch the early change. What it can show about the question: whether a mismatch
+  penalty grows, shrinks or vanishes with length (Zhao et al.'s "ephemeral" claim, here for an MoE).
+  What it cannot show: anything across base seeds or E (one base model per pretraining optimizer).
+
 ## Before the first real run
 
 - Download data: `python -m nanochat.dataset --dataset fineweb-edu-100b -n 100` (3B training

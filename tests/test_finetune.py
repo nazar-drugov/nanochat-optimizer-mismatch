@@ -175,12 +175,13 @@ def run_finetune(setup, *extra):
                    "--ft-data-dir", str(setup["ft"]), "--ft-name", "tiny", "--d0-file", str(setup["d0"]),
                    "--out-root", str(setup["root"] / "out"), "--device-type", "cpu",
                    "--eval-tokens", "512", "--eval-batch-size", "4", "--train-tokens", "1024",
-                   "--total-batch-size", "128", "--device-batch-size", "2", "--n-checkpoints", "2", *extra])
+                   "--total-batch-size", "128", "--device-batch-size", "2", *extra])
     return setup["root"] / "out" / "tiny-base" / "tiny"
 
 
 def test_finetune_end_to_end(tiny_setup):
-    out = run_finetune(tiny_setup, "--lrs", "adamw=3e-3", "muon=3e-3", "--seeds", "1", "2")
+    out = run_finetune(tiny_setup, "--lrs", "adamw=3e-3", "muon=3e-3", "--seeds", "1", "2",
+                       "--checkpoint-spacing", "linear", "--n-checkpoints", "2")
     base = json.loads((out / "base" / "base_metrics.json").read_text())
     assert set(base["layers"]) == {"0", "1"} and 0 <= base["layers"]["0"]["separation"] <= 1
     results = {p.parent.name: json.loads(p.read_text()) for p in out.glob("*/result.json")}
@@ -213,7 +214,8 @@ def test_finetune_end_to_end(tiny_setup):
 
     # A resubmitted job skips finished cells
     before = (run / "result.json").stat().st_mtime_ns
-    run_finetune(tiny_setup, "--lrs", "muon=3e-3", "--seeds", "1")
+    run_finetune(tiny_setup, "--lrs", "muon=3e-3", "--seeds", "1", "--checkpoint-spacing", "linear",
+                 "--n-checkpoints", "2")
     assert (run / "result.json").stat().st_mtime_ns == before
 
 
@@ -247,3 +249,42 @@ def test_hf_token_is_not_forwarded_on_redirect():
     assert req.get_header("Authorization") == "Bearer secret"
     assert "Authorization" not in req.headers  # unredirected: dropped when urllib follows a redirect
     assert hf_request("https://huggingface.co/x").get_header("Authorization") is None
+
+
+def test_log_spaced_checkpoints():
+    from scripts.finetune import checkpoint_steps
+    assert checkpoint_steps(240, 48) == [2, 4, 8, 16, 32, 64, 128, 192, 216, 240]
+    assert checkpoint_steps(60, 12) == [2, 4, 8, 16, 32, 48, 54, 60]
+    assert checkpoint_steps(960, 192) == [2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 864, 960]
+    assert checkpoint_steps(8, 2, "linear", 2) == [4, 8]
+
+
+def test_decay_branches_equal_separate_runs(tiny_setup):
+    """A length run as a decay branch of a longer trunk gives the same data, curve and final
+    measurements as a separate run of that length (same seed, same warmup steps)."""
+    common = ("--lrs", "muon=3e-3", "--seeds", "1")
+    branched = run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048")  # 4, 8 (main), 16 steps
+    results = {p.parent.name: json.loads(p.read_text()) for p in branched.glob("muon-lr0.003-s1-T*/result.json")}
+    assert sorted(results) == ["muon-lr0.003-s1-T16", "muon-lr0.003-s1-T4", "muon-lr0.003-s1-T8"]
+    assert all(r["status"] == "completed" and r["warmup_steps"] == 1 for r in results.values())
+    assert [c["step"] for c in results["muon-lr0.003-s1-T16"]["curve"]] == [2, 4, 8, 13, 14, 16]
+    assert [c["step"] for c in results["muon-lr0.003-s1-T4"]["curve"]] == [2, 3, 4]
+    assert results["muon-lr0.003-s1-T4"]["curve"][0] == results["muon-lr0.003-s1-T16"]["curve"][0]  # shared step 2
+    rows = [json.loads(line) for line in (branched / "muon-lr0.003-s1-T4" / "metrics.jsonl").read_text().splitlines()]
+    assert {r["run"] for r in rows} == {"muon-lr0.003-s1-T4"} and {r["ft_steps"] for r in rows} == {4}
+    for tokens, branch in ((512, "T4"), (1024, "T8")):
+        from scripts import finetune
+        out = tiny_setup["root"] / f"separate_{tokens}"
+        finetune.main(["--base-run", "tiny-base", "--base-checkpoints-dir", str(tiny_setup["root"] / "base_checkpoints"),
+                       "--ft-data-dir", str(tiny_setup["ft"]), "--ft-name", "tiny", "--d0-file", str(tiny_setup["d0"]),
+                       "--out-root", str(out), "--device-type", "cpu", "--eval-tokens", "512",
+                       "--eval-batch-size", "4", "--train-tokens", str(tokens), "--total-batch-size", "128",
+                       "--device-batch-size", "2", *common])
+        single = json.loads((out / "tiny-base" / "tiny" / "muon-lr0.003-s1" / "result.json").read_text())
+        branch_result = results[f"muon-lr0.003-s1-{branch}"]
+        assert single["data_fingerprint"] == branch_result["data_fingerprint"]
+        assert [c["step"] for c in single["curve"]] == [c["step"] for c in branch_result["curve"]]
+        for a, b in zip(single["curve"], branch_result["curve"]):
+            for key in ("learning", "forgetting", "F_route", "train_loss"):
+                assert a[key] == pytest.approx(b[key], rel=1e-5, abs=1e-7), (branch, a["step"], key)
+        assert single["cumulative_expert_counts"] == branch_result["cumulative_expert_counts"]

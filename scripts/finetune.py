@@ -7,6 +7,17 @@ model and one fine-tuning dataset, reusing the compiled model; each cell restart
 the base weights with fresh optimizer state (spec §6). Cells that already have a
 result.json are skipped, so a resubmitted job continues where it stopped.
 
+Fine-tuning length (--branch-tokens): a cell can run several lengths at once. One trunk runs
+to the longest length; at the end of each shorter length's constant phase the model, optimizer
+state and data position are copied, that length's decay is run and measured, and the trunk
+resumes from the copy. Warmup is fixed in steps (from --train-tokens), so every length is the
+same as a separate run of that length with the same seed. Each length gets its own directory,
+suffixed -T<steps>.
+
+Checkpoints (--checkpoint-spacing log, the default): steps 2, 4, 8, ... below the end of the
+constant phase, the end of the constant phase, the middle of the decay and the last step
+(240 steps: 2, 4, 8, 16, 32, 64, 128, 192, 216, 240).
+
 Per cell (output: <out-root>/<base-run>/<dataset>/<optimizer>-lr<lr>-s<seed>/):
   config.json      fully resolved settings, base model, data and eval-set identity
   metrics.jsonl    one row per (checkpoint, eval set, layer); layer -1 = whole model
@@ -23,10 +34,12 @@ Example:
 """
 
 import argparse
+import copy
 import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -168,21 +181,99 @@ def append_rows(path, rows):
         os.fsync(f.fileno())
 
 
+def checkpoint_steps(steps, decay, spacing="log", n_checkpoints=10):
+    """Measurement steps of a run of `steps` steps whose last `decay` steps decay the LR."""
+    if spacing == "linear":
+        return sorted({round(i * steps / n_checkpoints) for i in range(1, n_checkpoints + 1)})
+    stable_end = steps - decay
+    points = {2 ** k for k in range(1, max(stable_end, 2).bit_length() + 1) if 2 ** k < stable_end}
+    points |= {stable_end, stable_end + decay // 2, steps}
+    return sorted(p for p in points if 1 <= p <= steps)
+
+
+class Branch:
+    """One fine-tuning length within a cell."""
+
+    def __init__(self, args, steps, suffix):
+        self.steps = steps
+        self.decay = round(args.warmdown_ratio * steps)
+        self.branch_point = steps - self.decay  # last step at the trunk's (constant) LR
+        self.ckpts = checkpoint_steps(steps, self.decay, args.checkpoint_spacing, args.n_checkpoints)
+        self.suffix = suffix
+        self.curve, self.status, self.steps_completed, self.done = [], "completed", 0, False
+
+
+class ReplayLoader:
+    """Wraps the data loader so a branch's batches can be handed to the trunk again."""
+
+    def __init__(self, loader):
+        self.loader, self.pending, self.recording = loader, deque(), None
+
+    def __next__(self):
+        item = self.pending.popleft() if self.pending else next(self.loader)[:2]
+        if self.recording is not None:
+            self.recording.append(item)
+        return item
+
+    def record(self):
+        self.recording = []
+
+    def rewind(self):
+        self.pending = deque(self.recording + list(self.pending))
+        self.recording = None
+
+
+def train_steps(args, ctx, optimizer, loader, state, first, last, branch, on_checkpoint):
+    """Run steps first..last on the schedule of `branch`; returns False if the loss diverged."""
+    model, compiled = ctx["model"], ctx["compiled"]
+    for step in range(first, last + 1):
+        lrm = wsd_lr_multiplier(step - 1, branch.steps, ctx["warmup"], branch.decay, 0.0)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+        loss_sum = 0.0
+        for _ in range(ctx["accum"]):
+            x, y = next(loader)
+            state["fingerprint"], state["fp_weights"] = update_batch_fingerprint(state["fingerprint"], x,
+                                                                                 state["fp_weights"])
+            loss, _, router_stats = compiled(x, y, return_metrics=True)
+            (loss / ctx["accum"]).backward()
+            loss_sum += loss.detach()
+            if router_stats:
+                counts = torch.stack([s["expert_counts"] for s in router_stats])
+                state["counts"] += counts
+                if model.config.balancer == "bias" and args.balancer_mode == "active":
+                    model.update_expert_bias(counts)
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        state["step"] = step
+        train_loss = float(loss_sum) / ctx["accum"]
+        if not math.isfinite(train_loss):
+            print0(f"training loss {train_loss} at step {step}; stopping")
+            return False
+        on_checkpoint(step, train_loss)
+    return True
+
+
 def run_cell(args, cell, ctx):
-    """Fine-tune once from the base weights and measure every checkpoint."""
+    """Fine-tune once from the base weights (one trunk with its decay branches, or a single
+    run) and measure every checkpoint."""
     optimizer_name, lr, seed = cell
-    run_dir = ctx["out_dir"] / f"{optimizer_name}-lr{lr_tag(lr)}-s{seed}"
-    if (run_dir / "result.json").exists():
-        print0(f"Skipping {run_dir.name}: result.json exists")
+    name = f"{optimizer_name}-lr{lr_tag(lr)}-s{seed}"
+    lengths = sorted({ctx["main_steps"], *ctx["branch_steps"]})
+    branches = [Branch(args, n, f"-T{n}" if len(lengths) > 1 else "") for n in lengths]
+    run_dirs = {b.steps: ctx["out_dir"] / (name + b.suffix) for b in branches}
+    if all((d / "result.json").exists() for d in run_dirs.values()):
+        print0(f"Skipping {name}: result.json exists")
         return
-    if run_dir.exists():  # an interrupted cell restarts from scratch
-        for f in run_dir.iterdir():
-            f.unlink()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    model, compiled, device = ctx["model"], ctx["compiled"], ctx["device"]
+    for run_dir in run_dirs.values():  # an interrupted cell restarts from scratch
+        if run_dir.exists():
+            for f in run_dir.iterdir():
+                f.unlink()
+        run_dir.mkdir(parents=True, exist_ok=True)
+    model, device = ctx["model"], ctx["device"]
     with torch.no_grad():  # restore the base weights and balancer state
-        for name, tensor in model.state_dict().items():
-            tensor.copy_(ctx["base_state"][name])
+        for key, tensor in model.state_dict().items():
+            tensor.copy_(ctx["base_state"][key])
     model.train()
     pre = ctx["pretrain_defaults"]
     optimizer = model.setup_optimizer(
@@ -195,70 +286,97 @@ def run_cell(args, cell, ctx):
         weight_decay=args.weight_decay, router_weight_decay=0.0,
         max_grad_norm=args.grad_clip if args.grad_clip > 0 else None, track_grad_norm=True,
     )
-    steps = args.train_tokens // args.total_batch_size
-    accum = args.total_batch_size // (args.device_batch_size * ctx["seq_len"])
-    warmup = math.ceil(args.warmup_ratio * steps)
-    decay = round(args.warmdown_ratio * steps)
-    ckpt_steps = sorted({round(i * steps / args.n_checkpoints) for i in range(1, args.n_checkpoints + 1)})
-    meta = {"run": run_dir.name, "base_run": ctx["base_run"], "pretrain_optimizer": ctx["pretrain_optimizer"],
-            "ft_dataset": args.ft_name, "ft_optimizer": optimizer_name, "lr": lr, "seed": seed,
-            "n_experts": model.config.n_experts}
-    write_run_record(run_dir / "config.json", args=args, model=model, optimizer=optimizer,
-                     device_type=device.type, world_size=1, compute_dtype=COMPUTE_DTYPE,
-                     data={"ft_data_dir": args.ft_data_dir, "ft_train_files": ctx["ft_train_files"],
-                           "eval_sets": ctx["eval_identity"]},
-                     extra={"stage": "finetune", "cell": meta, "base": ctx["base_identity"], "steps": steps,
-                            "grad_accum": accum, "warmup_steps": warmup, "decay_steps": decay,
-                            "checkpoint_steps": ckpt_steps, "conventions": CONVENTIONS,
-                            "balancer_mode": args.balancer_mode})
-    loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+    trunk = branches[-1]
+    meta = {b.steps: {"run": run_dirs[b.steps].name, "base_run": ctx["base_run"],
+                      "pretrain_optimizer": ctx["pretrain_optimizer"], "ft_dataset": args.ft_name,
+                      "ft_optimizer": optimizer_name, "lr": lr, "seed": seed, "ft_steps": b.steps,
+                      "n_experts": model.config.n_experts} for b in branches}
+    for b in branches:
+        write_run_record(run_dirs[b.steps] / "config.json", args=args, model=model, optimizer=optimizer,
+                         device_type=device.type, world_size=1, compute_dtype=COMPUTE_DTYPE,
+                         data={"ft_data_dir": args.ft_data_dir, "ft_train_files": ctx["ft_train_files"],
+                               "eval_sets": ctx["eval_identity"]},
+                         extra={"stage": "finetune", "cell": meta[b.steps], "base": ctx["base_identity"],
+                                "steps": b.steps, "grad_accum": ctx["accum"], "warmup_steps": ctx["warmup"],
+                                "decay_steps": b.decay, "checkpoint_steps": b.ckpts,
+                                "branch": {"lengths": lengths, "branch_point": b.branch_point,
+                                           "trunk_steps": trunk.steps} if len(branches) > 1 else None,
+                                "conventions": CONVENTIONS, "balancer_mode": args.balancer_mode})
+    loader = ReplayLoader(tokenizing_distributed_data_loader_with_state_bos_bestfit(
         ctx["tokenizer"], args.device_batch_size, ctx["seq_len"], split="train", device=device,
-        data_dir=args.ft_data_dir, shuffle_seed=seed)
+        data_dir=args.ft_data_dir, shuffle_seed=seed))
     n_layers = len(model.moe_layer_indices)
-    cumulative_counts = torch.zeros(n_layers, model.config.n_experts, dtype=torch.long, device=device)
-    fingerprint, fp_weights = torch.zeros((), dtype=torch.long, device=device), None
-    curve, status, t0 = [], "completed", time.time()
-    for step in range(1, steps + 1):
-        lrm = wsd_lr_multiplier(step - 1, steps, warmup, decay, 0.0)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-        loss_sum = 0.0
-        for _ in range(accum):
-            x, y, _ = next(loader)
-            fingerprint, fp_weights = update_batch_fingerprint(fingerprint, x, fp_weights)
-            loss, _, router_stats = compiled(x, y, return_metrics=True)
-            (loss / accum).backward()
-            loss_sum += loss.detach()
-            if router_stats:
-                cumulative_counts += torch.stack([s["expert_counts"] for s in router_stats])
-                if model.config.balancer == "bias" and args.balancer_mode == "active":
-                    model.update_expert_bias(torch.stack([s["expert_counts"] for s in router_stats]))
-        optimizer.step()
+    state = {"step": 0, "counts": torch.zeros(n_layers, model.config.n_experts, dtype=torch.long, device=device),
+             "fingerprint": torch.zeros((), dtype=torch.long, device=device), "fp_weights": None}
+    t0 = time.time()
+
+    def measure_for(targets, step, train_loss):
+        """Measure once and record the checkpoint in every branch in `targets`."""
+        if not targets:
+            return
+        first = targets[0]
+        rows, entry = measure(args, ctx, model, step, step * args.total_batch_size, meta[first.steps],
+                              run_dirs[first.steps], state["counts"])
+        entry["train_loss"] = train_loss
+        for b in targets:
+            b.curve.append(dict(entry))
+            if b is not first:
+                os.link(run_dirs[first.steps] / f"ckpt_{step:06d}.npz", run_dirs[b.steps] / f"ckpt_{step:06d}.npz")
+            append_rows(run_dirs[b.steps] / "metrics.jsonl",
+                        [{**r, "run": meta[b.steps]["run"], "ft_steps": b.steps} for r in rows])
+        print0(f"{name} step {step} ({', '.join(str(b.steps) for b in targets)}): learning {entry['learning']:.4f} "
+               f"forgetting {entry['forgetting']:.4f} F_route {entry['F_route']:.4f}")
+        model.train()
+
+    def finish(b, status):
+        b.status, b.steps_completed = status, state["step"] if status == "completed" else state["step"] - 1
+        b.done = True
+        run_dir = run_dirs[b.steps]
+        rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()] \
+            if (run_dir / "metrics.jsonl").exists() else []
+        if rows:
+            pq.write_table(pa.Table.from_pylist(rows), run_dir / "metrics.parquet")
+        final = b.curve[-1] if b.curve else {}
+        write_json_atomic(run_dir / "result.json", {
+            "status": status, **meta[b.steps], "steps": b.steps, "steps_completed": b.steps_completed,
+            "warmup_steps": ctx["warmup"], "decay_steps": b.decay,
+            "final_learning": final.get("learning"), "final_forgetting": final.get("forgetting"),
+            "curve": b.curve, "data_fingerprint": int(state["fingerprint"]), "wall_time_s": time.time() - t0,
+            "cumulative_expert_counts": state["counts"].cpu().tolist(),
+        })
+
+    def trunk_checkpoint(step, train_loss):
+        # trunk steps up to a branch's branch point are shared with that branch
+        measure_for([b for b in branches if step in b.ckpts and (b is trunk or step <= b.branch_point)],
+                    step, train_loss)
+
+    def branch_checkpoint_for(b):
+        return lambda step, train_loss: measure_for([b] if step in b.ckpts else [], step, train_loss)
+
+    position = 0
+    for b in branches[:-1]:
+        if not train_steps(args, ctx, optimizer, loader, state, position + 1, b.branch_point, trunk, trunk_checkpoint):
+            for rest in branches:
+                if not rest.done:
+                    finish(rest, "diverged")
+            return
+        position = b.branch_point
+        snapshot = {"model": {k: v.detach().clone() for k, v in model.state_dict().items()},
+                    "optimizer": copy.deepcopy(optimizer.state_dict()),
+                    "counts": state["counts"].clone(), "fingerprint": state["fingerprint"].clone()}
+        loader.record()
+        ok = train_steps(args, ctx, optimizer, loader, state, position + 1, b.steps, b, branch_checkpoint_for(b))
+        finish(b, "completed" if ok else "diverged")
+        loader.rewind()
+        with torch.no_grad():
+            for key, tensor in model.state_dict().items():
+                tensor.copy_(snapshot["model"][key])
+        optimizer.load_state_dict(snapshot["optimizer"])
         model.zero_grad(set_to_none=True)
-        train_loss = float(loss_sum) / accum
-        if not math.isfinite(train_loss):
-            status = "diverged"
-            print0(f"{run_dir.name}: training loss {train_loss} at step {step}; stopping")
-            break
-        if step in ckpt_steps:
-            rows, entry = measure(args, ctx, model, step, step * args.total_batch_size, meta, run_dir, cumulative_counts)
-            entry["train_loss"] = train_loss
-            curve.append(entry)
-            append_rows(run_dir / "metrics.jsonl", rows)
-            print0(f"{run_dir.name} step {step}/{steps}: learning {entry['learning']:.4f} "
-                   f"forgetting {entry['forgetting']:.4f} F_route {entry['F_route']:.4f}")
-            model.train()
-    rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()] \
-        if (run_dir / "metrics.jsonl").exists() else []
-    if rows:
-        pq.write_table(pa.Table.from_pylist(rows), run_dir / "metrics.parquet")
-    final = curve[-1] if curve else {}
-    write_json_atomic(run_dir / "result.json", {
-        "status": status, **meta, "steps": steps, "steps_completed": step if status == "completed" else step - 1,
-        "final_learning": final.get("learning"), "final_forgetting": final.get("forgetting"),
-        "curve": curve, "data_fingerprint": int(fingerprint), "wall_time_s": time.time() - t0,
-        "cumulative_expert_counts": cumulative_counts.cpu().tolist(),
-    })
+        state.update(step=position, counts=snapshot["counts"], fingerprint=snapshot["fingerprint"])
+        del snapshot
+    ok = train_steps(args, ctx, optimizer, loader, state, position + 1, trunk.steps, trunk, trunk_checkpoint)
+    finish(trunk, "completed" if ok else "diverged")
 
 
 def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
@@ -327,15 +445,20 @@ def main(argv=None):
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--non-matrix-lr-scale", type=float, default=0.1,
                         help="embedding and lm_head AdamW LRs = pretraining defaults x this, identical in every cell")
-    parser.add_argument("--n-checkpoints", type=int, default=10)
+    parser.add_argument("--checkpoint-spacing", choices=("log", "linear"), default="log",
+                        help="log: 2, 4, 8, ... in the constant phase, its end, mid-decay, last step")
+    parser.add_argument("--n-checkpoints", type=int, default=10, help="with --checkpoint-spacing linear")
+    parser.add_argument("--branch-tokens", type=int, nargs="*", default=[],
+                        help="further fine-tuning lengths run as decay branches of one trunk (see above)")
     parser.add_argument("--balancer-mode", choices=("active", "frozen"), default="active",
                         help="frozen: balance coefficient 0 (aux) or no bias updates (bias)")
     parser.add_argument("--out-root", default=None, help="default: <base_dir>/finetune")
     parser.add_argument("--device-type", default="")
     args = parser.parse_args(argv)
     lrs = parse_lrs(args.lrs)
-    if args.train_tokens % args.total_batch_size:
-        parser.error("--train-tokens must be a multiple of --total-batch-size")
+    for tokens in (args.train_tokens, *args.branch_tokens):
+        if tokens % args.total_batch_size:
+            parser.error("--train-tokens and --branch-tokens must be multiples of --total-batch-size")
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _, _, _, _, device = compute_init(device_type, seed=0)
@@ -404,6 +527,11 @@ def main(argv=None):
                           "user_config": base_meta["user_config"], "git": git_state()},
         "ft_train_files": {Path(f).name: file_sha256(f) for f in ft_files[:-1]},
         "eval_identity": eval_identity, "d0": d0, "d1": d1, "base_d0": base_d0, "base_d1": base_d1,
+        "main_steps": args.train_tokens // args.total_batch_size,
+        "branch_steps": [t // args.total_batch_size for t in args.branch_tokens],
+        # warmup is fixed in steps by the main length, so every branch length shares it
+        "warmup": math.ceil(args.warmup_ratio * (args.train_tokens // args.total_batch_size)),
+        "accum": args.total_batch_size // (args.device_batch_size * seq_len),
     }
     for optimizer_name, grid in lrs.items():
         for lr in grid:

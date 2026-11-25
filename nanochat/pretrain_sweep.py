@@ -342,12 +342,13 @@ def finetune_lr_grid(selection, fractions=FINETUNE_LR_FRACTIONS):
 
 
 def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optimizer, lrs, time_limit, repo_dir,
-                        seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings()):
+                        seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings(), extra_args=()):
     """One process runs every (LR, seed) cell of one base model, dataset and fine-tuning optimizer."""
     if not RUN_NAME_PATTERN.match(base_run):
         raise ValueError(f"invalid run name {base_run!r}")
     args = ["--base-run", base_run, "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
-            "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds)]
+            "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds),
+            *map(str, extra_args)]
     lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [
         'PYTHON="${NANOCHAT_PYTHON:-.venv/bin/python}"',
         'export NANOCHAT_BASE_DIR="$SCRATCH"',

@@ -281,6 +281,14 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert call[:2] == ["-m", "scripts.finetune"] and call[call.index("--ft-name") + 1] == "wikitext103"
     assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
     assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]
+    # Length pilot: branch lengths, output root and job prefix are passed through
+    finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s42",
+                        "--dataset", "starcoderdata=/data/sc", "--d0-file", "/data/d0.parquet",
+                        "--out", str(tmp_path / "pilot"), "--repo-dir", str(tmp_path), "--seeds", "1", "2", "3",
+                        "--branch-tokens", "3932160", "62914560", "--out-root", "/scratch/finetune_pilot",
+                        "--job-prefix", "ftpilot"])
+    pilot = (tmp_path / "pilot" / "ftpilot-e8-main-adamw-s42-starcoderdata-muon.sbatch").read_text()
+    assert "--seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root /scratch/finetune_pilot" in pilot
 
 
 def test_transfer_check_runs_are_3b_runs_at_half_and_double_without_checkpoints():

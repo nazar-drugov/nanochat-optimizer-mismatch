@@ -152,7 +152,9 @@ Optional later gains: device batch 64 (if memory allows), fusing dispatch copies
   removed). Whether to use more languages is open.
 - Fine-tuning defaults (spec recommendations, `scripts/finetune.py`): 15.7M tokens at 65,536 per step, 3%
   warmup, 20% decay, weight decay 0, embedding/lm_head LR = 0.1× pretraining values in every cell, LR grid
-  1/16…1 × the selected pretraining LR of the fine-tuning optimizer, 5 seeds, 10 checkpoints, balancer active
+  1/16…1 × the selected pretraining LR of the fine-tuning optimizer, 5 seeds, balancer active.
+  **Decided 2026-11-25** (see PRETRAINING_PROTOCOL.md, "Fine-tuning: LR selection, checkpoints and length
+  pilot"): LR by lowest final D1 loss; log-spaced checkpoints; a length pilot (decay branches) first
   (`--balancer-mode frozen` for the control arm). ℓ0 not chosen.
 - Fine-tuning stores per-document loss sums (not per-token arrays) for the bootstrap.
 
