@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 
 from nanochat.pretrain_sweep import (
-    CHECKPOINT_EVERY, FULL_TOKENS, SWEEP_TOKENS, TOTAL_BATCH_SIZE, RunSpec, SlurmSettings, main_runs, num_steps,
-    parabola_vertex, render_job, select_lr, sweep_points, sweep_runs, transfer_factor, warmup_steps,
+    CHECKPOINT_EVERY, FULL_TOKENS, SWEEP_TOKENS, TOTAL_BATCH_SIZE, RunSpec, SlurmSettings, check_transfer, main_runs, num_steps,
+    parabola_vertex, render_job, select_lr, sweep_points, sweep_runs, transfer_check_runs, transfer_factor,
+    warmup_steps,
 )
 from scripts import pretrain_sweep as cli
 
@@ -280,3 +281,48 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert call[:2] == ["-m", "scripts.finetune"] and call[call.index("--ft-name") + 1] == "wikitext103"
     assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
     assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]
+
+
+def test_transfer_check_runs_are_3b_runs_at_half_and_double_without_checkpoints():
+    full = {"adamw": 6.5e-4, "muon": 8.9e-4}
+    runs = transfer_check_runs(full)
+    assert [(r.optimizer, r.lr) for r in runs] == [("adamw", 3.25e-4), ("adamw", 1.3e-3), ("muon", 4.45e-4), ("muon", 1.78e-3)]
+    main = main_runs(full)[0]
+    for run in runs:
+        args = run.base_train_args()
+        assert run.name.startswith(f"e8-xfer-{run.optimizer}-lr") and run.name.endswith("-s42")
+        assert "--save-every=-1" in args and f"--train-tokens={FULL_TOKENS}" in args
+        # Everything but the LR and checkpointing matches the main run of the same optimizer
+        same = [a for a in args if not a.startswith(("--adamw-matrix-lr", "--muon-matrix-lr", "--save-every", "--optimizer-name"))]
+        assert same == [a for a in main.base_train_args() if not a.startswith(("--adamw-matrix-lr", "--muon-matrix-lr", "--save-every", "--optimizer-name"))]
+    assert f"--save-every={CHECKPOINT_EVERY}" in main.base_train_args()
+
+
+def test_check_transfer_reports_the_vertex_and_the_implied_exponent():
+    sweep_lr, transferred = 1.2e-3, 1.2e-3 * transfer_factor()
+    # The 3B optimum is at half the sweep optimum: exponent log(0.5)/log(6) = -0.387
+    true_opt = sweep_lr / 2
+    points = [(transferred * f, quadratic(transferred * f, best_lr=true_opt)) for f in (0.5, 1.0, 2.0)]
+    r = check_transfer(points, transferred, sweep_lr)
+    assert r["status"] == "interior" and r["vertex_lr"] == pytest.approx(true_opt, rel=1e-9)
+    assert r["implied_exponent"] == pytest.approx(math.log(0.5) / math.log(FULL_TOKENS / SWEEP_TOKENS), rel=1e-9)
+    assert r["vertex_octaves_from_transferred"] == pytest.approx(math.log2(true_opt / transferred), rel=1e-9)
+    # Optimum below the checked range: reported as an edge, no vertex
+    edge = [(transferred * f, quadratic(transferred * f, best_lr=transferred / 8)) for f in (0.5, 1.0, 2.0)]
+    assert check_transfer(edge, transferred, sweep_lr)["status"] == "edge"
+
+
+def test_command_line_transfer_jobs_and_check(tmp_path):
+    out, root = tmp_path / "jobs", tmp_path / "checkpoints"
+    selection = {o: {"status": "selected", "sweep_lr": lr, "full_lr": lr * transfer_factor()}
+                 for o, lr in (("adamw", 1.2e-3), ("muon", 1.6e-3))}
+    (tmp_path / "sel.json").write_text(json.dumps(selection))
+    assert cli.main(["jobs", "--stage", "transfer", "--selection", str(tmp_path / "sel.json"), "--out", str(out)]) in (0, None)
+    assert len(list(out.glob("e8-xfer-*.sbatch"))) == 4
+    full = {o: selection[o]["full_lr"] for o in selection}
+    for run in transfer_check_runs(full) + main_runs(full):
+        write_result(root, run, quadratic(run.lr, best_lr=full[run.optimizer] * 0.8))
+    assert cli.main(["transfer-check", "--selection", str(tmp_path / "sel.json"), "--out", str(out),
+                     "--checkpoints-root", str(root)]) == 0
+    report = json.loads((out / "transfer_check.json").read_text())
+    assert report["muon"]["vertex_lr"] == pytest.approx(full["muon"] * 0.8, rel=1e-9)

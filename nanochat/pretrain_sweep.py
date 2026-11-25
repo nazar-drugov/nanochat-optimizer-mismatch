@@ -12,6 +12,9 @@ Selection: lowest final validation bpb (the held-out validation shard, minus D0'
 documents); the LR is the vertex of the parabola through the best point and its two
 neighbours in log2(LR), then multiplied by (3B / 0.5B)^-0.32 for the 3B-token runs.
 If the best point is at the edge of the grid, the sweep is extended by one point (x2).
+Transfer check (2026-11-25): 3B-token runs at x0.5 and x2 the transferred LR (the main
+run of the same seed is x1); the parabola vertex through the three shows how far the
+transferred LR is from the 3B optimum.
 """
 
 import json
@@ -35,6 +38,7 @@ HELDOUT_EVAL_TOKENS = 1_048_576       # D0 tokens per evaluation (logged only)
 EVAL_EVERY = 500
 CHECKPOINT_EVERY = 1526               # 400M tokens: checkpoints at 0.8B and 1.6B, where 1B/2B decay branches would start
 SWEEP_LRS = {"adamw": (1e-3, 2e-3, 4e-3), "muon": (2e-3, 4e-3, 8e-3)}
+TRANSFER_CHECK_FACTORS = (0.5, 2.0)   # x the transferred 3B LR; x1 is the main run
 OPTIMIZERS = ("adamw", "muon")
 LR_FLAG = {"adamw": "--adamw-matrix-lr", "muon": "--muon-matrix-lr"}
 RUN_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")  # what runs/pretrain_study.sh accepts
@@ -63,7 +67,7 @@ def format_lr(lr):
 
 @dataclass(frozen=True)
 class RunSpec:
-    stage: str            # "sweep" or "main"
+    stage: str            # "sweep" (0.5B), "main" (3B base model) or "xfer" (3B transfer check)
     optimizer: str
     lr: float
     seed: int = DEFAULT_SEED
@@ -74,8 +78,12 @@ class RunSpec:
         return SWEEP_TOKENS if self.stage == "sweep" else FULL_TOKENS
 
     @property
+    def keeps_checkpoints(self):
+        return self.stage == "main"  # the others need only their final evaluation
+
+    @property
     def name(self):
-        lr = f"-lr{format_lr(self.lr)}" if self.stage == "sweep" else ""
+        lr = "" if self.stage == "main" else f"-lr{format_lr(self.lr)}"
         return f"e{self.n_experts}-{self.stage}-{self.optimizer}{lr}-s{self.seed}"
 
     def base_train_args(self):
@@ -91,7 +99,7 @@ class RunSpec:
             f"--eval-every={EVAL_EVERY}", f"--eval-tokens={VAL_EVAL_TOKENS}",
             f"--heldout-eval-tokens={HELDOUT_EVAL_TOKENS}",
             "--core-metric-every=-1", "--sample-every=-1",
-            f"--save-every={-1 if self.stage == 'sweep' else CHECKPOINT_EVERY}",
+            f"--save-every={CHECKPOINT_EVERY if self.keeps_checkpoints else -1}",
         ]
 
 
@@ -103,6 +111,11 @@ def sweep_runs(seed=DEFAULT_SEED, lrs=None):
 def main_runs(full_lrs, seeds=(DEFAULT_SEED,)):
     """3B-token E = 8 base models at the selected (transferred) LR of each optimizer."""
     return [RunSpec("main", optimizer, full_lrs[optimizer], seed) for seed in seeds for optimizer in OPTIMIZERS]
+
+
+def transfer_check_runs(full_lrs, seed=DEFAULT_SEED, factors=TRANSFER_CHECK_FACTORS):
+    """3B-token runs at `factors` x each optimizer's transferred LR (the main run is x1)."""
+    return [RunSpec("xfer", optimizer, full_lrs[optimizer] * f, seed) for optimizer in OPTIMIZERS for f in factors]
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +183,35 @@ def select_lr(points):
         sweep_lr, method = 2 ** parabola_vertex(xs, ys), "parabola vertex in log2(LR) through the best point and its neighbours"
     return {**out, "status": "selected", "method": method, "sweep_lr": sweep_lr,
             "transfer_factor": transfer_factor(), "full_lr": sweep_lr * transfer_factor()}
+
+
+def check_transfer(points, transferred_lr, sweep_lr, from_tokens=SWEEP_TOKENS, to_tokens=FULL_TOKENS):
+    """Compare the transferred LR with the 3B optimum from the transfer-check points
+    [(lr, bpb or None)] (x0.5, x1, x2 the transferred LR).
+
+    Returns the best point, the parabola vertex in log2(LR) when the best point is
+    interior (with its offset from the transferred LR in octaves), and the exponent that
+    the vertex implies for LR* ∝ T^beta between the sweep and the full run.
+    """
+    points = sorted(points)
+    finite = [(lr, bpb) for lr, bpb in points if bpb is not None and math.isfinite(bpb)]
+    if not finite:
+        raise ValueError("every transfer-check run diverged")
+    best_lr, best_bpb = min(finite, key=lambda p: p[1])
+    out = {"points": [{"lr": lr, "final_val_bpb": bpb} for lr, bpb in points],
+           "transferred_lr": transferred_lr, "best_lr": best_lr, "best_bpb": best_bpb,
+           "assumed_exponent": TRANSFER_EXPONENT}
+    i = [lr for lr, _ in points].index(best_lr)
+    if 0 < i < len(points) - 1 and all(points[j][1] is not None for j in (i - 1, i + 1)):
+        xs = [math.log2(points[j][0]) for j in (i - 1, i, i + 1)]
+        ys = [points[j][1] for j in (i - 1, i, i + 1)]
+        vertex = 2 ** parabola_vertex(xs, ys)
+        out.update(status="interior", vertex_lr=vertex,
+                   vertex_octaves_from_transferred=math.log2(vertex / transferred_lr),
+                   implied_exponent=math.log(vertex / sweep_lr) / math.log(to_tokens / from_tokens))
+    else:
+        out["status"] = "edge"  # the 3B optimum lies beyond the checked range
+    return out
 
 
 # ---------------------------------------------------------------------------
