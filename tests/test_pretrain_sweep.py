@@ -326,3 +326,31 @@ def test_command_line_transfer_jobs_and_check(tmp_path):
                      "--checkpoints-root", str(root)]) == 0
     report = json.loads((out / "transfer_check.json").read_text())
     assert report["muon"]["vertex_lr"] == pytest.approx(full["muon"] * 0.8, rel=1e-9)
+
+
+def test_transfer_check_extends_past_an_edge_with_extra_factors(tmp_path):
+    out, root = tmp_path / "jobs", tmp_path / "checkpoints"
+    selection = {o: {"status": "selected", "sweep_lr": lr, "full_lr": lr * transfer_factor()}
+                 for o, lr in (("adamw", 1.2e-3), ("muon", 1.6e-3))}
+    (tmp_path / "sel.json").write_text(json.dumps(selection))
+    full = {o: selection[o]["full_lr"] for o in selection}
+    # AdamW's 3B optimum is 2.8x the transferred LR: x0.5..x2 only sees the edge.
+    best = {"adamw": full["adamw"] * 2.8, "muon": full["muon"]}
+    for run in transfer_check_runs(full) + main_runs(full):
+        write_result(root, run, quadratic(run.lr, best_lr=best[run.optimizer]))
+    args = ["--selection", str(tmp_path / "sel.json"), "--out", str(out)]
+    assert cli.main(["transfer-check", *args, "--checkpoints-root", str(root)]) == 0
+    assert json.loads((out / "transfer_check.json").read_text())["adamw"]["status"] == "edge"
+
+    assert cli.main(["jobs", "--stage", "transfer", *args, "--extra-factor", "adamw=4", "adamw=8"]) in (0, None)
+    extended = transfer_check_runs(full, factors={"adamw": (0.5, 2.0, 4.0, 8.0), "muon": (0.5, 2.0)})
+    assert {p.name for p in out.glob("e8-xfer-*.sbatch")} == {f"{r.name}.sbatch" for r in extended}
+    for run in extended:
+        write_result(root, run, quadratic(run.lr, best_lr=best[run.optimizer]))
+    assert cli.main(["transfer-check", *args, "--checkpoints-root", str(root),
+                     "--extra-factor", "adamw=4", "adamw=8"]) == 0
+    report = json.loads((out / "transfer_check.json").read_text())
+    assert report["adamw"]["status"] == "interior"
+    assert report["adamw"]["vertex_lr"] == pytest.approx(best["adamw"], rel=1e-9)
+    with pytest.raises(SystemExit):
+        cli.main(["jobs", "--stage", "transfer", *args, "--extra-factor", "sgd=4"])

@@ -114,8 +114,12 @@ def main_runs(full_lrs, seeds=(DEFAULT_SEED,)):
 
 
 def transfer_check_runs(full_lrs, seed=DEFAULT_SEED, factors=TRANSFER_CHECK_FACTORS):
-    """3B-token runs at `factors` x each optimizer's transferred LR (the main run is x1)."""
-    return [RunSpec("xfer", optimizer, full_lrs[optimizer] * f, seed) for optimizer in OPTIMIZERS for f in factors]
+    """3B-token runs at `factors` x each optimizer's transferred LR (the main run is x1).
+    `factors` is one tuple for every optimizer or {optimizer: tuple} (e.g. to extend the
+    check past an edge for one optimizer)."""
+    per_optimizer = factors if isinstance(factors, dict) else {o: factors for o in OPTIMIZERS}
+    return [RunSpec("xfer", optimizer, full_lrs[optimizer] * f, seed)
+            for optimizer in OPTIMIZERS for f in per_optimizer[optimizer]]
 
 
 # ---------------------------------------------------------------------------

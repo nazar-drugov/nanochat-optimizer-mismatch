@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from nanochat.pretrain_sweep import (
-    OPTIMIZERS, SWEEP_LRS, RunSpec, SlurmSettings, check_transfer, transfer_check_runs, main_runs, render_job, select_lr, sweep_points, sweep_runs,
+    OPTIMIZERS, SWEEP_LRS, TRANSFER_CHECK_FACTORS, RunSpec, SlurmSettings, check_transfer, transfer_check_runs, main_runs, render_job, select_lr, sweep_points, sweep_runs,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +49,17 @@ def parse_extra_lrs(values):
     return {optimizer: tuple(sorted(set(SWEEP_LRS[optimizer]) | set(extra[optimizer]))) for optimizer in OPTIMIZERS}
 
 
+def parse_extra_factors(values):
+    """--extra-factor adamw=4 adamw=8 -> {"adamw": (0.5, 2.0, 4.0, 8.0), "muon": (0.5, 2.0)}"""
+    extra = {optimizer: [] for optimizer in OPTIMIZERS}
+    for value in values or []:
+        optimizer, _, factor = value.partition("=")
+        if optimizer not in OPTIMIZERS or not factor:
+            raise SystemExit(f"--extra-factor expects optimizer=factor with optimizer in {OPTIMIZERS}, got {value!r}")
+        extra[optimizer].append(float(factor))
+    return {o: tuple(sorted(set(TRANSFER_CHECK_FACTORS) | set(extra[o]))) for o in OPTIMIZERS}
+
+
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
@@ -70,7 +81,7 @@ def cmd_jobs(args):
         if args.stage == "main":
             runs = main_runs(full_lrs, seeds=args.seeds)
         else:
-            runs = transfer_check_runs(full_lrs, seed=args.seed)
+            runs = transfer_check_runs(full_lrs, seed=args.seed, factors=parse_extra_factors(args.extra_factor))
         for run in runs:
             write(out / f"{run.name}.sbatch", render_job(run.name, [run], MAIN_TIME_LIMIT, args.repo_dir, args.scratch_base, slurm))
 
@@ -88,7 +99,7 @@ def load_selection(path, stage):
 def cmd_transfer_check(args):
     selection = load_selection(args.selection, "transfer")
     full_lrs = {o: selection[o]["full_lr"] for o in OPTIMIZERS}
-    runs = transfer_check_runs(full_lrs, seed=args.seed) + [RunSpec("main", o, full_lrs[o], args.seed) for o in OPTIMIZERS]
+    runs = transfer_check_runs(full_lrs, seed=args.seed, factors=parse_extra_factors(args.extra_factor)) + [RunSpec("main", o, full_lrs[o], args.seed) for o in OPTIMIZERS]
     root = Path(args.checkpoints_root or Path(default_scratch_base()) / "base_checkpoints")
     points = sweep_points(runs, root)
     report = {o: check_transfer(points[o], full_lrs[o], selection[o]["sweep_lr"]) for o in OPTIMIZERS}
@@ -100,7 +111,9 @@ def cmd_transfer_check(args):
             print(f"  -> 3B optimum {r['vertex_lr']:.4g}, {r['vertex_octaves_from_transferred']:+.2f} octaves from the "
                   f"transferred {r['transferred_lr']:.4g}; implied exponent {r['implied_exponent']:+.2f} (assumed {r['assumed_exponent']})")
         else:
-            print(f"  -> best point {r['best_lr']:.4g} is at the edge: the 3B optimum lies outside x0.5..x2")
+            edge = "x2" if r["best_lr"] > r["transferred_lr"] else "x0.5"
+            print(f"  -> best point {r['best_lr']:.4g} is at the edge: the 3B optimum lies beyond it; "
+                  f"extend with --extra-factor {optimizer}=<factor beyond {edge}>")
     write(Path(args.out) / "transfer_check.json", json.dumps(report, indent=2))
     return 0
 
@@ -136,6 +149,9 @@ def main(argv=None):
     transfer.add_argument("--checkpoints-root", help="default: $NANOCHAT_SCRATCH_BASE/base_checkpoints")
     transfer.add_argument("--out", default="jobs", help="directory for transfer_check.json")
     transfer.add_argument("--seed", type=int, default=42, help="seed of the transfer-check and main runs")
+    for p in (jobs, transfer):
+        p.add_argument("--extra-factor", nargs="*", default=[],
+                       help="extra transfer-check points as multiples of the transferred LR, e.g. adamw=4 adamw=8")
     for p in (jobs, select):
         p.add_argument("--out", default="jobs", help="directory for job scripts and lr_selection.json")
         p.add_argument("--seed", type=int, default=42, help="seed of the sweep runs")
