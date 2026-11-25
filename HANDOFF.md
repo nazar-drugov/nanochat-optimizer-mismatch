@@ -73,9 +73,10 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
 
 ## 4. Fine-tuning protocol (decided 2026-11-25; protocol section "Fine-tuning: LR selection, checkpoints and length pilot")
 
-- Datasets: near = WikiText-103 (detokenized articles; D1 = official validation + test + 146 training
-  articles sampled with seed 0 and removed from training: 268 articles, 1,100,545 tokens, shuffled;
-  training 29,298 articles, ~112M tokens); far = **StarCoderData, Python only**
+- Datasets: near = WikiText-103 (detokenized articles; D1 = official validation + test + 510 training
+  articles sampled with seed 0 and removed from training until the best-fit evaluation fills 512 rows:
+  632 articles, 2.5M tokens, shuffled, of which the evaluation scores 1,048,461 tokens from 627;
+  training 28,934 articles, 110.6M tokens); far = **StarCoderData, Python only**
   (train = first file, 218,079 documents, ~490M GPT-2 tokens; D1 = 20,000 documents sampled with
   seed 0 from the last file, ~43M tokens, first 1,048,576 scored). Built by
   `scripts/make_finetune_data.py --dataset starcoderdata` (gated; needs an HF token with the terms
