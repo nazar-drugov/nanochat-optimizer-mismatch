@@ -2,7 +2,7 @@
 Write the fine-tuning Slurm jobs: one per (base model, dataset, fine-tuning optimizer),
 each running a 5-point LR grid x 5 seeds through scripts/finetune.py on one B200.
 
-  python -m scripts.finetune_jobs --selection jobs/lr_selection.json \
+  python -m scripts.finetune_jobs --selection results/e8/lr_selection_3b.json \
       --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
       --dataset wikitext103=<scratch>/finetune_data/wikitext103 --dataset starcoderdata=<scratch>/finetune_data/starcoderdata \
       --d0-file <scratch>/heldout/fineweb-edu-100b/d0.parquet --out jobs/
@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--selection", required=True, help="pretraining lr_selection.json (scripts/pretrain_sweep.py)")
+    parser.add_argument("--selection", required=True, help="3B pretraining LR selection, results/e8/lr_selection_3b.json")
     parser.add_argument("--base-runs", nargs="+", required=True)
     parser.add_argument("--dataset", action="append", required=True, help="name=directory (repeatable)")
     parser.add_argument("--d0-file", required=True)

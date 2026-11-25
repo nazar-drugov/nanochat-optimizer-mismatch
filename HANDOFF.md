@@ -136,13 +136,13 @@ To run the two matched pairs on Nazar's account, generate the jobs and submit on
   --job-prefix ftpilot --out <jobs dir>
 ```
 
-Then add `--base-checkpoints-dir /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints`
-to the `scripts.finetune` line of each script (`finetune_jobs` has no flag for it yet), or copy the two
-base checkpoints. Check `--exclude` for your account's bad nodes (ours: node5800-c1, node5702-c1).
-Job scripts generated from commit bd74937 on set `PYTHONUNBUFFERED=1`, so progress lines reach the Slurm log
-live (hgo's two running jobs predate it: their logs fill only at the end; results stream to scratch).
-The analysis must read both output roots (hgo's for the mismatched pairs, Nazar's for the matched).
-The WikiText pilot (all four pairs) is not assigned yet.
+The generated jobs now pass the shared `--base-checkpoints-dir` and `--base-step 11445` explicitly.
+`scripts.finetune` uses the same defaults and checks the seed-42 checkpoint metadata and SHA-256
+before loading either model. Check `--exclude` for your account's bad nodes (ours:
+node5800-c1, node5702-c1). Jobs generated from the new commit set `PYTHONUNBUFFERED=1`, so
+progress lines reach Slurm logs live; hgo's two running jobs predate that change. The analysis
+must read both output roots (hgo's for mismatched pairs, Nazar's for matched pairs). The WikiText
+pilot (all four pairs) is not assigned yet.
 
 ## 6. Next steps (in order)
 
@@ -162,9 +162,14 @@ The WikiText pilot (all four pairs) is not assigned yet.
 5. Main grid: `scripts.finetune_jobs --selection results/e8/lr_selection_3b.json --base-runs e8-main-{adamw,muon}-s{42,43,44} ...`
    at the length the pilot picks. Pilot cells at that length can be reused for seeds 1–3 of the
    seed-42 bases if the length is one of the pilot lengths (same warmup, same data order).
-6. Build the analysis script: forgetting at matched learning ℓ0 (interpolated between checkpoints),
-   mismatch penalty, routing share (F_route / forgetting), paired document bootstrap over seeds. ℓ0 is
-   not chosen yet. Per-document sums are stored in `ckpt_<step>.npz` for the bootstrap.
+6. Run `scripts/analyze_finetune.py` after the LR grid completes. It validates every seed/LR cell,
+   selects LR by mean final D1 loss, plots learning/forgetting and router diagnostics, and computes
+   forgetting at matched learning ℓ0 with a paired seed/document bootstrap. Invoke it first without
+   `--ell0` to inspect the common D1-learning range; ℓ0 must be chosen and frozen before the main
+   comparison. Per-document sums in `ckpt_<step>.npz` support the bootstrap. The script reads
+   `metrics.jsonl` for per-layer router fields because the current Parquet writer omits those fields.
+   Pass `--root` twice for the split pilot: once for hgo's mismatched-pair output root and once for
+   Nazar's matched-pair output root; the analyzer validates that they use the same data and seeds.
 7. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
    at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
 

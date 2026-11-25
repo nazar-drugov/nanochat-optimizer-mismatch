@@ -332,6 +332,14 @@ def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=Sl
 # Fine-tuning jobs (scripts/finetune.py)
 
 FINETUNE_SEEDS = (1, 2, 3, 4, 5)
+FINETUNE_BASE_CHECKPOINTS_DIR = Path(
+    "/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints"
+)
+FINETUNE_BASE_STEP = 11445
+FINETUNE_BASE_CHECKPOINTS = {
+    "e8-main-adamw-s42": ("adamw", "de13193a8de30cb460a891b97bf67d195b97d611fc53d26b37b523507fcbd8d2"),
+    "e8-main-muon-s42": ("muon", "2eff018763ccde5fd70b3a60df18a3e0a812f4b126ec0860fac8cf0be286c926"),
+}
 # Fine-tuning LR grid per fine-tuning optimizer: fractions of that optimizer's selected
 # 3B-token pretraining LR, spaced x2 (EXPERIMENT_SPEC.md §6: 5-point grid per cell).
 FINETUNE_LR_FRACTIONS = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
@@ -344,9 +352,11 @@ def finetune_lr_grid(selection, fractions=FINETUNE_LR_FRACTIONS):
 def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optimizer, lrs, time_limit, repo_dir,
                         seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings(), extra_args=()):
     """One process runs every (LR, seed) cell of one base model, dataset and fine-tuning optimizer."""
-    if not RUN_NAME_PATTERN.match(base_run):
-        raise ValueError(f"invalid run name {base_run!r}")
-    args = ["--base-run", base_run, "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
+    if not RUN_NAME_PATTERN.match(base_run) or base_run not in FINETUNE_BASE_CHECKPOINTS:
+        raise ValueError(f"fine-tuning base run must be a pinned seed-42 checkpoint: {base_run!r}")
+    args = ["--base-run", base_run, "--base-checkpoints-dir", str(FINETUNE_BASE_CHECKPOINTS_DIR),
+            "--base-step", str(FINETUNE_BASE_STEP),
+            "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
             "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds),
             *map(str, extra_args)]
     lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [

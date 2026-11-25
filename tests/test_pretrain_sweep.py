@@ -262,10 +262,16 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     selection = {"adamw": {"full_lr": 1e-3}, "muon": {"full_lr": 2e-3}}
     (tmp_path / "sel.json").write_text(json.dumps(selection))
     finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s42",
-                        "--dataset", "wikitext103=/data/wt", "--dataset", "starcoderdata=/data/sc",
+                        "e8-main-muon-s42", "--dataset", "wikitext103=/data/wt", "--dataset", "starcoderdata=/data/sc",
                         "--d0-file", "/data/d0.parquet", "--out", str(tmp_path / "jobs"), "--repo-dir", str(tmp_path)])
     jobs = sorted(p.name for p in (tmp_path / "jobs").glob("*.sbatch"))
-    assert len(jobs) == 4 and "ft-e8-main-adamw-s42-starcoderdata-muon.sbatch" in jobs
+    assert len(jobs) == 8 and "ft-e8-main-adamw-s42-starcoderdata-muon.sbatch" in jobs
+    assert "ft-e8-main-muon-s42-starcoderdata-adamw.sbatch" in jobs
+    from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP
+    for job in jobs:
+        script_text = (tmp_path / "jobs" / job).read_text()
+        assert f"--base-checkpoints-dir {FINETUNE_BASE_CHECKPOINTS_DIR}" in script_text
+        assert f"--base-step {FINETUNE_BASE_STEP}" in script_text
     grid = finetune_lr_grid(selection)
     assert grid["muon"] == [2e-3 * f for f in FINETUNE_LR_FRACTIONS]
     # Run one job against a fake python that records its arguments
@@ -279,6 +285,9 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60).returncode == 0
     call = (tmp_path / "call.log").read_text().split()
     assert call[:2] == ["-m", "scripts.finetune"] and call[call.index("--ft-name") + 1] == "wikitext103"
+    assert call[call.index("--base-run") + 1] == "e8-main-adamw-s42"
+    assert call[call.index("--base-checkpoints-dir") + 1] == str(FINETUNE_BASE_CHECKPOINTS_DIR)
+    assert call[call.index("--base-step") + 1] == str(FINETUNE_BASE_STEP)
     assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
     assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]
     # Length pilot: branch lengths, output root and job prefix are passed through

@@ -172,6 +172,7 @@ def tiny_setup(tmp_path_factory):
 def run_finetune(setup, *extra):
     from scripts import finetune
     finetune.main(["--base-run", "tiny-base", "--base-checkpoints-dir", str(setup["root"] / "base_checkpoints"),
+                   "--base-step", "10",
                    "--ft-data-dir", str(setup["ft"]), "--ft-name", "tiny", "--d0-file", str(setup["d0"]),
                    "--out-root", str(setup["root"] / "out"), "--device-type", "cpu",
                    "--eval-tokens", "512", "--eval-batch-size", "4", "--train-tokens", "1024",
@@ -276,6 +277,7 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
         from scripts import finetune
         out = tiny_setup["root"] / f"separate_{tokens}"
         finetune.main(["--base-run", "tiny-base", "--base-checkpoints-dir", str(tiny_setup["root"] / "base_checkpoints"),
+                           "--base-step", "10",
                        "--ft-data-dir", str(tiny_setup["ft"]), "--ft-name", "tiny", "--d0-file", str(tiny_setup["d0"]),
                        "--out-root", str(out), "--device-type", "cpu", "--eval-tokens", "512",
                        "--eval-batch-size", "4", "--train-tokens", str(tokens), "--total-batch-size", "128",

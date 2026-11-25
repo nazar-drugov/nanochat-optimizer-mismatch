@@ -48,11 +48,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from nanochat.checkpoint_manager import build_model, find_last_step
+from nanochat.checkpoint_manager import build_model
 from nanochat.common import COMPUTE_DTYPE, autodetect_device_type, compute_init, get_base_dir, print0
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.dataset import list_parquet_files
 from nanochat.eval_set import EvalSet, build_eval_set, per_doc_sums
+from nanochat.pretrain_sweep import (
+    FINETUNE_BASE_CHECKPOINTS, FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP,
+)
 from nanochat.finetune_metrics import (
     expert_relative_change, flip_cause_counts, load_shares, maxvio, route_comparison, separation, top2_margin,
     token_weighted_mean,
@@ -426,9 +429,12 @@ def parse_lrs(values):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-run", required=True, help="pretraining run name under <base_dir>/base_checkpoints")
-    parser.add_argument("--base-checkpoints-dir", default=None, help="default: <base_dir>/base_checkpoints")
-    parser.add_argument("--base-step", type=int, default=None, help="default: the last checkpoint")
+    parser.add_argument("--base-run", required=True,
+                        help="seed-42 pretraining run with the default shared checkpoint directory")
+    parser.add_argument("--base-checkpoints-dir", default=str(FINETUNE_BASE_CHECKPOINTS_DIR),
+                        help=f"default: {FINETUNE_BASE_CHECKPOINTS_DIR}")
+    parser.add_argument("--base-step", type=int, default=FINETUNE_BASE_STEP,
+                        help=f"default: seed-42 best checkpoint, step {FINETUNE_BASE_STEP}")
     parser.add_argument("--ft-data-dir", required=True, help="train_*.parquet + val_*.parquet (scripts/make_finetune_data.py)")
     parser.add_argument("--ft-name", required=True, help="dataset name used in outputs, e.g. wikitext103")
     parser.add_argument("--d0-file", required=True, help="held-out pretraining-distribution parquet (D0)")
@@ -463,10 +469,29 @@ def main(argv=None):
         if tokens % args.total_batch_size:
             parser.error("--train-tokens and --branch-tokens must be multiples of --total-batch-size")
 
+    base_dir = Path(args.base_checkpoints_dir) / args.base_run
+    base_step = args.base_step
+    using_shared_checkpoints = Path(args.base_checkpoints_dir).resolve() == FINETUNE_BASE_CHECKPOINTS_DIR.resolve()
+    if using_shared_checkpoints and args.base_run not in FINETUNE_BASE_CHECKPOINTS:
+        parser.error(f"shared checkpoints are pinned to {tuple(FINETUNE_BASE_CHECKPOINTS)}")
+    model_path = base_dir / f"model_{base_step:06d}.pt"
+    meta_path = base_dir / f"meta_{base_step:06d}.json"
+    if not model_path.is_file() or not meta_path.is_file():
+        parser.error(f"missing base checkpoint or metadata: {model_path}, {meta_path}")
+    checkpoint_meta = json.loads(meta_path.read_text())
+    user_config = checkpoint_meta.get("user_config", {})
+    if checkpoint_meta.get("step") != base_step:
+        parser.error(f"checkpoint step mismatch in {meta_path}")
+    if using_shared_checkpoints:
+        expected_optimizer, expected_sha256 = FINETUNE_BASE_CHECKPOINTS[args.base_run]
+        if (base_step != FINETUNE_BASE_STEP or user_config.get("seed") != 42
+                or user_config.get("optimizer_name") != expected_optimizer):
+            parser.error(f"unexpected base checkpoint metadata in {meta_path}")
+    model_sha256 = file_sha256(model_path)
+    if using_shared_checkpoints and model_sha256 != expected_sha256:
+        parser.error(f"base checkpoint SHA-256 mismatch: {model_path}")
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _, _, _, _, device = compute_init(device_type, seed=0)
-    base_dir = Path(args.base_checkpoints_dir or Path(get_base_dir()) / "base_checkpoints") / args.base_run
-    base_step = args.base_step if args.base_step is not None else find_last_step(str(base_dir))
     model, tokenizer, base_meta = build_model(str(base_dir), base_step, device, phase="train")
     model0, _, _ = build_model(str(base_dir), base_step, device, phase="eval")
     if model.config.ffn_type != "moe":
@@ -527,7 +552,8 @@ def main(argv=None):
         "base_state": {k: v.detach().clone() for k, v in model.state_dict().items()},
         "pretrain_defaults": pretrain_defaults, "out_dir": out_dir, "base_run": args.base_run,
         "pretrain_optimizer": base_meta["user_config"].get("optimizer_name"),
-        "base_identity": {"dir": str(base_dir), "step": base_step, "val_bpb": base_meta.get("val_bpb"),
+        "base_identity": {"dir": str(base_dir), "step": base_step, "model_file": str(model_path),
+                          "model_sha256": model_sha256, "val_bpb": base_meta.get("val_bpb"),
                           "user_config": base_meta["user_config"], "git": git_state()},
         "ft_train_files": {Path(f).name: file_sha256(f) for f in ft_files[:-1]},
         "eval_identity": eval_identity, "d0": d0, "d1": d1, "base_d0": base_d0, "base_d1": base_d1,
