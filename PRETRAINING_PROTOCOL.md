@@ -197,7 +197,9 @@ if a transfer check fails.
   articles, 2.5M tokens, shuffled; the evaluation scores the first ≤ 2,048 tokens of 627 of them
   (1,048,461 tokens). Training: 28,934 articles (110.6M tokens), which give only 49.0M training tokens
   per pass under best-fit cropping (articles are long), so a 960-step WikiText run would need 1.28
-  passes (open question). StarCoderData: 215.8M per pass, 0.29 passes.
+  passes. **Decided 2026-11-25 (user):** the WikiText pilot uses 60 / 240 / 720 steps (3.9M / 15.7M /
+  47.2M tokens; 720 steps = 23,040 rows, within one pass), warmup 8 steps as in the StarCoderData pilot.
+  StarCoderData: 215.8M per pass, 0.29 passes at 960 steps.
 - **LR selection: (A), conventional** (user decision). Per cell (base model, fine-tuning dataset,
   fine-tuning optimizer, E), the LR with the lowest final D1 loss, mean over fine-tuning seeds, as in
   Zhao et al. (arXiv:2610.22650). The learning–forgetting analysis (forgetting at matched learning

@@ -150,9 +150,13 @@ pilot (all four pairs) is not assigned yet.
 2. **D0 loss gap: explained and fixed 2026-11-25** (LOG_CHANGES, `results/e8/d0_eval_gap/`). The old
    fine-tuning evaluation packed documents contiguously, cutting the context of ~49% of scored tokens
    (~0.2 of the ~0.24-nat gap). The evaluation now uses the pretraining best-fit rows (§5).
-   **WikiText caveat:** under best-fit cropping, one pass over WikiText's training split yields only
-   49.0M training tokens, so a 960-step WikiText run needs 1.28 passes. Decide (with the user) before
-   the WikiText pilot: cap WikiText at ~740 steps, accept a partial second pass, or split articles.
+   **WikiText length (decided 2026-11-25):** under best-fit cropping one pass over WikiText's training
+   split yields only 49.0M training tokens (23,924 rows), so the WikiText pilot uses 60 / 240 / **720**
+   steps (720 × 32 = 23,040 rows, one pass) instead of 960: `--branch-tokens 3932160 47185920`
+   (with the default `--train-tokens 15728640`, so warmup stays 8 steps and the 60- and 240-step runs
+   match the StarCoderData pilot's). Its generation command is the §5 one with
+   `--dataset wikitext103=/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/wikitext103`
+   and those branch tokens. Who runs it (all four pairs) is not assigned yet.
 3. Analyse the pilot: per (base, fine-tuning optimizer, length) the D1-selected LR, learning and
    forgetting curves over log-spaced checkpoints, seed spread; record the chosen main length and number
    of seeds in the protocol with the date.
@@ -181,8 +185,8 @@ pilot (all four pairs) is not assigned yet.
 - StarCoderData: Python only is agreed; the report text still says "86 languages" (the authors fix the
   wording; agents add `% NOTE` comments to `docs/report.tex`, not prose: the report states the authors
   did not use AI to draft it). D1 composition decided: best-fit, short files (protocol).
-- WikiText at 960 steps needs 1.28 passes under best-fit (cap at ~740 steps, accept a partial second
-  pass, or split articles); recommended: cap.
+- WikiText beyond ~740 steps (only if the main length goes past that): accept a shorter WikiText length
+  or split long articles.
 - ℓ0 for forgetting at matched learning; the number of fine-tuning seeds and main length (from the pilot).
 - Transfer check at other E (proposal above).
 
