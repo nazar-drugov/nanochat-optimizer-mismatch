@@ -282,9 +282,20 @@ case "$mode" in
         # W&B files, tokenizer cache, and per-run logs get explicit locations.
         export NANOCHAT_BASE_DIR="$SCRATCH_BASE"
         export WANDB_DIR="${WANDB_DIR:-$SCRATCH_BASE}"
-        # Cluster nodes have no W&B login, and a run without one stops at wandb.init.
-        # The metrics JSONL is the record; offline W&B files can be synced later.
-        export WANDB_MODE="${WANDB_MODE:-offline}"
+        # W&B: the API key comes from WANDB_API_KEY or the file WANDB_API_KEY_FILE
+        # (default ~/.wandb/wandb_api_key). Without a key, a run would stop at wandb.init,
+        # so it logs offline instead (files under WANDB_DIR, syncable later with `wandb sync`).
+        # The metrics JSONL is the record of every run either way.
+        wandb_key_file="${WANDB_API_KEY_FILE:-$HOME/.wandb/wandb_api_key}"
+        if [[ -z "${WANDB_API_KEY:-}" && -r "$wandb_key_file" ]]; then
+            WANDB_API_KEY="$(tr -d '[:space:]' < "$wandb_key_file")"
+            export WANDB_API_KEY
+        fi
+        if [[ -n "${WANDB_API_KEY:-}" ]]; then
+            export WANDB_MODE="${WANDB_MODE:-online}"
+        else
+            export WANDB_MODE="${WANDB_MODE:-offline}"
+        fi
         export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"
         export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
         log_file="$SCRATCH_BASE/logs/$RUN_NAME.log"
