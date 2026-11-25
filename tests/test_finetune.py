@@ -19,7 +19,7 @@ from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.dataset import list_parquet_files
 from nanochat.eval_set import EvalSet, build_eval_set, per_doc_sums
 from nanochat.finetune_data import (
-    detokenize_wikitext, hf_request, sample_heldout, wikitext_articles, write_manifest, write_shards,
+    assemble_heldout, detokenize_wikitext, hf_request, sample_heldout, wikitext_articles, write_manifest, write_shards,
 )
 from nanochat.finetune_metrics import (
     expert_relative_change, flip_cause_counts, load_shares, maxvio, route_comparison, select_experts, separation,
@@ -288,3 +288,17 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
             for key in ("learning", "forgetting", "F_route", "train_loss"):
                 assert a[key] == pytest.approx(b[key], rel=1e-5, abs=1e-7), (branch, a["step"], key)
         assert single["cumulative_expert_counts"] == branch_result["cumulative_expert_counts"]
+
+
+def test_wikitext_d1_takes_all_official_articles_and_tops_up_from_training():
+    official = [f"v{i} " * 10 for i in range(3)]              # 30 "tokens"
+    train = [f"t{i} " * 10 for i in range(20)]
+    count = lambda text: len(text.split())
+    d1, rest, moved, total = assemble_heldout(official, train, count, 75, seed=0)
+    assert set(official) <= set(d1) and moved == 5 and total == 80 and len(d1) == 8
+    assert len(rest) == 15 and not set(rest) & set(d1)        # moved articles leave training
+    assert rest == [t for t in train if t not in d1]          # training keeps its order
+    assert d1 != official + [d for d in d1 if d not in official]  # shuffled
+    assert assemble_heldout(official, train, count, 75, seed=0)[0] == d1
+    with pytest.raises(ValueError):
+        assemble_heldout(official, train, count, 10_000, seed=0)

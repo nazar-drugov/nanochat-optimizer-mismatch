@@ -2,7 +2,10 @@
 Fine-tuning datasets (EXPERIMENT_SPEC.md §6) in nanochat's parquet layout.
 
 - near: WikiText-103, raw version (`Salesforce/wikitext`, `wikitext-103-raw-v1`),
-  grouped into articles and detokenized. Held-out D1 = the official validation split.
+  grouped into articles and detokenized. Held-out D1 = the official validation and test
+  splits plus training articles sampled with a fixed seed (and removed from training) until
+  D1 holds `d1_tokens` GPT-2 tokens (default 1.1M, so the default 1,048,576 scored tokens fit),
+  in shuffled order (D1 is scored from the start of the file).
 - far:  StarCoderData (`bigcode/starcoderdata`, gated: needs a Hugging Face token whose account
   accepted the terms), one language directory (default `python`). Training = the first
   parquet file(s) of that directory; held-out D1 = a seeded random sample of documents from
@@ -38,6 +41,7 @@ FINETUNE_SOURCES = {
     "wikitext103": {
         "train": ("Salesforce/wikitext", "wikitext-103-raw-v1", "train", "text"),
         "val": ("Salesforce/wikitext", "wikitext-103-raw-v1", "validation", "text"),
+        "test": ("Salesforce/wikitext", "wikitext-103-raw-v1", "test", "text"),
     },
 }
 
@@ -148,21 +152,59 @@ def write_manifest(out_dir, info):
     return info
 
 
-def prepare_wikitext103(out_dir, raw_dir):
-    """Download WikiText-103 raw, group into articles, detokenize, write shards."""
-    out = {}
-    for split in ("train", "val"):
+def assemble_heldout(official, train, count_tokens, target_tokens, seed):
+    """D1 = every official held-out document plus training documents drawn in a seeded random
+    order until D1 has at least `target_tokens`; returns (d1 shuffled, remaining training
+    documents in their original order, number of training documents moved)."""
+    d1, total = list(official), sum(count_tokens(d) for d in official)
+    order = list(range(len(train)))
+    random.Random(seed).shuffle(order)
+    moved = set()
+    for i in order:
+        if total >= target_tokens:
+            break
+        d1.append(train[i])
+        moved.add(i)
+        total += count_tokens(train[i])
+    if total < target_tokens:
+        raise ValueError(f"only {total} tokens available for D1; {target_tokens} requested")
+    random.Random(seed + 1).shuffle(d1)
+    return d1, [d for i, d in enumerate(train) if i not in moved], len(moved), total
+
+
+def gpt2_token_counter():
+    """Tokens per document as the fine-tuning evaluation counts them (GPT-2, plus one BOS)."""
+    from nanochat.tokenizer import get_tokenizer
+    tokenizer = get_tokenizer("gpt2")
+    return lambda text: len(tokenizer.encode(text)) + 1
+
+
+def prepare_wikitext103(out_dir, raw_dir, d1_tokens=1_100_000, seed=0, count_tokens=None):
+    """Download WikiText-103 raw, group into articles, detokenize; D1 = validation + test +
+    sampled training articles (see the module docstring); write shards."""
+    articles = {}
+    for split in ("train", "val", "test"):
         repo, config, hf_split, column = FINETUNE_SOURCES["wikitext103"][split]
         lines = []
         for i, url in enumerate(parquet_urls(repo, config, hf_split)):
             lines += pq.read_table(download(url, Path(raw_dir) / f"wikitext103_{hf_split}_{i}.parquet"),
                                    columns=[column]).column(column).to_pylist()
-        docs = [detokenize_wikitext(article) for article in wikitext_articles(lines)]
-        write_shards(docs, out_dir, "train" if split == "train" else "val",
-                     docs_per_shard=10**9 if split == "val" else 50_000)
-        out[split] = {"source": f"{repo}/{config}/{hf_split}", "documents": len(docs),
-                      "characters": sum(map(len, docs))}
-    return write_manifest(out_dir, {"dataset": "wikitext103", "preprocessing": DETOKENIZER_VERSION, "splits": out})
+        articles[split] = [detokenize_wikitext(article) for article in wikitext_articles(lines)]
+    count_tokens = count_tokens or gpt2_token_counter()
+    d1, train, moved, d1_total = assemble_heldout(articles["val"] + articles["test"], articles["train"],
+                                                  count_tokens, d1_tokens, seed)
+    write_shards(train, out_dir, "train")
+    write_shards(d1, out_dir, "val", docs_per_shard=10**9)
+    out = {"train": {"source": "Salesforce/wikitext/wikitext-103-raw-v1/train", "documents": len(train),
+                     "characters": sum(map(len, train)), "articles_moved_to_d1": moved},
+           "val": {"source": "validation + test + training articles sampled with seed "
+                             f"{seed} until >= {d1_tokens} GPT-2 tokens (incl. one BOS per article)",
+                   "documents": len(d1), "validation_articles": len(articles["val"]),
+                   "test_articles": len(articles["test"]), "training_articles": moved,
+                   "gpt2_tokens_incl_bos": d1_total, "characters": sum(map(len, d1))}}
+    return write_manifest(out_dir, {"dataset": "wikitext103", "preprocessing": DETOKENIZER_VERSION,
+                                    "d1": f"validation+test+train-sample-v1 (seed {seed}, {d1_tokens} tokens)",
+                                    "splits": out})
 
 
 def starcoder_files(language, token):
