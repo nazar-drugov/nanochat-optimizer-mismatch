@@ -218,6 +218,28 @@ def check_transfer(points, transferred_lr, sweep_lr, from_tokens=SWEEP_TOKENS, t
     return out
 
 
+TRANSFER_RERUN_OCTAVES = 0.25  # protocol 2026-11-25: rerun the base models beyond this offset
+
+
+def selection_after_transfer(selection, report, threshold=TRANSFER_RERUN_OCTAVES):
+    """The LR selection for the 3B base models after the transfer check: per optimizer, the
+    transferred LR if the 3B optimum is within `threshold` octaves of it, else the 3B optimum
+    (the transfer-check vertex). An optimizer whose check ended at an edge is not selected."""
+    out = {}
+    for optimizer, choice in selection.items():
+        r, c = report[optimizer], dict(choice)
+        c["transferred_lr"] = choice["full_lr"]
+        if r["status"] != "interior":
+            c.update(status="transfer-check-edge", full_lr_source=None)
+        elif abs(r["vertex_octaves_from_transferred"]) > threshold:
+            c.update(full_lr=r["vertex_lr"], full_lr_source="transfer-check vertex",
+                     octaves_from_transferred=r["vertex_octaves_from_transferred"])
+        else:
+            c.update(full_lr_source="transferred", octaves_from_transferred=r["vertex_octaves_from_transferred"])
+        out[optimizer] = c
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Slurm job scripts
 

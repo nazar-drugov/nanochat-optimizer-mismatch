@@ -19,7 +19,7 @@ import pytest
 
 from nanochat.pretrain_sweep import (
     CHECKPOINT_EVERY, FULL_TOKENS, SWEEP_TOKENS, TOTAL_BATCH_SIZE, RunSpec, SlurmSettings, check_transfer, main_runs, num_steps,
-    parabola_vertex, render_job, select_lr, sweep_points, sweep_runs, transfer_check_runs, transfer_factor,
+    parabola_vertex, render_job, select_lr, selection_after_transfer, sweep_points, sweep_runs, transfer_check_runs, transfer_factor,
     warmup_steps,
 )
 from scripts import pretrain_sweep as cli
@@ -354,3 +354,37 @@ def test_transfer_check_extends_past_an_edge_with_extra_factors(tmp_path):
     assert report["adamw"]["vertex_lr"] == pytest.approx(best["adamw"], rel=1e-9)
     with pytest.raises(SystemExit):
         cli.main(["jobs", "--stage", "transfer", *args, "--extra-factor", "sgd=4"])
+
+
+def test_rerun_at_the_3b_optimum_and_transfer_check_still_reads_the_old_base_model(tmp_path):
+    out, root = tmp_path / "jobs", tmp_path / "checkpoints"
+    selection = {o: {"status": "selected", "sweep_lr": lr, "full_lr": lr * transfer_factor()}
+                 for o, lr in (("adamw", 1.2e-3), ("muon", 1.6e-3))}
+    (tmp_path / "sel.json").write_text(json.dumps(selection))
+    full = {o: selection[o]["full_lr"] for o in selection}
+    best = {"adamw": full["adamw"] * 2.8, "muon": full["muon"] * 1.05}
+    factors = {"adamw": (0.5, 2.0, 4.0, 8.0), "muon": (0.5, 2.0)}
+    for run in transfer_check_runs(full, factors=factors) + main_runs(full):
+        write_result(root, run, quadratic(run.lr, best_lr=best[run.optimizer]))
+    check = ["transfer-check", "--selection", str(tmp_path / "sel.json"), "--out", str(out),
+             "--checkpoints-root", str(root), "--extra-factor", "adamw=4", "adamw=8"]
+    assert cli.main(check) == 0
+    final = json.loads((out / "lr_selection_3b.json").read_text())
+    assert final["adamw"]["full_lr"] == pytest.approx(best["adamw"], rel=1e-9)
+    assert final["adamw"]["full_lr_source"] == "transfer-check vertex"
+    assert final["adamw"]["transferred_lr"] == full["adamw"]
+    assert final["muon"]["full_lr"] == full["muon"] and final["muon"]["full_lr_source"] == "transferred"
+
+    # Supersede the AdamW base model: move it to its x1 transfer-check name, rerun at the optimum.
+    old = RunSpec("main", "adamw", full["adamw"], 42)
+    (root / old.name).rename(root / RunSpec("xfer", "adamw", full["adamw"], 42).name)
+    assert cli.main(["jobs", "--stage", "main", "--selection", str(out / "lr_selection_3b.json"),
+                     "--out", str(out)]) in (0, None)
+    assert f"--adamw-matrix-lr={final['adamw']['full_lr']}" in (out / "e8-main-adamw-s42.sbatch").read_text()
+    new = RunSpec("main", "adamw", final["adamw"]["full_lr"], 42)
+    write_result(root, new, quadratic(new.lr, best_lr=best["adamw"]))
+    assert cli.main(check) == 0
+    assert json.loads((out / "lr_selection_3b.json").read_text()) == final
+
+    edge = selection_after_transfer(selection, {"adamw": {"status": "edge"}, "muon": {"status": "edge"}})
+    assert all(c["status"] == "transfer-check-edge" for c in edge.values())

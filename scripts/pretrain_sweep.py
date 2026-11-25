@@ -16,6 +16,13 @@ PRETRAINING_PROTOCOL.md). Run on the ORCD login node from the repository:
      then compare (writes jobs/transfer_check.json):
        python -m scripts.pretrain_sweep jobs --stage transfer --selection jobs/lr_selection.json --out jobs/
        python -m scripts.pretrain_sweep transfer-check --selection jobs/lr_selection.json --out jobs/
+     If an optimizer's best point is at the edge, add --extra-factor (e.g. adamw=4 adamw=8)
+     to both commands. transfer-check also writes jobs/lr_selection_3b.json: the transferred
+     LR, or the 3B optimum where it is more than 0.25 octave away.
+  5. If the 3B optimum replaced an LR: move each superseded base model to its x1
+     transfer-check name (e8-xfer-<optimizer>-lr<transferred>-s42, so transfer-check still
+     finds it), then write and submit the base models from the new selection:
+       python -m scripts.pretrain_sweep jobs --stage main --selection jobs/lr_selection_3b.json --seeds 42 43 44 --out jobs/
 """
 
 import argparse
@@ -25,7 +32,7 @@ import sys
 from pathlib import Path
 
 from nanochat.pretrain_sweep import (
-    OPTIMIZERS, SWEEP_LRS, TRANSFER_CHECK_FACTORS, RunSpec, SlurmSettings, check_transfer, transfer_check_runs, main_runs, render_job, select_lr, sweep_points, sweep_runs,
+    OPTIMIZERS, SWEEP_LRS, TRANSFER_CHECK_FACTORS, RunSpec, SlurmSettings, check_transfer, selection_after_transfer, transfer_check_runs, main_runs, render_job, select_lr, sweep_points, sweep_runs,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,8 +106,12 @@ def load_selection(path, stage):
 def cmd_transfer_check(args):
     selection = load_selection(args.selection, "transfer")
     full_lrs = {o: selection[o]["full_lr"] for o in OPTIMIZERS}
-    runs = transfer_check_runs(full_lrs, seed=args.seed, factors=parse_extra_factors(args.extra_factor)) + [RunSpec("main", o, full_lrs[o], args.seed) for o in OPTIMIZERS]
     root = Path(args.checkpoints_root or Path(default_scratch_base()) / "base_checkpoints")
+    # The x1 point is the base model, unless that was rerun at the 3B optimum: then the
+    # original base model was moved to the x1 transfer-check name.
+    x1 = [RunSpec("xfer", o, full_lrs[o], args.seed) for o in OPTIMIZERS]
+    x1 = [r if (root / r.name).is_dir() else RunSpec("main", r.optimizer, r.lr, r.seed) for r in x1]
+    runs = transfer_check_runs(full_lrs, seed=args.seed, factors=parse_extra_factors(args.extra_factor)) + x1
     points = sweep_points(runs, root)
     report = {o: check_transfer(points[o], full_lrs[o], selection[o]["sweep_lr"]) for o in OPTIMIZERS}
     for optimizer, r in report.items():
@@ -115,6 +126,11 @@ def cmd_transfer_check(args):
             print(f"  -> best point {r['best_lr']:.4g} is at the edge: the 3B optimum lies beyond it; "
                   f"extend with --extra-factor {optimizer}=<factor beyond {edge}>")
     write(Path(args.out) / "transfer_check.json", json.dumps(report, indent=2))
+    final = selection_after_transfer(selection, report)
+    for optimizer, c in final.items():
+        if c["full_lr_source"] == "transfer-check vertex":
+            print(f"{optimizer}: base models at the 3B optimum {c['full_lr']:.4g} (rerun those at {c['transferred_lr']:.4g})")
+    write(Path(args.out) / "lr_selection_3b.json", json.dumps(final, indent=2))
     return 0
 
 
