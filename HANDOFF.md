@@ -109,11 +109,13 @@ the first attempt used the old contiguous evaluation and was cancelled, outputs 
 
 | Job | Base model → fine-tuning optimizer | Account | State |
 |---|---|---|---|
-| 30500290 | e8-main-adamw-s42 → Muon | hgo | submitted 14:50 EST (~75 min once running) |
-| 30500292 | e8-main-muon-s42 → AdamW | hgo | submitted 14:50 EST |
+| 30500290 | e8-main-adamw-s42 → Muon | hgo | **done** 16:11 EST; best LR at the grid top → extension 30512566 (×2, ×4) |
+| 30500292 | e8-main-muon-s42 → AdamW | hgo | **done** 16:05 EST; optimum interior |
 | — | e8-main-adamw-s42 → AdamW | **Nazar** | to run, from commit 0c86b24 or later |
 | — | e8-main-muon-s42 → Muon | **Nazar** | to run, from commit 0c86b24 or later |
 
+Per-LR results of the two finished pairs are in LOG_CHANGES. The matched pairs may also put Muon's best
+LR at the grid top; if so, extend with `--lr-fractions 2 4` (same branches, seeds, output root).
 All four must use the same evaluation: check that each job's `config.json` has
 `data.eval_sets.D0.packing == "bestfit"`. Sanity check: the base model's D0 loss in
 `<out>/<base>/starcoderdata/base/base_metrics.json` should be close to its pretraining D0 value
