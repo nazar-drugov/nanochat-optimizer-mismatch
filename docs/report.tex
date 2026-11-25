@@ -118,7 +118,9 @@ To establish an experimental baseline, we measure the trade-off between learning
     \item Number of fine-tuning steps, $t$.
     \item Pre-training and fine-tuning optimizers, $(\Omega_0, \Omega_1) \in \{\text{AdamW}, \text{Muon}\}^2$,
     \item Sparsity, measured as the number $E$ of experts in each layer, at fixed active parameters.
-    \item Fine-tuning learning rate $\eta_1$, swept separately for each optimizer and sparsity and fixed at its per-cell optimum, the learning rate with the lowest final fine-tuning validation loss averaged over seeds \cite{zhao2026ephemeral}.
+    \item Fine-tuning learning rate $\eta_1$, swept separately for each optimizer and sparsity and fixed at its per-cell optimum.
+    % NOTE (decided 2026-11-25): per-cell optimum = the LR with the lowest final D1 loss, mean over
+    % fine-tuning seeds, as in zhao2026ephemeral; the matched-learning frontier is a robustness check only.
     \item Fine-tuning dataset $\D_1$, set to either a near-distribution or far-from-distribution corpus (details in Section~\ref{sec:datasets}).
 
 \end{enumerate}
@@ -222,6 +224,10 @@ We take our near-distribution dataset to be WikiText-103 \cite{merity2017iclr-po
 % NOTE: decided 2026-11-25: StarCoderData, implemented for one language (default Python): training from
 % the first parquet file of the language directory, held-out D1 = 20,000 documents sampled from its last file.
 % The text below says 86 languages; either restrict the description to Python or change the subset.
+% NOTE (decided 2026-11-25): evaluation rows use the pretraining best-fit packing for D0 and D1. For
+% StarCoderData this makes D1 the Python files of at most 2,048 tokens (1,446 whole files, median 663
+% tokens; the 26% of files longer than a row are never scored), the same selection fine-tuning training
+% makes; WikiText D1 is scored on the first <= 2,048 tokens of 627 articles. State this in the text.
 We take our far-distribution dataset to be StarCoderData \cite{li2023starcoder}. This dataset contains $250$B tokens of GitHub content spanning $86$ programming languages. We consider this dataset to be far from the pre-training distribution, since FineWeb-Edu excludes most code by its filtering rules. 
 
 \subsection{Training procedure}

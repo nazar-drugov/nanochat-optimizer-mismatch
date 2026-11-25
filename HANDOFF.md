@@ -178,7 +178,11 @@ pilot (all four pairs) is not assigned yet.
 
 ## 7. Open decisions (raise with the team; do not resolve silently)
 
-- StarCoderData: Python only is agreed; the report text still says "86 languages" (fix the wording).
+- StarCoderData: Python only is agreed; the report text still says "86 languages" (the authors fix the
+  wording; agents add `% NOTE` comments to `docs/report.tex`, not prose: the report states the authors
+  did not use AI to draft it). D1 composition decided: best-fit, short files (protocol).
+- WikiText at 960 steps needs 1.28 passes under best-fit (cap at ~740 steps, accept a partial second
+  pass, or split articles); recommended: cap.
 - ℓ0 for forgetting at matched learning; the number of fine-tuning seeds and main length (from the pilot).
 - Transfer check at other E (proposal above).
 

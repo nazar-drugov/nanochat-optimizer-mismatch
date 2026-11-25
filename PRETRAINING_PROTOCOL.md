@@ -185,6 +185,12 @@ if a transfer check fails.
   (every row starts with a BOS, no document crosses a row, long documents are cropped), with document
   IDs kept; each document is read once. The old contiguous packing cut the context of ~49% of the
   scored tokens. `--eval-packing contiguous` keeps the old version for reference.
+- **StarCoderData D1 composition accepted as is** (user decision, 2026-11-25, option 1 of 2). Under
+  best-fit, D1 is scored on 1,446 whole Python files of at most 2,048 tokens (median 663); the 26% of
+  D1 files longer than a row are never scored. Fine-tuning training makes the same selection (short
+  files whole, openings of long files), and D0 is built the same way, so "learning on StarCoderData"
+  means learning on short Python files; the report states this. Rejected: one document per row cut at
+  2,048 tokens (length-neutral, but differs from training and would need another pilot rerun).
 - **WikiText D1: official validation + test + sampled training articles** (user decision,
   2026-11-25). Sized for the best-fit packing: 60 validation and 62 test articles plus 510 training
   articles drawn with seed 0 (and removed from training) until the packing fills 512 rows: 632
