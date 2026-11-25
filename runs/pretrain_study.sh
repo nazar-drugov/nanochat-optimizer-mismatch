@@ -282,16 +282,12 @@ case "$mode" in
         # W&B files, tokenizer cache, and per-run logs get explicit locations.
         export NANOCHAT_BASE_DIR="$SCRATCH_BASE"
         export WANDB_DIR="${WANDB_DIR:-$SCRATCH_BASE}"
-        # W&B: the API key comes from WANDB_API_KEY or the file WANDB_API_KEY_FILE
-        # (default ~/.wandb/wandb_api_key). Without a key, a run would stop at wandb.init,
-        # so it logs offline instead (files under WANDB_DIR, syncable later with `wandb sync`).
-        # The metrics JSONL is the record of every run either way.
-        wandb_key_file="${WANDB_API_KEY_FILE:-$HOME/.wandb/wandb_api_key}"
-        if [[ -z "${WANDB_API_KEY:-}" && -r "$wandb_key_file" ]]; then
-            WANDB_API_KEY="$(tr -d '[:space:]' < "$wandb_key_file")"
-            export WANDB_API_KEY
-        fi
-        if [[ -n "${WANDB_API_KEY:-}" ]]; then
+        # W&B: wandb finds its API key in WANDB_API_KEY or in ~/.netrc (machine
+        # api.wandb.ai; NETRC overrides the path). Without a key, a run would stop at
+        # wandb.init, so it logs offline instead (files under WANDB_DIR, syncable later
+        # with `wandb sync`). The metrics JSONL is the record of every run either way.
+        netrc_file="${NETRC:-$HOME/.netrc}"
+        if [[ -n "${WANDB_API_KEY:-}" ]] || { [[ -r "$netrc_file" ]] && grep -q "machine api.wandb.ai" "$netrc_file"; }; then
             export WANDB_MODE="${WANDB_MODE:-online}"
         else
             export WANDB_MODE="${WANDB_MODE:-offline}"

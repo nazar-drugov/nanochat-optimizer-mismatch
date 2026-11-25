@@ -112,12 +112,15 @@ def test_dry_run_does_not_check_the_data(setup):
 def test_wandb_is_online_with_a_key_and_offline_without(setup, tmp_path):
     # Without a key, online mode would stop the run at wandb.init.
     environ = {k: v for k, v in setup["environ"].items() if k not in ("WANDB_MODE", "WANDB_API_KEY")}
-    key_file = tmp_path / "wandb_api_key"
-    key_file.write_text("secret-key-123\n")
-    cases = (({"WANDB_API_KEY_FILE": str(tmp_path / "missing")}, "offline"),
-             ({"WANDB_API_KEY_FILE": str(key_file)}, "online"),
-             ({"WANDB_API_KEY_FILE": str(key_file), "WANDB_MODE": "offline"}, "offline"),
-             ({"WANDB_API_KEY_FILE": str(tmp_path / "missing"), "WANDB_API_KEY": "k"}, "online"))
+    netrc = tmp_path / "netrc"
+    netrc.write_text("machine api.wandb.ai\n  login user\n  password secret-key-123\n")
+    other = tmp_path / "netrc_other"
+    other.write_text("machine example.com\n  login user\n  password x\n")
+    cases = (({"NETRC": str(tmp_path / "missing")}, "offline"),
+             ({"NETRC": str(other)}, "offline"),
+             ({"NETRC": str(netrc)}, "online"),
+             ({"NETRC": str(netrc), "WANDB_MODE": "offline"}, "offline"),
+             ({"NETRC": str(tmp_path / "missing"), "WANDB_API_KEY": "k"}, "online"))
     for extra, expected in cases:
         result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT,
                                 env={**environ, **extra}, capture_output=True, text=True, timeout=120)
