@@ -132,7 +132,7 @@ To run the two matched pairs on Nazar's account, generate the jobs and submit on
 Then add `--base-checkpoints-dir /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/base_checkpoints`
 to the `scripts.finetune` line of each script (`finetune_jobs` has no flag for it yet), or copy the two
 base checkpoints. Check `--exclude` for your account's bad nodes (ours: node5800-c1, node5702-c1).
-Job scripts from commit 5429aa7 on set `PYTHONUNBUFFERED=1`, so progress lines reach the Slurm log
+Job scripts generated from commit bd74937 on set `PYTHONUNBUFFERED=1`, so progress lines reach the Slurm log
 live (hgo's two running jobs predate it: their logs fill only at the end; results stream to scratch).
 The analysis must read both output roots (hgo's for the mismatched pairs, Nazar's for the matched).
 The WikiText pilot (all four pairs) is not assigned yet.
