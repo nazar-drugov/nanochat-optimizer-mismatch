@@ -122,6 +122,10 @@ Estimated B200 time (central, range): sweep 1.7 GPU-hours (1.1–2.8), ~0.9 h on
 selection rule is unchanged (the ×¼ point is used only if ×½ is best, when the rule would ask
 for it anyway).
 
+**Selected E = 8 LRs (2026-11-25).** With the extension (AdamW 5e-4 1.0432, 2.5e-4 1.0797;
+Muon 1e-3 1.0060, 5e-4 1.0278) both optima are interior: AdamW 1.155e-3 at 0.5B → 6.511e-4 at 3B,
+Muon 1.575e-3 at 0.5B → 8.874e-4 at 3B. The base models (seeds 42, 43, 44) use these.
+
 **Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
 (job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
 at 64 (9% faster); Muon 385 vs 375 ms (3% faster); 64 fits (62 GB reserved). It is not adopted
