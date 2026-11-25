@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None, shuffle_seed=None):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None, shuffle_seed=None, exclude_rows=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
@@ -39,6 +39,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
               None = the default pretraining dataset's directory.
     shuffle_seed: None = fixed file/row-group order (pretraining default);
               int = seeded shuffled order, see _shuffled_document_batches.
+    exclude_rows: optional set of row indices (0-based, over the whole file) of the
+              validation file to skip, e.g. the documents that D0 took from it. Only
+              for split="val" in fixed order.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
@@ -47,6 +50,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
     if split == "train" and len(parquet_paths) < 2:
         raise ValueError(f"Need >= 2 parquet files (train shard(s), then the val shard last), found {parquet_paths}")
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    if exclude_rows is not None and (split != "val" or shuffle_seed is not None):
+        raise ValueError("exclude_rows is only supported for the validation split in fixed order")
+    exclude_rows = frozenset(exclude_rows or ())
 
     if shuffle_seed is not None:
         yield from _shuffled_document_batches(
@@ -70,6 +76,10 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
+            # Index of each row group's first row in the file, to match exclude_rows
+            rg_offsets = [0]
+            for i in range(pf.num_row_groups - 1):
+                rg_offsets.append(rg_offsets[-1] + pf.metadata.row_group(i).num_rows)
             # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 if resume_batch_idx is not None:
@@ -89,8 +99,14 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
                 first_batch = resume_batch_idx if resume_rg_idx == rg_idx else 0
                 for batch_idx in range(first_batch, (len(batch) + tokenizer_batch_size - 1) // tokenizer_batch_size):
                     i = batch_idx * tokenizer_batch_size
+                    docs = batch[i:i+tokenizer_batch_size]
+                    if exclude_rows:
+                        first_row = rg_offsets[rg_idx] + i
+                        docs = [doc for j, doc in enumerate(docs) if first_row + j not in exclude_rows]
+                        if not docs:
+                            continue
                     yielded_this_pass = True
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch, batch_idx)
+                    yield docs, (pq_idx, rg_idx, epoch, batch_idx)
                 resume_rg_idx = None  # apply the saved cursor only once
                 resume_batch_idx = None
                 rg_idx += ddp_world_size
@@ -154,7 +170,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000, data_dir=None, shuffle_seed=None,
+    buffer_size=1000, data_dir=None, shuffle_seed=None, exclude_rows=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -178,11 +194,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
               row-group order and of documents within each row group, re-drawn every epoch; the
               same seed (and world size) gives the same batch sequence. Its states carry
               "shuffle_seed" and "next_unit_pos" and must be resumed with the same seed.
+    exclude_rows: validation-file rows to skip (see _document_batches).
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir, shuffle_seed=shuffle_seed)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir,
+                                shuffle_seed=shuffle_seed, exclude_rows=exclude_rows)
     bos_token = tokenizer.get_bos_token_id()
     exact_resume = resume_state_dict is not None and "doc_buffer" in resume_state_dict
     doc_buffer = [list(tokens) for tokens in resume_state_dict["doc_buffer"]] if exact_resume else []

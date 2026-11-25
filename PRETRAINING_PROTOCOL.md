@@ -16,22 +16,21 @@ Every run writes its fully resolved settings to `config.json` next to its checkp
 | Muon learning rate | Swept separately from AdamW, not copied from it; see the sweep below | Moonlight's scaling makes the two LRs comparable in size, but their optima need not coincide |
 | Batch size | 262,144 tokens, constant for the whole run, identical in every cell and both optimizers | Ludziejewski et al.'s final batch (they ramp 64K → 128K → 256K; we do not). DeepSeek LLM's fit gives ~249K at 3B tokens. See "Batch size" below |
 | Schedule | 130M-token linear warmup, constant, linear decay to 0 over the last 20% | Ludziejewski et al. Sec. 5.1.3 |
-| Gradient clipping | Global norm 1.0 in every cell | Spec recommendation, applied to both optimizers so cells differ only in the optimizer |
+| Gradient clipping | Global norm 1.0 in every cell | Spec recommendation, applied to both optimizers so cells differ only in the optimizer; Hernanz does the same. Confirmed 2026-11-24. The fraction of clipped steps is compared between optimizers |
 | Balancer | Auxiliary loss 0.01 + z-loss 0.001 (`--balancer aux`) | Following Ludziejewski et al. (arXiv:2502.05172): Switch balance loss 0.01 and router z-loss 0.001, each **summed over the MoE layers** (not averaged); see "Auxiliary loss" below |
+| AdamW (matrices, embeddings, lm_head) | β = (0.9, 0.95), ε = 1e-8 | Decided 2026-11-24. Hernanz (arXiv:2610.37914) uses exactly these with Muon at 0.95 Nesterov, 5 Newton–Schulz steps, 0.2·√max scaling, weight decay 0.1 and clipping 1.0 for both optimizers. Ludziejewski et al. state no optimizer settings. ε is far below the per-element gradient scale (~1e-4) here |
+| Weight decay on matrices | λ = 0.1 for AdamW and Muon, applied as `1 − lr·λ` (option A) | Decided 2026-11-24. Each optimizer keeps its standard recipe (Hernanz; Moonlight). Because decay scales with the LR, the decay timescale 1/(η·λ) differs between cells by the ratio of their LRs (~3.4× at the sweep centres; Wang & Aitchison, arXiv:2405.13698). Mitigation: per-layer weight norms are logged, and one E = 4 Muon run at 3B tokens uses λ chosen to match AdamW's η·λ (see the sweep, step 9). Option B (fixing the timescale in every cell) was not chosen |
+| Router | LR = the matrix LR of the router's optimizer; router weight decay 0 | Decided 2026-11-24. Neither reference paper tunes the router separately |
+| Pretraining seeds | 3 at E = 8, 1 elsewhere (seed changes only the initialization; the data order is fixed) | Decided 2026-11-24 |
+| Initialization | As in the code; see "Initialization" below | Decided 2026-11-24 (Nazar's plan): experts match Ludziejewski et al.'s truncated normal at scale 0.1; the router is fp32, as their "high precision" router |
+| Validation | LR selection uses the held-out validation shard `shard_01822.parquet` without the documents D0 took from it; D0 is reserved for forgetting measurements and only logged during pretraining | Decided 2026-11-24, so that D0 does not choose the models it later evaluates. D0 is sampled from that shard (`make_heldout`), so validation skips D0's rows to keep the two disjoint |
+| GPU reproducibility | Not bitwise; accepted | Decided 2026-11-24. Seeds measure the noise |
+| Model | Depth 10 (width 640, 10 blocks): 118M active with GPT-2 vocab | Confirmed 2026-11-24 |
+| Token budget | 3,000,238,080 tokens (11,445 steps) | Confirmed 2026-11-24. Optional 1B and 2B decay branches stay possible (see below) |
+| Headline cell | E = 8; pretraining may start with E = 8 only | Decided 2026-11-24 to save time; other E later if the fine-tuning results warrant |
 
 
-## Defaults that still need team confirmation
-
-| Setting | Default | Alternative |
-|---|---|---|
-| Weight decay on matrices | 0.1 for AdamW and Muon | The spec gives no Muon value. Moonlight uses 0.1 in all training stages (paper) and as the default in its code, shared by Muon and AdamW |
-| Router learning rate | Same as the matrix LR; router weight decay 0 | Sweep separately |
-| AdamW | β = (0.9, 0.95), ε = 1e-8 | ε = 1e-10 |
-| Model | depth 10 (width 640, 10 blocks): 118M active with GPT-2 vocab | depth 12 costs ~1.55× |
-| Token budget | 3,000,238,080 tokens (11,445 steps) for every E | Optional 1B- and 2B-token runs can test whether the result depends on the training horizon; see below. |
-| Pretraining seeds | 3 at E = 8, 1 elsewhere | |
-
-
+## Pretraining settings: all confirmed (2026-11-24)
 
 ### Initialization
 
@@ -87,27 +86,51 @@ additional check, not part of the chosen 3B-token budget. The current launcher
 does not automate checkpoint branching; it requires a separate, verified resume
 procedure before results can be treated as shared-prefix branches.
 
-## Learning-rate sweep (Option A)
+## E = 8 learning-rate sweep and base models (current plan, 2026-11-24)
 
-Chosen 2026-11-23: sweep on short runs, then transfer to the full budget.
+E = 8 is the headline cell; pretraining starts with E = 8 only. `scripts/pretrain_sweep.py`
+writes the Slurm jobs and chooses the LRs (`nanochat/pretrain_sweep.py` holds the plan).
 
-1. **What is tuned:** only the peak LR of the matrices and routers, separately for each
-   (optimizer, E): 8 cells. Embedding and lm_head LRs stay at their defaults in every cell.
-2. **Grid:** 5 points spaced ×2 around a center (c/4, c/2, c, 2c, 4c). AdamW center
-   2e-3 · E^-0.25 (Ludziejewski et al. Eq. 8): 2e-3, 1.41e-3, 1.19e-3, 1e-3 for E = 1, 4, 8, 16.
-    Muon center 4e-3 (Hernanz), swept independently of AdamW's result. Extend the grid if the best point is on an edge.
-3. **Sweep length:** 499,908,608 tokens (1,907 steps) with the full schedule shape
-   (130M-token warmup, 20% decay).
-4. **Selection:** lowest final validation bits-per-byte, one seed. If neighbouring points are
-   within seed noise (measure once with 2 seeds at the best point), take the smaller LR.
-5. **Transfer to 3B tokens:** multiply by (3 / 0.5)^-0.32 = 0.564 (Hernanz's T^-0.32 scaling).
-6. **Transfer check:** at E = 4, for both optimizers, train 3B-token runs at 0.5×, 1× and 2×
-   the transferred LR. If 1× is not best, redo the transfer for all cells with the measured factor.
-7. **Batch-size robustness (agreed):** at E = 4, 0.5B tokens, both optimizers × {128K, 256K, 512K}
-   at the swept best LR.
+1. **Sweep:** E = 8, 499,908,608 tokens (1,907 steps), seed 42, one B200 per run.
+   AdamW at 1e-3, 2e-3, 4e-3; Muon at 2e-3, 4e-3, 8e-3. The AdamW grid covers our earlier
+   centre (1.19e-3) and Ludziejewski et al.'s Eq. 8 carried to 0.5B tokens (~2.5e-3); the Muon
+   grid covers Moonlight's "same LR as AdamW" and Hernanz's ~2× AdamW (both of his model sizes).
+   Warmup is 4.33% of the run (83 steps, the fraction 130M tokens is of 3B), then constant,
+   then linear decay over the last 20%. Only the final checkpoint is kept.
+2. **Validation:** the held-out validation shard (`shard_01822.parquet`) minus the documents D0
+   took from it, 10,485,760 tokens every 500 steps. D0 is evaluated at the same steps on
+   1,048,576 tokens and only logged; it never selects anything.
+3. **Selection** (`select`): per optimizer, the lowest final validation bpb; the LR is the vertex
+   of the parabola through that point and its two neighbours in log2(LR). If the best point is
+   at the edge of the grid, one more point (×2 or ×½) is run first. A run whose training loss
+   becomes non-finite or rises 1 nat above its step-0 loss after warmup stops and counts as
+   diverged.
+4. **Transfer to 3B tokens:** × (3B / 0.5B)^-0.32 = 0.5635. The exponent is not Hernanz's own
+   fit: he takes it from Bjorck et al. (AdamW) and Ren et al. (Muon) and applies ×0.7 for a 3×
+   longer run. The transfer check is deferred (below).
+5. **Base models:** E = 8, AdamW and Muon at their transferred LRs, 3,000,238,080 tokens,
+   seed 42 first, then seeds 43 and 44. Checkpoints every 1,526 steps (400M tokens), which
+   includes 0.8B and 1.6B tokens, where optional 1B and 2B decay branches would start.
+
+Estimated B200 time (central, range): sweep 1.7 GPU-hours (1.1–2.8), ~0.9 h on two GPUs; each
+3B run ~1.4–1.5 h; first AdamW/Muon pair ~2.6 h after the sweep starts; all three seeds
+~10 GPU-hours (7–17).
+
+**Deferred until the first fine-tuning results:** other E; the transfer check (E = 4, 0.5×/1×/2×
+at 3B); batch-size robustness; the weight-decay ablation (one Muon run with λ = 0.1·η_AdamW/η_Muon,
+so that η·λ matches AdamW); seed-noise runs for the sweep.
+
+### If other E are added: joint fit across E (decided 2026-11-24)
+
+Sweep every (optimizer, E) cell on 5 points spaced ×2 (AdamW centre 2e-3·E^-0.25; Muon centre
+4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16, so the four grids interleave), and choose
+LRs by one fit per optimizer: y = a_E + b·(log₂ LR − m₀ − α·log₂ E)², with one curvature b,
+using points within 0.05 bpb of each cell's minimum. α is reported (AdamW: compare with
+Ludziejewski's −0.25; Muon: no prior). Ludziejewski et al. themselves fit one LR formula in N and
+E (Eq. 8; fitted at E = 1 and 8, checked at E = 4 and 32) rather than tuning each E.
 
 Option B (decay branches off longer stable phases instead of transferring) is the fallback
-if the transfer check fails.
+if a transfer check fails.
 
 ## Before the first real run
 
@@ -126,6 +149,10 @@ if the transfer check fails.
   scratch once per dataset version, then launch many runs using that scratch
   copy. Downloads and staging are not part of each training run. See
   `STORAGE_PATHS.md`.
+- Validation reads the held-out validation shard `shard_01822.parquet` without the documents
+  D0 took from it (`val_excluded_heldout_rows` in `config.json`); D0 is evaluated alongside and
+  only logged. Each run ends with `result.json` (status, final validation and D0 bpb, evaluation
+  curve, clipped-step fraction, settings).
 - The data is frozen in `data_manifests/fineweb_edu_100_v1/` (100 training shards,
   the validation shard, and D0). Every `train` start and resume through the launcher
   hashes all shards against that manifest (about 30 s) and stops on any difference, so
@@ -138,14 +165,15 @@ if the transfer check fails.
   dispatch); the data stream is identical across runs and cells, and resume restores the exact state,
   but the continuation is only statistically equivalent.
 
-Example cell preview (0.004 is the Muon sweep center, not a selected final LR):
+Sweep and base-model jobs (on the ORCD login node, from the repository):
 
 ```bash
-RUN_NAME=moe-e8-muon-s42 bash runs/pretrain_study.sh dry-run \
-    --depth=10 --ffn-type=moe --n-experts=8 --optimizer-name=muon \
-    --muon-matrix-lr=0.004 --train-tokens=3000238080 --save-every=1000 \
-    --eval-tokens=1048576 --core-metric-every=-1 --seed=42
+python -m scripts.pretrain_sweep jobs --stage sweep --out jobs/      # 2 jobs × 3 runs
+sbatch jobs/e8-sweep-adamw.sbatch; sbatch jobs/e8-sweep-muon.sbatch
+python -m scripts.pretrain_sweep select --out jobs/                  # writes jobs/lr_selection.json
+python -m scripts.pretrain_sweep jobs --stage main --selection jobs/lr_selection.json --out jobs/
+sbatch jobs/e8-main-adamw-s42.sbatch; sbatch jobs/e8-main-muon-s42.sbatch
 ```
 
-Use `train` instead of `dry-run` only after the chosen learning rate and
-remaining protocol defaults have been confirmed and the dataset staged.
+Each job runs its runs through `runs/pretrain_study.sh train` on one GPU, skips runs that
+already have `result.json`, and continues past a failed or diverged run.

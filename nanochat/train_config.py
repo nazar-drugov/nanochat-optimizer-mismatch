@@ -250,9 +250,14 @@ def write_run_record(path, *, args, model, optimizer, device_type, world_size, c
     }
     if extra:
         record.update(extra)
+    write_json_atomic(path, record)
+    return record
+
+
+def write_json_atomic(path, data):
+    """Write JSON so that readers never see a half-written file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(record, indent=2, default=str))
+    tmp.write_text(json.dumps(data, indent=2, default=str))
     tmp.replace(path)
-    return record

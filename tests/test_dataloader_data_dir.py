@@ -163,3 +163,31 @@ def test_shuffled_resume_requires_same_seed(tmp_path):
     assert "shuffle_seed" not in plain_state and "next_unit_pos" not in plain_state
     with pytest.raises(ValueError):
         next(dataloader.tokenizing_distributed_data_loader_with_state_bos_bestfit(TinyTokenizer(), shuffle_seed=3, resume_state_dict=plain_state, **kw))
+
+
+def test_validation_can_skip_rows_by_their_index_in_the_file(tmp_path):
+    """D0 is sampled from the validation shard; validation skips those rows. Row indices
+    count over the whole file, across row groups (as make_heldout records them)."""
+    tmp_path.mkdir(exist_ok=True)
+    docs = [f"{i:03d}" for i in range(35)]
+    for name in ("train_00000.parquet", "train_00001.parquet"):
+        pq.write_table(pa.table({"text": ["1"]}), tmp_path / name)
+    pq.write_table(pa.table({"text": docs}), tmp_path / "val_00000.parquet", row_group_size=10)
+    excluded = {0, 9, 10, 11, 23, 34}  # first/last of row groups, a whole tokenizer batch edge, the last row
+
+    def first_pass(exclude_rows, batch_size=4):
+        gen = dataloader._document_batches("val", None, batch_size, data_dir=str(tmp_path), exclude_rows=exclude_rows)
+        seen = []
+        while len(seen) < 35 - len(exclude_rows or ()):
+            batch, cursor = next(gen)
+            assert batch, "empty document batches must not be yielded"
+            seen.extend(batch)
+        return seen
+
+    assert first_pass(None) == docs
+    assert first_pass(excluded) == [d for i, d in enumerate(docs) if i not in excluded]
+    assert first_pass({0, 1, 2, 3}, batch_size=4)[0] == "004"  # a fully excluded batch is skipped
+    with pytest.raises(ValueError, match="validation split"):
+        next(dataloader._document_batches("train", None, 4, data_dir=str(tmp_path), exclude_rows={1}))
+    with pytest.raises(ValueError, match="fixed order"):
+        next(dataloader._document_batches("val", None, 4, data_dir=str(tmp_path), shuffle_seed=0, exclude_rows={1}))

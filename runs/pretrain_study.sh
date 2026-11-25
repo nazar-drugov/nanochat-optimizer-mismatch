@@ -7,20 +7,26 @@ Run this script from the repository directory. Data preparation (`download`,
 A training run reads the existing FineWeb-Edu files on scratch; `train` never
 downloads them again.
 
-Before the learning-rate sweep, check D0 on an allocated two-GPU node with a
-one-step run. Use a fresh name (or change the suffix if you repeat the test):
+Before the learning-rate sweep, check the evaluation data on an allocated GPU
+node with a one-step run. Use a fresh name (or change the suffix if you repeat it):
 
-  RUN_NAME=d0-check-s42 bash runs/pretrain_study.sh train \
+  NPROC_PER_NODE=1 RUN_NAME=eval-check-s42 bash runs/pretrain_study.sh train \
       --depth=10 --ffn-type=moe --n-experts=8 \
       --optimizer-name=muon --muon-matrix-lr=0.004 \
       --train-tokens=262144 --warmup-steps=0 --eval-every=1 \
-      --eval-tokens=131072 --core-metric-every=-1 --sample-every=-1 --seed=42
+      --eval-tokens=131072 --heldout-eval-tokens=131072 \
+      --core-metric-every=-1 --sample-every=-1 --seed=42
 
-This one-step test evaluates D0 at steps 0 and 1, writes a checkpoint, and
-logs to <scratch>/logs/d0-check-s42.log. Check for two finite "Validation bpb"
-lines, then inspect <scratch>/base_checkpoints/d0-check-s42/config.json for
-data.val_data_file ending in /d0.parquet and its val_data_sha256. This test
-does not select a learning rate.
+This one-step test evaluates the validation shard and D0 at steps 0 and 1,
+writes a checkpoint, and logs to <scratch>/logs/eval-check-s42.log. Check for
+two finite "Validation bpb" and two "Held-out bpb" lines, then inspect
+<scratch>/base_checkpoints/eval-check-s42/config.json: data.val_data_file ends
+in /shard_01822.parquet, data.heldout_data_file in /d0.parquet, and
+data.val_excluded_heldout_rows is the number of D0 documents (validation skips
+them). This test does not select a learning rate.
+
+The E = 8 sweep and base models are run as Slurm jobs written by
+`python -m scripts.pretrain_sweep` (see PRETRAINING_PROTOCOL.md).
 
 To start a run, first get an allocated GPU node. In that node's shell:
 
@@ -28,7 +34,7 @@ To start a run, first get an allocated GPU node. In that node's shell:
   RUN_NAME=moe-e8-muon-s42 bash runs/pretrain_study.sh dry-run \
       --depth=10 --ffn-type=moe --n-experts=8 \
       --optimizer-name=muon --muon-matrix-lr=0.004 \
-      --train-tokens=3000238080 --eval-tokens=1048576 \
+      --train-tokens=3000238080 \
       --core-metric-every=-1 --sample-every=-1 --save-every=1000 --seed=42
 
 `dry-run` prints the command and paths without starting training. Review it,
@@ -36,8 +42,8 @@ then run the same command with `train` instead of `dry-run`. Give each new run
 a unique RUN_NAME. To use AdamW, replace the Muon options with
 `--optimizer-name=adamw --adamw-matrix-lr=<chosen_rate>`. Change the expert
 count or token budget with their flags. This example uses a provisional learning
-rate. The launcher evaluates D0 from scratch and records its SHA-256 in every
-run. Finish the short GPU validation test before the learning-rate sweep.
+rate. The launcher evaluates the validation shard and D0 from scratch and
+records their SHA-256 in every run. Finish the short GPU validation test before the learning-rate sweep.
 
 WHAT THE EXAMPLE RUN USES (including defaults from scripts/base_train.py):
 
@@ -53,9 +59,12 @@ WHAT THE EXAMPLE RUN USES (including defaults from scripts/base_train.py):
                   two microbatches are accumulated per update. Linear LR warmup
                   over 130M tokens, then constant, then linear decay over the
                   final 20% of updates. Seed 42.
-  Validation:     Bits per byte every 250 updates on D0 (`d0.parquet`), using
-                  1,048,576 model input tokens per evaluation. The same fixed
-                  subset is revisited each time. CORE benchmark and text
+  Validation:     Bits per byte every 250 updates on the validation shard
+                  (`shard_01822.parquet`, without D0's documents), using
+                  10,485,760 model input tokens per evaluation; LRs are chosen
+                  on it. D0 (`d0.parquet`) is evaluated at the same steps on
+                  1,048,576 tokens and only logged (heldout/bpb). The same fixed
+                  subsets are revisited each time. CORE benchmark and text
                   sampling are disabled in this example.
   Outputs:        Checkpoints and resolved config.json:
                     <scratch>/base_checkpoints/<RUN_NAME>/
@@ -65,7 +74,7 @@ WHAT THE EXAMPLE RUN USES (including defaults from scripts/base_train.py):
                   `<scratch>` is printed by `bash runs/pretrain_study.sh paths`.
 
 Only `--depth`, `--ffn-type`, `--n-experts`, `--optimizer-name`,
-`--muon-matrix-lr`, `--train-tokens`, `--eval-tokens`,
+`--muon-matrix-lr`, `--train-tokens`,
 `--core-metric-every`, `--sample-every`, `--save-every`, and `--seed` are
 explicit in the example. The other values above are current Python defaults,
 not settings imposed by this launcher. `dry-run` prints the launch command but
@@ -246,7 +255,7 @@ case "$mode" in
         is_resume=false
         for arg in "$@"; do
             case "$arg" in
-                --run|--run=*|--data-dir|--data-dir=*|--val-data-dir|--val-data-dir=*|--train-stats-jsonl|--train-stats-jsonl=*)
+                --run|--run=*|--data-dir|--data-dir=*|--val-data-dir|--val-data-dir=*|--heldout-data-dir|--heldout-data-dir=*|--train-stats-jsonl|--train-stats-jsonl=*)
                     echo "$arg is set by this launcher; remove it from the base_train arguments." >&2
                     exit 2
                     ;;
@@ -259,10 +268,12 @@ case "$mode" in
             echo "Pass an explicit --train-tokens value from the pretraining protocol." >&2
             exit 2
         fi
-        # D0 has about 2M raw tokens. Use 1M model input tokens by default;
-        # the data loader may discard some raw tokens when packing batches.
-        # A caller can override this count for a short test.
-        eval_token_args=(--eval-tokens=1048576)
+        # Validation (used for LR selection) reads the held-out validation shard,
+        # shard_01822.parquet, the last file in the data directory: 10M model input
+        # tokens by default. D0 is evaluated next to it and only logged
+        # (--heldout-eval-tokens, default 1M of its ~2M raw tokens). A caller can
+        # override --eval-tokens for a short test.
+        eval_token_args=(--eval-tokens=10485760)
         if [[ "$has_eval_tokens" == true ]]; then
             eval_token_args=()
         fi
@@ -279,7 +290,7 @@ case "$mode" in
         # "$@" come from the caller; the final path arguments are fixed here.
         cmd=("$TORCHRUN" --standalone "--nproc_per_node=$NPROC_PER_NODE" -m scripts.base_train
              "${eval_token_args[@]}" "$@" "--run=$RUN_NAME" "--data-dir=$DATA_DIR"
-             "--val-data-dir=$HELDOUT_DIR" "--train-stats-jsonl=$stats_file")
+             "--heldout-data-dir=$HELDOUT_DIR" "--train-stats-jsonl=$stats_file")
         if [[ "$mode" == dry-run ]]; then
             # Preview only: do not run torchrun or check that data exists.
             printf 'NANOCHAT_BASE_DIR=%s\nWANDB_DIR=%s\nTIKTOKEN_CACHE_DIR=%s\n' \
@@ -302,7 +313,7 @@ case "$mode" in
         # the data loader treats every file except the last as training data.
         # `find -L` follows symbolic links, as the Python data loader does.
         if ! diff_output="$(diff <(awk '{print $2}' "$MANIFEST_DIR/shards.sha256" | LC_ALL=C sort) \
-                                 <(find -L "$DATA_DIR" -maxdepth 1 -name '*.parquet' -printf '%f\n' | LC_ALL=C sort))"; then
+                                 <(find -L "$DATA_DIR" -maxdepth 1 -name '*.parquet' -exec basename {} \; | LC_ALL=C sort))"; then
             echo "The Parquet files in $DATA_DIR do not match the data manifest" >&2
             echo "(< = in the manifest but missing here, > = here but not in the manifest):" >&2
             echo "$diff_output" >&2
@@ -334,7 +345,8 @@ case "$mode" in
         printf '\n=== %s run %s ===\n' "$(date -Is)" "$RUN_NAME" | tee -a "$log_file"
         # Show stdout/stderr in the terminal and append it to the run log.
         # The Python program performs optimizer steps, periodic validation,
-        # and checkpoint writes. Validation reads D0 via --val-data-dir.
+        # and checkpoint writes. Validation reads the validation shard; D0 is
+        # evaluated alongside it via --heldout-data-dir and only logged.
         # W&B can use the network, and enabled CORE evaluation may fetch its
         # benchmark bundle, but neither operation downloads FineWeb-Edu again.
         "${cmd[@]}" 2>&1 | tee -a "$log_file"

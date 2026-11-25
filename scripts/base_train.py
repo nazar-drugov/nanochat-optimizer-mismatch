@@ -20,11 +20,12 @@ import gc
 import json
 import time
 import argparse
-import hashlib
+import math
 from dataclasses import asdict
 
 import wandb
 import torch
+import pyarrow.parquet as pq
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, make_gpt_config, resolve_moe_dispatch
@@ -39,7 +40,7 @@ from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_ro
 from nanochat.training_stats import accumulate_router_stats, expert_gradient_squared_norms, add_router_log_fields, write_train_stats_jsonl, update_batch_fingerprint
 from nanochat.train_config import (
     add_moe_args, add_optimizer_args, resolve_optimizer_args, resolve_moe_args,
-    muon_momentum_at, wsd_lr_multiplier, write_run_record, tokenizer_identity,
+    muon_momentum_at, wsd_lr_multiplier, write_run_record, tokenizer_identity, file_sha256, write_json_atomic,
 )
 from nanochat.dataset import resolve_data_dir, list_parquet_files, list_split_files
 from nanochat.loss_eval import evaluate_bpb
@@ -73,7 +74,12 @@ parser.add_argument("--tokenizer", choices=TOKENIZERS, default="gpt2",
 parser.add_argument("--dataset", type=str, default=None, help="pretraining dataset name (default: the registry default, FineWeb-Edu-100B)")
 parser.add_argument("--data-dir", type=str, default=None, help="directory of nanochat-format parquet shards (overrides --dataset)")
 parser.add_argument("--val-data-dir", type=str, default=None,
-                    help="directory containing one validation parquet (e.g. D0); default: last shard in --data-dir")
+                    help="directory containing one validation parquet; default: last shard in --data-dir (the "
+                         "held-out validation shard, used for LR selection)")
+parser.add_argument("--heldout-data-dir", type=str, default=None,
+                    help="directory containing one held-out parquet (D0). Evaluated and logged next to validation "
+                         "as heldout/bpb, never used for selection")
+parser.add_argument("--heldout-eval-tokens", type=int, default=1_048_576, help="tokens per held-out evaluation")
 # Training horizon
 parser.add_argument("--train-tokens", type=int, required=True, help="total number of training tokens")
 # Optimization
@@ -129,11 +135,27 @@ if not val_files or (args.val_data_dir and len(val_files) != 1):
     parser.error(f"Validation directory {val_data_dir} must contain "
                  + ("exactly one" if args.val_data_dir else "at least one") + " parquet file")
 val_data_file = val_files[-1]
-val_sha256 = hashlib.sha256()
-with open(val_data_file, "rb") as val_file:
-    for chunk in iter(lambda: val_file.read(1024 * 1024), b""):
-        val_sha256.update(chunk)
-val_data_sha256 = val_sha256.hexdigest()
+val_data_sha256 = file_sha256(val_data_file)
+heldout_data_dir = heldout_data_file = heldout_data_sha256 = None
+if args.heldout_data_dir:
+    heldout_data_dir = resolve_data_dir(data_dir=args.heldout_data_dir)
+    try:
+        heldout_files = list_parquet_files(heldout_data_dir)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    if len(heldout_files) != 1:
+        parser.error(f"Held-out directory {heldout_data_dir} must contain exactly one parquet file")
+    heldout_data_file = heldout_files[0]
+    heldout_data_sha256 = file_sha256(heldout_data_file)
+# D0 is sampled from the validation shard. Validation (used for LR selection) skips
+# the documents D0 took from it, so the two sets are disjoint.
+val_exclude_rows = None
+if heldout_data_file:
+    heldout_columns = set(pq.ParquetFile(heldout_data_file).schema_arrow.names)
+    if {"source_shard", "row_index"} <= heldout_columns:
+        rows = pq.read_table(heldout_data_file, columns=["source_shard", "row_index"]).to_pydict()
+        val_name = os.path.basename(val_data_file)
+        val_exclude_rows = frozenset(int(r) for shard, r in zip(rows["source_shard"], rows["row_index"]) if shard == val_name)
 # Names and sizes of the training shards, saved in checkpoints so a resumed run
 # can detect added, removed or changed shards (the saved data position is only
 # "file number, row group" and is meaningless for different files).
@@ -178,8 +200,15 @@ eval_batch_tokens = args.device_batch_size * args.max_seq_len * ddp_world_size
 if args.eval_every > 0 and (args.eval_tokens < eval_batch_tokens or args.eval_tokens % eval_batch_tokens):
     parser.error(f"--eval-tokens must be a positive multiple of {eval_batch_tokens} "
                  "(device batch size × sequence length × world size)")
+if args.eval_every > 0 and heldout_data_file and (args.heldout_eval_tokens < eval_batch_tokens
+                                                  or args.heldout_eval_tokens % eval_batch_tokens):
+    parser.error(f"--heldout-eval-tokens must be a positive multiple of {eval_batch_tokens} "
+                 "(device batch size × sequence length × world size)")
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 print0(f"Validation data: {val_data_file} (SHA-256 {val_data_sha256})")
+if heldout_data_file:
+    print0(f"Held-out data (logged only): {heldout_data_file} (SHA-256 {heldout_data_sha256})")
+    print0(f"Validation skips {len(val_exclude_rows or ())} documents that the held-out set took from it")
 
 # wandb logging init
 wandb_run = (
@@ -259,6 +288,8 @@ if resuming:
         raise ValueError("Checkpoint has no validation SHA-256; refusing to resume with --val-data-dir")
     if saved_val_sha256 is not None and (saved_val_sha256 != val_data_sha256 or meta_data.get("val_data_file") != val_data_file):
         raise ValueError("Validation file or SHA-256 differs from the checkpoint; refusing to resume")
+    if (meta_data.get("heldout_data_file"), meta_data.get("heldout_data_sha256")) != (heldout_data_file, heldout_data_sha256):
+        raise ValueError("Held-out file or SHA-256 differs from the checkpoint; refusing to resume")
     patch_missing_expert_bias(model, model_data)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -293,6 +324,9 @@ if master_process:
         device_type=device_type, world_size=ddp_world_size, compute_dtype=COMPUTE_DTYPE,
         data={"train_data_dir": data_dir, "train_shards": train_shards, "val_data_dir": val_data_dir,
               "val_data_file": val_data_file, "val_data_sha256": val_data_sha256,
+              "heldout_data_dir": heldout_data_dir, "heldout_data_file": heldout_data_file,
+              "heldout_data_sha256": heldout_data_sha256,
+              "val_excluded_heldout_rows": len(val_exclude_rows or ()),
               "tokenizer_name": args.tokenizer,
               "tokenizer": tokenizer_id},
         extra={"experiment_name": experiment_name, "stage": "pretrain", "num_iterations": num_iterations, "moe_dispatch_resolved": moe_dispatch},
@@ -308,7 +342,8 @@ if scaler is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=data_dir)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=val_data_dir)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=val_data_dir, exclude_rows=val_exclude_rows)
+build_heldout_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, data_dir=heldout_data_dir)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # Learning rate schedule (linear warmup, constant, linear decay over the last warmdown_ratio)
@@ -343,6 +378,7 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    loop_state = {}
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -350,6 +386,18 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+# For result.json and the divergence stop (older checkpoints lack these fields)
+heldout_bpb = meta_data.get("heldout_bpb") if resuming else None
+eval_history = list(loop_state.get("eval_history", []))
+first_train_loss = loop_state.get("first_train_loss")  # training loss at step 0
+clipped_steps = torch.tensor(loop_state.get("clipped_steps", 0), dtype=torch.long, device=device)
+clipped_steps_after_warmup = torch.tensor(loop_state.get("clipped_steps_after_warmup", 0), dtype=torch.long, device=device)
+diverged_reason = None
+diverged_after_step = False  # True if the step that diverged was taken (a training-loss stop)
+debiased_smooth_loss = None
+# A run has diverged when its training loss is not finite, or rises more than this
+# many nats above its step-0 loss after warmup (a working run falls far below it).
+DIVERGENCE_MARGIN_NATS = 1.0
 
 # Rank 0 owns the fixed probe and its snapshots. On resume, reload the exact
 # tokens used by the checkpoint rather than drawing a fresh validation batch.
@@ -387,13 +435,25 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        eval_log = {
             "step": step,
             "tokens_seen": tokens_seen,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        eval_entry = {"step": step, "val_bpb": val_bpb}
+        if heldout_data_file:
+            heldout_steps = args.heldout_eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+            heldout_bpb = evaluate_bpb(model, build_heldout_loader(), heldout_steps, token_bytes)
+            print0(f"Step {step:05d} | Held-out bpb: {heldout_bpb:.6f}")
+            eval_log["heldout/bpb"] = eval_entry["heldout_bpb"] = heldout_bpb
+        eval_history.append(eval_entry)
+        wandb_run.log(eval_log)
         model.train()
+        if not math.isfinite(val_bpb):
+            diverged_reason = f"validation bpb is {val_bpb} at step {step}"
+            print0(f"Stopping: {diverged_reason}")
+            break
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -459,6 +519,9 @@ while True:
                 "val_data_dir": val_data_dir,
                 "val_data_file": val_data_file,
                 "val_data_sha256": val_data_sha256,
+                "heldout_data_file": heldout_data_file,
+                "heldout_data_sha256": heldout_data_sha256,
+                "heldout_bpb": heldout_bpb,
                 "parameter_counts": parameter_counts,
                 "cumulative_expert_counts": None if cumulative_expert_counts is None else cumulative_expert_counts.cpu().tolist(),
                 "data_fingerprints": data_fingerprints,  # per rank, over all batches trained so far
@@ -473,6 +536,10 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "eval_history": eval_history,
+                    "first_train_loss": first_train_loss,
+                    "clipped_steps": int(clipped_steps.item()),
+                    "clipped_steps_after_warmup": int(clipped_steps_after_warmup.item()),
                 },
             },
             rank=ddp_rank,
@@ -573,6 +640,25 @@ while True:
         cumulative_expert_counts += step_expert_counts
         orig_model.update_expert_bias(step_expert_counts)
     train_loss_f = metrics_sums["total"].item() # .item() is a CPU-GPU sync point
+    if optimizer.last_clip_coef is not None:  # counted on device: no extra sync
+        clipped = (optimizer.last_clip_coef < 1).long()
+        clipped_steps += clipped
+        if step >= args.warmup_steps:
+            clipped_steps_after_warmup += clipped
+    if first_train_loss is None:
+        first_train_loss = train_loss_f
+    diverged = not math.isfinite(train_loss_f) or (
+        step >= args.warmup_steps and train_loss_f > first_train_loss + DIVERGENCE_MARGIN_NATS)
+    if is_ddp_initialized():  # every rank must stop at the same step
+        diverged_flag = torch.tensor(float(diverged), device=device)
+        dist.all_reduce(diverged_flag, op=dist.ReduceOp.MAX)
+        diverged = diverged_flag.item() > 0
+    if diverged:
+        diverged_reason = (f"training loss {train_loss_f} at step {step} (step-0 loss {first_train_loss}, "
+                           f"limit +{DIVERGENCE_MARGIN_NATS} nats after warmup)")
+        print0(f"Stopping: run diverged: {diverged_reason}")
+        diverged_after_step = True
+        break
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -653,6 +739,44 @@ wandb_run.log({
     "total_training_time": total_training_time,
     "train/peak_memory_mib": peak_memory_mib,
 })
+
+# result.json: the run's outcome in one small file, read by scripts/pretrain_sweep.py.
+# A diverged run stops early (no final evaluation or checkpoint) and still exits 0,
+# so a job that runs several sweep points continues with the next one.
+if master_process:
+    completed = diverged_reason is None
+    steps_trained = step + (1 if diverged_after_step else 0)  # the step that diverged was still taken
+    clipped_total = int(clipped_steps.item())
+    clipped_after = int(clipped_steps_after_warmup.item())
+    write_json_atomic(os.path.join(checkpoint_dir, "result.json"), {
+        "status": "completed" if completed else "diverged",
+        "diverged_reason": diverged_reason,
+        "run": experiment_name,
+        "steps_trained": steps_trained,
+        "num_iterations": num_iterations,
+        "tokens_trained": steps_trained * total_batch_size,
+        "final_val_bpb": val_bpb if completed else None,
+        "min_val_bpb": min_val_bpb if math.isfinite(min_val_bpb) else None,
+        "final_heldout_bpb": heldout_bpb if completed else None,
+        "eval_history": eval_history,
+        "final_train_loss": debiased_smooth_loss,
+        "first_train_loss": first_train_loss,
+        "clipped_steps": clipped_total,
+        "clipped_fraction": clipped_total / max(steps_trained, 1),
+        "clipped_fraction_after_warmup": clipped_after / max(steps_trained - args.warmup_steps, 1),
+        "total_training_time_s": total_training_time,
+        "peak_memory_mib": peak_memory_mib,
+        "settings": {
+            "optimizer_name": args.optimizer_name,
+            "matrix_lr": optimizer_kwargs["muon_matrix_lr" if args.optimizer_name == "muon" else "adamw_matrix_lr"],
+            "ffn_type": args.ffn_type, "n_experts": args.n_experts, "depth": args.depth, "seed": args.seed,
+            "total_batch_size": total_batch_size, "train_tokens": total_tokens,
+            "warmup_steps": args.warmup_steps, "warmdown_ratio": args.warmdown_ratio,
+            "weight_decay": args.weight_decay, "max_grad_norm": optimizer_kwargs["max_grad_norm"],
+        },
+        "val_data_file": val_data_file,
+        "heldout_data_file": heldout_data_file,
+    })
 
 # cleanup
 wandb_run.finish() # wandb run finish

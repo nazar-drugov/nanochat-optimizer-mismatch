@@ -218,3 +218,60 @@ def test_resume_rejects_changed_training_data_and_tokenizer(env, tmp_path):
     meta_path.write_text(json.dumps(saved))
     assert f"Tokenizer files differ from the checkpoint's for tokenizer 'gpt2': {changed_file}" in resume_error()
     meta_path.write_text(original_meta)
+
+
+def make_heldout_from_val(env, directory, rows):
+    """A D0-like file: documents of the validation shard with their row indices, as make_heldout writes it."""
+    texts = pq.read_table(env["data"] / "shard_00002.parquet", columns=["text"]).column("text").to_pylist()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "d0.parquet"
+    pq.write_table(pa.table({"text": [texts[r] for r in rows], "source_shard": ["shard_00002.parquet"] * len(rows),
+                             "row_index": list(rows)}), path, row_group_size=50)
+    return path
+
+
+def test_heldout_is_logged_validation_skips_its_documents_and_result_json_is_written(env, tmp_path):
+    d0 = make_heldout_from_val(env, tmp_path / "heldout", range(0, 400, 2))  # every other validation document
+    heldout_args = ("--optimizer-name", "adamw", "--heldout-data-dir", str(d0.parent), "--heldout-eval-tokens", "256")
+    ckpt = run_base_train(env, "smoke-heldout", *heldout_args)
+    data = json.loads((ckpt / "config.json").read_text())["data"]
+    assert data["val_data_file"].endswith("shard_00002.parquet")  # validation = the validation shard
+    assert data["heldout_data_file"] == str(d0)
+    assert data["heldout_data_sha256"] == hashlib.sha256(d0.read_bytes()).hexdigest()
+    assert data["val_excluded_heldout_rows"] == 200
+    m = meta(ckpt, 8)
+    assert m["heldout_data_sha256"] == data["heldout_data_sha256"] and 0 < m["heldout_bpb"] < float("inf")
+
+    result = json.loads((ckpt / "result.json").read_text())
+    assert result["status"] == "completed" and result["diverged_reason"] is None
+    assert result["steps_trained"] == 8 and result["tokens_trained"] == TRAIN_TOKENS
+    assert [e["step"] for e in result["eval_history"]] == [0, 4, 8]
+    assert all(0 < e["val_bpb"] < float("inf") and 0 < e["heldout_bpb"] < float("inf") for e in result["eval_history"])
+    assert result["final_val_bpb"] == m["val_bpb"] == result["eval_history"][-1]["val_bpb"]
+    assert result["final_heldout_bpb"] == m["heldout_bpb"]
+    assert result["settings"]["optimizer_name"] == "adamw" and result["settings"]["matrix_lr"] == 2e-3
+    assert result["settings"]["warmup_steps"] == 1 and result["settings"]["max_grad_norm"] == 1.0
+    records = [json.loads(line) for line in (env["base"] / "smoke-heldout.jsonl").read_text().splitlines()]
+    assert result["clipped_steps"] == sum(r["train/grad_clip_coef"] < 1 for r in records)
+    assert result["clipped_fraction"] == result["clipped_steps"] / 8
+
+    # Without D0 nothing is excluded, so the same model at step 0 scores different validation documents
+    plain = run_base_train(env, "smoke-no-heldout", "--optimizer-name", "adamw")
+    plain_result = json.loads((plain / "result.json").read_text())
+    assert plain_result["final_heldout_bpb"] is None and "heldout_bpb" not in plain_result["eval_history"][0]
+    assert plain_result["eval_history"][0]["val_bpb"] != result["eval_history"][0]["val_bpb"]
+
+    # A changed D0 must not silently replace the held-out set on resume
+    make_heldout_from_val(env, tmp_path / "heldout", range(1, 400, 2))
+    cmd = base_train_cmd(env, "smoke-heldout", *heldout_args, "--resume-from-step", "4")
+    resumed = subprocess.run(cmd, cwd=REPO_ROOT, env=env["environ"], capture_output=True, text=True, timeout=900)
+    assert resumed.returncode != 0 and "Held-out file or SHA-256 differs" in resumed.stderr
+
+
+def test_a_diverging_run_stops_early_and_records_it(env):
+    ckpt = run_base_train(env, "smoke-diverge", "--optimizer-name", "adamw", "--grad-clip", "0",
+                          "--adamw-matrix-lr", "10", "--embedding-lr", "1000", "--unembedding-lr", "1000")
+    result = json.loads((ckpt / "result.json").read_text())  # run_base_train already checked exit code 0
+    assert result["status"] == "diverged" and "training loss" in result["diverged_reason"]
+    assert result["steps_trained"] < 8 and result["final_val_bpb"] is None
+    assert not (ckpt / "model_000008.pt").exists()  # no final checkpoint for a diverged run

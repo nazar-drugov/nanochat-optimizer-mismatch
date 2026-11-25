@@ -107,3 +107,21 @@ def test_dry_run_does_not_check_the_data(setup):
     result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT, env=setup["environ"],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "Command:" in result.stdout
+
+
+def test_validation_uses_the_validation_shard_and_d0_is_only_logged(setup):
+    result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT, env=setup["environ"],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0
+    command = result.stdout.split("Command:", 1)[1]
+    heldout = setup["data"].parent / "heldout" / "fineweb-edu-100b"
+    assert f"--heldout-data-dir={heldout}" in command
+    assert "--val-data-dir" not in command  # base_train then validates on the last shard, shard_01822
+    assert "--eval-tokens=10485760" in command
+
+
+@pytest.mark.parametrize("flag", ["--heldout-data-dir=/elsewhere", "--val-data-dir=/elsewhere"])
+def test_callers_cannot_redirect_validation_or_heldout(setup, flag):
+    result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1", flag], cwd=REPO_ROOT,
+                            env=setup["environ"], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 2 and "is set by this launcher" in result.stderr

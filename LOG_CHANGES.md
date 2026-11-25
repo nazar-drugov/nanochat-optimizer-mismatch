@@ -369,3 +369,14 @@ Found by running the full suite and a short CUDA `base_train` on an RTX 5080 (sm
 
   On the 5080 `torch._grouped_mm` has no native kernel and falls back to one GEMM per expert with a host sync per call, which accounts for the remaining E=1 gap (GPU time equals dense). The B200 numbers need the cluster run.
 - **Found while testing:** GPU training is not bitwise reproducible with either dispatch (two identical runs differ after a few steps); the data stream is identical.
+
+## E = 8 sweep and base-model infrastructure (2026-11-24)
+
+Decisions in `PRETRAINING_PROTOCOL.md`: λ = 0.1 for both optimizers (option A), AdamW (0.9, 0.95, 1e-8), clipping 1.0 in every cell, depth 10 and 3B tokens confirmed, E = 8 as the headline cell, LR selection on the held-out validation shard.
+
+- **Validation and D0** (`scripts/base_train.py`, `nanochat/dataloader.py`, `runs/pretrain_study.sh`): validation now reads the validation shard `shard_01822.parquet`, not D0. D0 is sampled from that shard, so validation skips the rows D0 took (`exclude_rows`, matched by D0's `source_shard`/`row_index`); `config.json` records how many. D0 is evaluated alongside via `--heldout-data-dir` / `--heldout-eval-tokens` (logged as `heldout/bpb`, stored in checkpoints, SHA-256 checked on resume) and never used for selection. The launcher passes D0 that way and defaults `--eval-tokens` to 10,485,760.
+- **`result.json`** at the end of every run: status, steps and tokens trained, final and minimum validation bpb, final D0 bpb, the evaluation curve, step-0 and final training loss, clipped-step counts and fractions (counted on the GPU, no extra sync), wall time, peak memory and the resolved settings. The evaluation curve and clip counts survive resume.
+- **Divergence stop:** a run whose training loss is non-finite, or more than 1 nat above its step-0 loss after warmup, or whose validation bpb is non-finite, stops, writes `result.json` with status `diverged` and exits 0, so a job running several sweep points continues.
+- **Sweep plan and jobs** (`nanochat/pretrain_sweep.py`, `scripts/pretrain_sweep.py`): the six E = 8 sweep runs (0.5B tokens, 83-step warmup), LR selection (parabola vertex in log2 LR through the best point and its neighbours; one more point if the best is at an edge; × 0.5635 for 3B), the 3B base-model runs (checkpoints every 1,526 steps) and Slurm job scripts for one B200 per run that skip finished runs and continue past failures.
+- **Launcher portability:** the shard-list check no longer uses GNU-only `find -printf`, so the launcher tests also pass on macOS.
+- **Tests:** `tests/test_pretrain_sweep.py` (plan, selection, job scripts against a fake launcher, the command line end to end), validation row exclusion in `tests/test_dataloader_data_dir.py`, D0 logging / exclusion / `result.json` / resume check and the divergence stop in `tests/test_base_train_smoke.py`, launcher arguments in `tests/test_pretrain_study_launcher.py`.
