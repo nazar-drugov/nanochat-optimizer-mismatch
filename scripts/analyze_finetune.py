@@ -10,6 +10,7 @@ import csv
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib
@@ -22,6 +23,9 @@ from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS
 BASES = ("e8-main-adamw-s42", "e8-main-muon-s42")
 OPTS = ("adamw", "muon")
 ROUTER = ("flip_rate", "maxvio", "tv", "churn", "flip_rate_normalized")
+PACKINGS = ("bestfit", "contiguous")
+LEGACY_PACKING = "contiguous"  # runs written before the packing field existed used contiguous rows
+EVAL_IDENTITY_FIELDS = ("sha256", "scored_tokens", "rows", "seq_len", "documents")
 
 
 def check(ok, message):
@@ -97,10 +101,11 @@ def load_runs(roots, dataset, steps, seeds):
                 runs.append(Run(path.parent, base, ft, int(seed), float(lr), steps, curve, config,
                                 result.get("data_fingerprint")))
     check(runs, f"no completed runs for {dataset}, {steps} steps")
+    eval_packing(runs)
     for d in ("D0", "D1"):
-        identities = {(r.config["data"]["eval_sets"][d]["sha256"],
-                       r.config["data"]["eval_sets"][d]["scored_tokens"]) for r in runs}
-        check(len(identities) == 1, f"{d} evaluation set differs across runs")
+        identities = {tuple(eval_identity(r, d).get(field) for field in EVAL_IDENTITY_FIELDS) for r in runs}
+        check(len(identities) == 1, f"{d} evaluation set differs across runs "
+                                    f"(compared {', '.join(EVAL_IDENTITY_FIELDS)}, packing)")
     check(len({r.config["args"]["total_batch_size"] for r in runs}) == 1,
           "batch sizes differ across runs")
     train_sets = {json.dumps(r.config["data"].get("ft_train_files"), sort_keys=True) for r in runs}
@@ -185,6 +190,67 @@ def router_at(run, match):
     return result
 
 
+def eval_identity(run, d):
+    identity = run.config.get("data", {}).get("eval_sets", {}).get(d)
+    check(isinstance(identity, dict), f"missing {d} evaluation-set identity in config: {run.path}")
+    return identity
+
+
+def run_packing(run):
+    """(packing, legacy) of one run; a missing field means the original contiguous packing."""
+    found, legacy = set(), False
+    for d in ("D0", "D1"):
+        value = eval_identity(run, d).get("packing")
+        if value is None:
+            value, legacy = LEGACY_PACKING, True
+        check(value in PACKINGS, f"unknown evaluation packing {value!r} for {d}: {run.path}")
+        found.add(value)
+    check(len(found) == 1, f"D0 and D1 use different evaluation packings: {run.path}")
+    return found.pop(), legacy
+
+
+def eval_packing(runs):
+    """The one evaluation packing shared by all runs, plus how many runs lack the field."""
+    info = [(r, *run_packing(r)) for r in runs]
+    packings = sorted({packing for _, packing, _ in info})
+    if len(packings) > 1:
+        legacy = [r for r, _, is_legacy in info if is_legacy]
+        counts = ", ".join(f"{p}: {sum(1 for _, q, _ in info if q == p)} runs" for p in packings)
+        if legacy:
+            raise ValueError(f"runs without a packing field (legacy {LEGACY_PACKING}, e.g. {legacy[0].path}) "
+                             f"cannot be combined with other packings ({counts})")
+        raise ValueError(f"evaluation packing differs across runs ({counts})")
+    return {"packing": packings[0], "runs_without_packing_field": sum(1 for _, _, is_legacy in info if is_legacy)}
+
+
+@lru_cache(maxsize=None)
+def check_eval_set_file(path, d, packing, sha256, n_docs, counts):
+    """Per-document checks against the saved evaluation set, when the file was copied with the run:
+    IDs inside [-1, n_docs), per-document scored counts equal the saved ones, and for best-fit sets
+    documents listed in file order and never split across rows."""
+    from nanochat.eval_set import EvalSet
+    es = EvalSet.load(path)
+    ids = es.doc_ids.numpy()
+    check(es.packing == packing, f"{path}: saved set packs {es.packing}, config says {packing}")
+    check(sha256 is None or es.source_sha256 == sha256, f"{path}: saved set was built from a different file")
+    check(es.n_docs == n_docs, f"{path}: {es.n_docs} documents in the set, {n_docs} in the saved arrays")
+    check(ids.shape == tuple(es.inputs.shape) and ids.min() >= -1 and ids.max() < n_docs,
+          f"{path}: document IDs outside [-1, {n_docs})")
+    scored = ids[ids >= 0]
+    if packing == "bestfit":
+        rows = es.doc_rows
+        check(rows is not None and len(rows) == n_docs and bool((rows[1:] > rows[:-1]).all()),
+              f"{path}: best-fit set needs doc_rows with one increasing file row per document")
+        row_of = np.broadcast_to(np.arange(ids.shape[0])[:, None], ids.shape)[ids >= 0]
+        first = np.full(n_docs, ids.shape[0]); last = np.full(n_docs, -1)
+        np.minimum.at(first, scored, row_of); np.maximum.at(last, scored, row_of)
+        used = last >= 0
+        check(np.array_equal(first[used], last[used]), f"{path}: a best-fit document is split across rows")
+    check(np.array_equal(np.bincount(scored, minlength=n_docs), np.array(counts)),
+          f"{path}: per-document scored counts differ from the saved arrays")
+    return True
+
+
 def doc_data(run):
     path = run.path.parent / "base" / "base_arrays.npz"
     check(path.is_file(), f"missing base arrays: {path}")
@@ -203,6 +269,18 @@ def doc_data(run):
     check(d0.shape[1] == len(count0) == len(base0) and d1.shape[1] == len(count1) == len(base1),
           f"per-document shape mismatch: {run.path}")
     check(count0.sum() > 0 and count1.sum() > 0, f"empty evaluation set: {run.path}")
+    for d, counts in (("D0", count0), ("D1", count1)):
+        identity = run.config.get("data", {}).get("eval_sets", {}).get(d)
+        if identity is None:
+            continue
+        check(identity.get("documents", len(counts)) == len(counts),
+              f"{d} has {len(counts)} documents in the arrays, {identity.get('documents')} in the config: {run.path}")
+        check(identity.get("scored_tokens", counts.sum()) == counts.sum(),
+              f"{d} scored tokens in the arrays differ from the config: {run.path}")
+        file = run.path.parent / "base" / f"eval_set_{d}.pt"
+        if file.is_file():
+            check_eval_set_file(str(file), d, run_packing(run)[0], identity.get("sha256"), len(counts),
+                                tuple(counts.astype(int)))
     l00, l01 = base0.sum()/count0.sum(), base1.sum()/count1.sum()
     for i, point in enumerate(run.curve):
         l10, l11 = d0[i].sum()/count0.sum(), d1[i].sum()/count1.sum()
@@ -462,7 +540,12 @@ def main(argv=None):
     write_csv(args.out / "matched_runs.csv", matches)
     write_csv(args.out / "router_layers.csv", router_rows)
     write_csv(args.out / "router_runs.csv", router_runs)
+    packing = eval_packing(runs)
     summary = {"dataset": args.dataset, "steps": args.steps, "seeds": args.seeds,
+               "eval_packing": packing["packing"],
+               "runs_without_packing_field": packing["runs_without_packing_field"],
+               "eval_sets": {d: {f: eval_identity(runs[0], d).get(f) for f in EVAL_IDENTITY_FIELDS}
+                             for d in ("D0", "D1")},
                "ell0": args.ell0, "common_learning_support": [0.0, support],
                "lr_selection": lr_rows, "edge_winners": [x for x in lr_rows if x["edge"]],
                "matched_runs": matches, "contrasts": contrasts, "bootstrap": uncertainty,
@@ -477,6 +560,9 @@ def main(argv=None):
     (args.out / "analysis.json").write_text(json.dumps(summary, indent=2, allow_nan=False)+"\n")
     make_plots(args.out, runs, lr_rows, selected, matches, router_rows, router_runs, args.ell0)
     print(f"Analyzed {len(runs)} runs; wrote {args.out}")
+    print(f"Evaluation packing: {packing['packing']}" +
+          (f" ({packing['runs_without_packing_field']} runs had no packing field: legacy)"
+           if packing["runs_without_packing_field"] else ""))
     print(f"Common D1-learning support: 0 to {support:.6g}")
     for row in lr_rows:
         if row["selected"]:

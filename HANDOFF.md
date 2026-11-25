@@ -21,7 +21,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Fine-tuning protocol | LR selection, checkpoints, length pilot **decided** 2026-11-25 (§4) |
 | Fine-tuning length pilot (StarCoderData) | **Restarted with the new evaluation**; hgo runs the mismatched pairs, Nazar the matched (§5) |
 | Fine-tuning main grid | Waits for the pilot (length, seeds) |
-| Analysis script | Not built |
+| Analysis script | **Built** (`scripts/analyze_finetune.py`, §6 step 6); needs all runs on one evaluation packing (best-fit) |
 | Other E (1, 4, 16) | Deferred until fine-tuning results |
 
 ## 2. Pretraining: design and results
@@ -170,6 +170,9 @@ pilot (all four pairs) is not assigned yet.
    `metrics.jsonl` for per-layer router fields because the current Parquet writer omits those fields.
    Pass `--root` twice for the split pilot: once for hgo's mismatched-pair output root and once for
    Nazar's matched-pair output root; the analyzer validates that they use the same data and seeds.
+   It also reads the evaluation `packing` of each run (`bestfit` default; a missing field means the
+   original `contiguous`), requires one packing and identical D0/D1 identity across all roots, and reports
+   the packing in its output and `analysis.json`; runs from before and after 0c86b24 cannot be mixed.
 7. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
    at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
 
