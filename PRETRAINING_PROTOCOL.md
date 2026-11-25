@@ -135,6 +135,12 @@ and 44 (held), seed 42 is run at 3B at ×0.5 and ×2 the transferred LR for both
 untransferred sweep LR); `scripts.pretrain_sweep transfer-check` fits the three points with the main run.
 If the 3B optimum is more than ~0.25 octave from the transferred LR, the base models are rerun at it.
 
+**Transfer check, first result (2026-11-25).** Muon: 3B optimum −0.06 octave from the transferred LR
+(implied exponent −0.34), so the transfer holds. AdamW: ×2 the transferred LR is best (0.9130 vs 0.9180
+at ×1, 0.9280 at ×0.5), so its 3B optimum is at least 1 octave above the transferred LR and at or above
+the 0.5B optimum: the −0.32 exponent does not hold for AdamW here. The check is extended to ×4 and ×8
+for AdamW before the AdamW base models are rerun; the rerun itself awaits confirmation.
+
 **Device batch stays 32 for the sweep and the base models (2026-11-24).** B200 benchmark
 (job 30414697, E = 8, 262,144 tokens per step): AdamW 425 ms/step at device batch 32 vs 386 ms
 at 64 (9% faster); Muon 385 vs 375 ms (3% faster); 64 fits (62 GB reserved). It is not adopted
