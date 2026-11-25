@@ -100,7 +100,7 @@ def main():
                     a_by_doc_pos[(doc, t - start)] = ls[r][t]  # position of the target within the document
 
     # B: the fine-tuning evaluation set (contiguous packing, file order)
-    es = build_eval_set("D0", args.d0_file, tokenizer, T, args.tokens)
+    es = build_eval_set("D0", args.d0_file, tokenizer, T, args.tokens, packing="contiguous")
     b_loss = torch.cat([row_losses(model, es.inputs[i:i + args.batch_size].to(device),
                                    es.targets[i:i + args.batch_size].to(device)).cpu()
                         for i in range(0, es.inputs.size(0), args.batch_size)])

@@ -21,8 +21,9 @@ def main():
     parser.add_argument("--dataset", choices=("wikitext103", "starcoderdata"), required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--raw-dir", default=None)
-    parser.add_argument("--wikitext-d1-tokens", type=int, default=1_100_000,
-                        help="WikiText D1 = validation + test + sampled training articles up to this many tokens")
+    parser.add_argument("--wikitext-d1-rows", type=int, default=512,
+                        help="WikiText D1 = validation + test + sampled training articles until the best-fit "
+                             "evaluation packing fills this many rows of 2,048 tokens")
     parser.add_argument("--starcoder-language", default="python", help="StarCoderData language directory")
     parser.add_argument("--starcoder-train-files", type=int, default=1,
                         help="StarCoderData parquet files used for training (python: ~0.4 GB each)")
@@ -31,7 +32,7 @@ def main():
     args = parser.parse_args()
     raw = args.raw_dir or str(Path(args.out) / "raw")
     if args.dataset == "wikitext103":
-        info = prepare_wikitext103(args.out, raw, d1_tokens=args.wikitext_d1_tokens)
+        info = prepare_wikitext103(args.out, raw, d1_rows=args.wikitext_d1_rows)
     else:
         info = prepare_starcoderdata(args.out, raw, language=args.starcoder_language,
                                      train_files=args.starcoder_train_files, val_docs=args.starcoder_val_docs)

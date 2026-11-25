@@ -434,6 +434,9 @@ def main(argv=None):
     parser.add_argument("--d0-file", required=True, help="held-out pretraining-distribution parquet (D0)")
     parser.add_argument("--eval-tokens", type=int, default=1_048_576, help="tokens scored per eval set (D0 and D1)")
     parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--eval-packing", choices=("bestfit", "contiguous"), default="bestfit",
+                        help="bestfit: the pretraining evaluation's rows, every token with its document's "
+                             "context (nanochat/eval_set.py); contiguous: the original stream packing")
     parser.add_argument("--lrs", nargs="+", required=True, help="matrix LR grid per optimizer, e.g. adamw=1e-4,2e-4 muon=2e-4")
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     parser.add_argument("--train-tokens", type=int, default=15_728_640, help="fine-tuning tokens per cell (spec: 10-20M)")
@@ -480,10 +483,11 @@ def main(argv=None):
     out_dir = Path(args.out_root or Path(get_base_dir()) / "finetune") / args.base_run / args.ft_name
     (out_dir / "base").mkdir(parents=True, exist_ok=True)
     ft_files = list_parquet_files(args.ft_data_dir)
-    d0 = build_eval_set("D0", args.d0_file, tokenizer, seq_len, args.eval_tokens)
-    d1 = build_eval_set("D1", ft_files[-1], tokenizer, seq_len, args.eval_tokens)
+    d0 = build_eval_set("D0", args.d0_file, tokenizer, seq_len, args.eval_tokens, packing=args.eval_packing)
+    d1 = build_eval_set("D1", ft_files[-1], tokenizer, seq_len, args.eval_tokens, packing=args.eval_packing)
     eval_identity = {s.name: {"file": s.source_file, "sha256": s.source_sha256, "rows": s.inputs.size(0),
-                              "seq_len": seq_len, "scored_tokens": s.n_scored, "documents": s.n_docs} for s in (d0, d1)}
+                              "seq_len": seq_len, "scored_tokens": s.n_scored, "documents": s.n_docs,
+                              "packing": s.packing} for s in (d0, d1)}
     for s in (d0, d1):
         s.save(out_dir / "base" / f"eval_set_{s.name}.pt")
 

@@ -66,8 +66,8 @@ def test_eval_set_is_fixed_and_tracks_documents(tmp_path):
     docs = ["abc", "defgh", "ij", "klmnopq", "rs"] * 4
     path = tmp_path / "d.parquet"
     pq.write_table(pa.table({"text": docs}), path, row_group_size=3)
-    a = build_eval_set("D0", path, TinyTokenizer(), seq_len=8, max_tokens=40)
-    b = build_eval_set("D0", path, TinyTokenizer(), seq_len=8, max_tokens=40)
+    a = build_eval_set("D0", path, TinyTokenizer(), seq_len=8, max_tokens=40, packing="contiguous")
+    b = build_eval_set("D0", path, TinyTokenizer(), seq_len=8, max_tokens=40, packing="contiguous")
     assert a.inputs.shape == (5, 8) and torch.equal(a.inputs, b.inputs) and torch.equal(a.doc_ids, b.doc_ids)
     assert torch.equal(a.inputs.view(-1)[1:], a.targets.view(-1)[:-1])  # one continuous stream
     assert ((a.targets == 0) == (a.doc_ids == -1)).all()  # BOS targets are exactly the unscored ones
@@ -294,11 +294,48 @@ def test_wikitext_d1_takes_all_official_articles_and_tops_up_from_training():
     official = [f"v{i} " * 10 for i in range(3)]              # 30 "tokens"
     train = [f"t{i} " * 10 for i in range(20)]
     count = lambda text: len(text.split())
-    d1, rest, moved, total = assemble_heldout(official, train, count, 75, seed=0)
+    enough = lambda lengths: sum(lengths) >= 75
+    d1, rest, moved, total = assemble_heldout(official, train, count, enough, seed=0, step=1)
     assert set(official) <= set(d1) and moved == 5 and total == 80 and len(d1) == 8
     assert len(rest) == 15 and not set(rest) & set(d1)        # moved articles leave training
     assert rest == [t for t in train if t not in d1]          # training keeps its order
-    assert d1 != official + [d for d in d1 if d not in official]  # shuffled
-    assert assemble_heldout(official, train, count, 75, seed=0)[0] == d1
+    assert assemble_heldout(official, train, count, enough, seed=0, step=1)[0] == d1
     with pytest.raises(ValueError):
-        assemble_heldout(official, train, count, 10_000, seed=0)
+        assemble_heldout(official, train, count, lambda lengths: False, seed=0)
+
+
+def test_bestfit_eval_set_reproduces_the_pretraining_loader_rows(tmp_path):
+    from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+    from nanochat.eval_set import bestfit_capacity
+    rng = random.Random(0)
+    docs = ["".join(rng.choice("abcdefghij") for _ in range(rng.randint(1, 40))) for _ in range(300)]
+    (tmp_path / "d").mkdir()
+    path = tmp_path / "d" / "val.parquet"
+    pq.write_table(pa.table({"text": docs}), path, row_group_size=50)
+    tok, seq_len, rows = TinyTokenizer(), 16, 40
+    es = build_eval_set("D0", path, tok, seq_len, rows * seq_len, buffer_size=20)
+    loader = tokenizing_distributed_data_loader_bos_bestfit(tok, 8, seq_len, split="val", device="cpu",
+                                                            data_dir=str(tmp_path / "d"), buffer_size=20)
+    batches = [tuple(t.clone() for t in next(loader)) for _ in range(rows // 8)]  # the loader reuses its buffers
+    ref_x, ref_y = map(torch.cat, zip(*batches))
+    assert torch.equal(es.inputs, ref_x) and torch.equal(es.targets, ref_y)
+    assert (es.inputs[:, 0] == 0).all()                      # every row starts with a BOS
+    assert ((es.targets == 0) == (es.doc_ids == -1)).all()   # BOS targets are exactly the unscored ones
+    # each scored target is the right token of its document, counted from the document's BOS
+    encoded = tok.encode(docs, prepend=0)
+    for r in range(rows):
+        start = None
+        for t in range(seq_len):
+            if es.inputs[r, t] == 0:
+                start = t
+            d = int(es.doc_ids[r, t])
+            if d >= 0:
+                assert int(es.targets[r, t]) == encoded[int(es.doc_rows[d])][t + 1 - start]
+    assert es.n_docs == int(es.doc_rows.numel()) and es.packing == "bestfit"
+    # capacity from lengths alone matches what the builder can do
+    capacity = bestfit_capacity([len(e) for e in encoded], seq_len + 1, buffer_size=20, row_group_size=50)
+    assert build_eval_set("D0", path, tok, seq_len, capacity * seq_len, buffer_size=20).inputs.size(0) == capacity
+    with pytest.raises(ValueError):
+        build_eval_set("D0", path, tok, seq_len, (capacity + 1) * seq_len, buffer_size=20)
+    es.save(tmp_path / "set.pt")
+    assert torch.equal(EvalSet.load(tmp_path / "set.pt").doc_rows, es.doc_rows)
