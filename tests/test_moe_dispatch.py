@@ -9,7 +9,7 @@ python -m pytest tests/test_moe_dispatch.py -v
 import pytest
 import torch
 
-from nanochat.gpt import GPT, GPTConfig, MoEMLP, resolve_moe_dispatch
+from nanochat.gpt import GPT, GROUPED_MM_ALIGN, GPTConfig, MoEMLP, grouped_segment_ends, resolve_moe_dispatch
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 needs_grouped_mm = pytest.mark.skipif(not hasattr(torch, "_grouped_mm"), reason="torch._grouped_mm unavailable")
@@ -76,6 +76,19 @@ def test_dispatch_resolution():
 
 # ---------------------------------------------------------------------------
 # Grouped == loop
+
+def test_grouped_segments_are_aligned_never_empty_and_fit_the_buffer():
+    """The native B200 grouped GEMM leaves the weight gradient of an empty group
+    uninitialized, so every expert's segment must have at least one aligned block."""
+    A = GROUPED_MM_ALIGN
+    for counts in ([17, 0, 33, 1, 15, 0, 33, 1], [100, 0, 0, 0], [0, 0, 0, 1], [16, 32, 48, 0], [64]):
+        counts = torch.tensor(counts)
+        ends, padded = grouped_segment_ends(counts, A)
+        starts = ends - padded
+        assert (padded >= A).all() and (padded % A == 0).all() and (starts % A == 0).all()
+        assert (padded >= counts).all() and ((padded - counts < A) | (counts == 0)).all()
+        assert ends[-1] <= counts.sum() + len(counts) * A  # fits the N + E*A buffer
+
 
 @needs_grouped_mm
 @pytest.mark.parametrize("device", DEVICES)

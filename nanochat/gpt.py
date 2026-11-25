@@ -63,6 +63,19 @@ MOE_DISPATCH = ("auto", "grouped", "loop")
 GROUPED_MM_ALIGN = 16  # each expert's segment starts at a multiple of this many rows
 
 
+def grouped_segment_ends(expert_counts, align=GROUPED_MM_ALIGN):
+    """End row of each expert's segment in the grouped-GEMM buffer.
+
+    Segment e holds count_e tokens padded with zero rows to a multiple of `align`, and
+    is never empty: an expert without tokens gets one block of `align` zero rows. On
+    B200 (sm_100), torch 2.9's native grouped GEMM does not write the weight gradient
+    of an empty group (it returns uninitialized memory instead of zeros). Every
+    segment fits in N + E * align rows.
+    """
+    padded = torch.clamp((expert_counts + align - 1) // align * align, min=align)
+    return torch.cumsum(padded, 0), padded
+
+
 def grouped_dispatch_supported(n_embd, dtype):
     """torch._grouped_mm needs bf16 operands and 16-byte aligned rows."""
     return hasattr(torch, "_grouped_mm") and dtype == torch.bfloat16 and n_embd % 8 == 0
@@ -328,11 +341,11 @@ class MoEMLP(nn.Module):
         flat_choices = router_choices.reshape(N)
         gate = router_probs.reshape(N, E).gather(1, flat_choices[:, None]) # (N, 1) fp32, carries the router gradient
         # Sort tokens by expert. Expert e's tokens go to rows [seg_start_e, seg_start_e + count_e)
-        # of a buffer with N + E*A rows, where every segment starts at a multiple of A.
+        # of a buffer with N + E*A rows, where every segment starts at a multiple of A and
+        # holds at least A rows (see grouped_segment_ends).
         order = torch.argsort(flat_choices, stable=True)
         sorted_choices = flat_choices[order]
-        padded = (expert_counts + A - 1) // A * A
-        seg_end = torch.cumsum(padded, 0)
+        seg_end, padded = grouped_segment_ends(expert_counts, A)
         seg_start = seg_end - padded
         first_sorted = torch.cumsum(expert_counts, 0) - expert_counts # position of each expert's first token in `order`
         rank_in_expert = torch.arange(N, device=x.device) - first_sorted[sorted_choices]
