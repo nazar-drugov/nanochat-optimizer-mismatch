@@ -242,6 +242,7 @@ WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
 | Fine-tuning driver (cells, log checkpoints, decay branches) | `scripts/finetune.py` |
 | Fine-tuning Slurm jobs (`--branch-tokens`, `--out-root`, `--job-prefix`, `--pair-lr-fractions`) | `scripts/finetune_jobs.py` |
 | Fine-tuning analysis (`--bases`, `--lr-selection`, `--ell0`, bootstrap) | `scripts/analyze_finetune.py` |
+| Pilot charts for the reports (→ `results/e8/figures/`) | `scripts/plot_finetune_pilot.py` |
 | LR selections and data manifest | `results/e8/` |
 | Tests | `tests/` (`.venv/bin/python -m pytest -q tests`) |
 
