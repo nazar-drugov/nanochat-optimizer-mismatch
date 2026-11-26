@@ -268,6 +268,8 @@ if a transfer check fails.
   selection (the selected LR fell or held from 240 to 960 steps for every pair); same edge rule and
   selection rule (lowest mean final D1 loss over seeds 1–3). Separate output root so its 60–960-step
   branches (a replication of the pilot cells at those LRs) do not overwrite the pilot's.
+  Result (2026-11-26): at 1,920 and 3,200 steps every pair's pick is ×1, the top of this grid; edge
+  extension at ×2 (AdamW fine-tuning 1.31e-3, Muon 1.77e-3) submitted, same branches and output root.
 
 ## Before the first real run
 
