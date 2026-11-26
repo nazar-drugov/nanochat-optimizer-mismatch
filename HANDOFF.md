@@ -189,16 +189,28 @@ by either account.
 
 ## 6. Next steps (in order)
 
-1. **Nazar: WikiText pilot** (§5), with edge extensions until every selected LR is interior.
-2. **User decisions** once both pilots are in: the main fine-tuning length (pilot lengths, or add a
-   longer StarCoderData length; WikiText cannot exceed ~740 steps) and ℓ0 (from the learning curves,
-   before computing the forgetting contrast; protocol "Fine-tuning main grid").
-3. **Extend the checkpoint pin** (`FINETUNE_BASE_CHECKPOINTS` in `nanochat/pretrain_sweep.py`) to the
-   seed-43 and seed-44 base models, with their SHA-256 (`model_011445.pt` in each
-   `base_checkpoints/e8-main-{adamw,muon}-s{43,44}/`).
-4. **Main grid** on seeds 43 and 44: both datasets, all four pairs, 3 fine-tuning seeds, only the LR(s)
-   selected on seed 42 for each pair, dataset and length (one trunk per selected LR gives all lengths;
-   run each distinct selected LR once). Seed 42 reuses the pilot runs.
+Status 2026-11-26 03:40 (hgo, after the replay fix; details in LOG_CHANGES):
+- **StarCoderData seed-42 pilot rerun: done.** `results/e8/finetune_pilot_starcoderdata_summary.json`
+  (84 cells × 3 seeds). Selected LR (lowest mean final D1 loss), 60 / 240 / 960 steps, all interior:
+
+  | pretrain → fine-tune | 60 | 240 | 960 |
+  |---|---|---|---|
+  | AdamW → AdamW | 1.31e-3 | 1.31e-3 | 6.55e-4 |
+  | AdamW → Muon | 3.55e-3 | 1.77e-3 | 8.87e-4 |
+  | Muon → AdamW | 3.28e-4 | 6.55e-4 | 6.55e-4 |
+  | Muon → Muon | 1.77e-3 | 8.87e-4 | 8.87e-4 |
+
+- **WikiText seed-42 pilot rerun: running on hgo** (jobs `ftp2-wt-*`, output `finetune_pilot/`).
+- **StarCoderData main grid, seeds 43/44: submitted on hgo** (`ftm2-*`, `ftm2x4-*`, output
+  `finetune_main/`), one trunk per distinct selected LR above.
+- **Long StarCoderData pilot (seed 42, 3,200 steps): submitted on hgo** (`ftl2-*`, `finetune_pilot_long/`).
+
+1. WikiText selection, then the WikiText main grid on seeds 43/44 (Nazar's unbranched 720-step
+   s43/s44 runs are reusable only where their LR equals the clean 720-step pick and their warmup is 8).
+2. **User decisions:** the main fine-tuning length and ℓ0 (from the learning curves, before computing
+   the forgetting contrast; protocol "Fine-tuning main grid").
+3. `analyze_finetune`: list the seed-43/44 bases (`BASES`) and handle cells with status "diverged".
+4. Seed 42 reuses the pilot runs in the main analysis.
 5. **Analysis** across all output roots (`scripts/analyze_finetune.py`, repeated `--root`): forgetting at
    matched learning ℓ0 with the paired seed/document bootstrap, mismatch contrasts, routing share. It
    requires one evaluation packing and identical D0/D1 identity across roots; runs from before
