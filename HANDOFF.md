@@ -212,7 +212,8 @@ WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
    sbatch against `~/jobs/ft-long2/` before submitting; ~40 min per job. Subagent review first if any code
    changed (§10).
 4. **Update the pilot report** (https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx, a Claude Doc): it is
-   current to 2026-11-26 06:30 and lacks the main-grid and long-pilot results.
+   current to 2026-11-26 06:30 and lacks the main-grid and long-pilot results. Re-export it to
+   `reports/finetune_pilot_report.md` afterwards.
 5. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
    at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
 
@@ -281,6 +282,7 @@ data and eval-set SHA-256s) and `result.json` (status and summary). Fine-tuning 
   no git identity; commit with `git -c user.name=... -c user.email=...` as the user's setup requires.
 - Record every decision with its date in `PRETRAINING_PROTOCOL.md`, every change and run outcome in
   `LOG_CHANGES.md`. Write prose plainly for humans.
-- Tracker dashboard: https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo (may be stale since 2026-11-24).
+- Reports: Markdown snapshots of the Claude artifacts are in `reports/` (README there lists sources and how
+  current each is). Tracker dashboard: https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo (stale since 2026-11-24).
 - Summary document of the pretraining (hyperparameters, sweep, transfer check, base models):
   https://claude.ai/artifact/TP3GZWWwJHK2EqVu3GHdyk (private to the user until shared).
