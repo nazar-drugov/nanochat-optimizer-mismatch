@@ -209,7 +209,7 @@ Status 2026-11-26 03:40 (hgo, after the replay fix; details in LOG_CHANGES):
   `finetune_main/`), one trunk per distinct selected LR above.
 - **Long StarCoderData pilot (seed 42, 3,200 steps): submitted on hgo** (`ftl2-*`, `finetune_pilot_long/`).
 
-1. Check the WikiText main grid's 240-step trunks against Nazar's 720-step runs in the constant phase.
+1. Check the WikiText main grid's 240-step trunks against Nazar's 720-step runs in the constant phase (passed for the 9 runs done by 07:30: max |ΔD1| ≤ 6.4e-4 at steps 2–128; finish for the rest).
 2. **User decisions:** the main fine-tuning length and ℓ0 (from the learning curves, before computing
    the forgetting contrast; protocol "Fine-tuning main grid").
 3. `analyze_finetune`: list the seed-43/44 bases (`BASES`) and handle cells with status "diverged".
