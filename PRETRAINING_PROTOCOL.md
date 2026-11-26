@@ -252,6 +252,16 @@ if a transfer check fails.
   pick ×4 is interior: ×8 7.10e-3 gave D1 1.7363 vs 1.5786); Muon → AdamW 3.28e-4, 6.55e-4; Muon → Muon 1.77e-3, 8.87e-4.
   `--pair-lr-fractions adamw:adamw=1,0.5 adamw:muon=2,1 muon:adamw=0.25,0.5 muon:muon=2,1` plus
   `adamw:muon=4` (separate jobs), output root `finetune_main/`. Base checkpoints pinned by SHA-256 like seed 42.
+- **WikiText main grid on seeds 43 and 44 (2026-11-26):** seed-42 selections from the clean pilot rerun
+  (all interior), 60 / 240 / 720 steps: AdamW → AdamW 3.28e-4 / 6.55e-4 / 6.55e-4; AdamW → Muon 8.87e-4
+  at all three; Muon → AdamW 1.64e-4 / 3.28e-4 / 3.28e-4; Muon → Muon 4.44e-4 at all three. The 720-step
+  cells reuse Nazar's unbranched 720-step runs (`/orcd/scratch/orcd/010/ndrugov/finetune_pilot/`, seeds 1–3,
+  at exactly these four LRs; unaffected by the replay bug; warmup 8, same data fingerprint and checkpoint
+  steps as the clean seed-42 720-step trunks; commit 60fc9f5 plus local edits). The 60- and 240-step
+  cells run on hgo as 240-step trunks with a 60-step branch at every selected LR (`--pair-lr-fractions
+  adamw:adamw=0.25,0.5 adamw:muon=1 muon:adamw=0.125,0.25 muon:muon=0.5 --branch-tokens 3932160`), output
+  root `finetune_main/`. Their constant-phase checkpoints (up to step 192) at the shared LRs must agree with
+  Nazar's runs at the same steps (reproducibility check of his code).
 - **Long StarCoderData length pilot (started 2026-11-25, user), seed 42:** trunk to 3,200 steps
   (209.7M tokens, 97% of one best-fit pass of the training file; 3,840 would need 1.17 passes) with
   branches at 60, 240, 960 and 1,920 steps; 3-point grid per pair at ×1, ×1/2, ×1/4 the 960-step

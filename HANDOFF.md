@@ -200,13 +200,16 @@ Status 2026-11-26 03:40 (hgo, after the replay fix; details in LOG_CHANGES):
   | Muon → AdamW | 3.28e-4 | 6.55e-4 | 6.55e-4 |
   | Muon → Muon | 1.77e-3 | 8.87e-4 | 8.87e-4 |
 
-- **WikiText seed-42 pilot rerun: running on hgo** (jobs `ftp2-wt-*`, output `finetune_pilot/`).
+- **WikiText seed-42 pilot rerun: done.** `results/e8/finetune_pilot_wikitext103_summary.json` (72 cells ×
+  3 seeds). Selected, 60 / 240 / 720 steps, all interior: AdamW → AdamW 3.28e-4 / 6.55e-4 / 6.55e-4;
+  AdamW → Muon 8.87e-4 ×3; Muon → AdamW 1.64e-4 / 3.28e-4 / 3.28e-4; Muon → Muon 4.44e-4 ×3.
+- **WikiText main grid, seeds 43/44: submitted on hgo** (`ftm2-*-wikitext103-*`, 60/240 steps, output
+  `finetune_main/`); the 720-step cells are Nazar's existing unbranched runs (same LRs).
 - **StarCoderData main grid, seeds 43/44: submitted on hgo** (`ftm2-*`, `ftm2x4-*`, output
   `finetune_main/`), one trunk per distinct selected LR above.
 - **Long StarCoderData pilot (seed 42, 3,200 steps): submitted on hgo** (`ftl2-*`, `finetune_pilot_long/`).
 
-1. WikiText selection, then the WikiText main grid on seeds 43/44 (Nazar's unbranched 720-step
-   s43/s44 runs are reusable only where their LR equals the clean 720-step pick and their warmup is 8).
+1. Check the WikiText main grid's 240-step trunks against Nazar's 720-step runs in the constant phase.
 2. **User decisions:** the main fine-tuning length and ℓ0 (from the learning curves, before computing
    the forgetting contrast; protocol "Fine-tuning main grid").
 3. `analyze_finetune`: list the seed-43/44 bases (`BASES`) and handle cells with status "diverged".
