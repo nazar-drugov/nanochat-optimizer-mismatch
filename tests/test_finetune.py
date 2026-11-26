@@ -260,6 +260,24 @@ def test_log_spaced_checkpoints():
     assert checkpoint_steps(8, 2, "linear", 2) == [4, 8]
 
 
+def test_replay_loader_replays_the_branch_batches_from_a_buffer_reusing_loader():
+    """The real loader overwrites one buffer per call; the trunk must still get the branch's batches."""
+    from scripts.finetune import ReplayLoader
+
+    def loader():
+        buf = torch.zeros(2, 3, dtype=torch.long)
+        for i in range(1, 100):
+            buf.fill_(i)
+            yield buf[0], buf[1], {}
+
+    replay = ReplayLoader(loader())
+    assert [int(next(replay)[0][0]) for _ in range(3)] == [1, 2, 3]
+    replay.record()
+    assert [int(next(replay)[0][0]) for _ in range(3)] == [4, 5, 6]
+    replay.rewind()
+    assert [int(next(replay)[0][0]) for _ in range(5)] == [4, 5, 6, 7, 8]
+
+
 def test_decay_branches_equal_separate_runs(tiny_setup):
     """A length run as a decay branch of a longer trunk gives the same data, curve and final
     measurements as a separate run of that length (same seed, same warmup steps)."""
@@ -273,7 +291,7 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
     assert results["muon-lr0.003-s1-T4"]["curve"][0] == results["muon-lr0.003-s1-T16"]["curve"][0]  # shared step 2
     rows = [json.loads(line) for line in (branched / "muon-lr0.003-s1-T4" / "metrics.jsonl").read_text().splitlines()]
     assert {r["run"] for r in rows} == {"muon-lr0.003-s1-T4"} and {r["ft_steps"] for r in rows} == {4}
-    for tokens, branch in ((512, "T4"), (1024, "T8")):
+    for tokens, branch in ((512, "T4"), (1024, "T8"), (2048, "T16")):  # T16 is the trunk
         from scripts import finetune
         out = tiny_setup["root"] / f"separate_{tokens}"
         finetune.main(["--base-run", "tiny-base", "--base-checkpoints-dir", str(tiny_setup["root"] / "base_checkpoints"),

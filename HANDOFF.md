@@ -104,6 +104,15 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
 
 ## 5. Pilots: StarCoderData done, WikiText assigned to Nazar
 
+> **Decay-branch replay bug (found 2026-11-25, fixed in the commit after d704870).** Before the fix,
+> `ReplayLoader` kept references to the loader's reused buffer, so after each branch the trunk
+> replayed the branch's *last* batch in place of all of its batches. With `--branch-tokens`, the first
+> (shortest) branch is correct; every longer length is not: at 60/240/960 (or 720), the 240-step runs
+> trained steps 49–60 on step 60's batch, and the longest runs also steps 193–240 on step 240's batch.
+> Runs without `--branch-tokens` (e.g. single 720-step runs) are unaffected. Do not launch branched
+> runs from a commit before the fix; pilot results at 240 and 960/720 steps are pending a decision on
+> reruns (user).
+
 ### StarCoderData pilot (done 2026-11-25)
 
 All four pairs on the seed-42 bases, 60 / 240 / 960 steps, 5-point grid plus 2× and 4× extensions

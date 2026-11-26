@@ -207,7 +207,10 @@ class Branch:
 
 
 class ReplayLoader:
-    """Wraps the data loader so a branch's batches can be handed to the trunk again."""
+    """Wraps the data loader so a branch's batches can be handed to the trunk again.
+
+    The loader yields views of one persistent buffer that it overwrites on every call, so a
+    recorded batch must be copied; holding the yielded tensors would replay only the last batch."""
 
     def __init__(self, loader):
         self.loader, self.pending, self.recording = loader, deque(), None
@@ -215,7 +218,7 @@ class ReplayLoader:
     def __next__(self):
         item = self.pending.popleft() if self.pending else next(self.loader)[:2]
         if self.recording is not None:
-            self.recording.append(item)
+            self.recording.append(tuple(t.clone() for t in item))
         return item
 
     def record(self):
