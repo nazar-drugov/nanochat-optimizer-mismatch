@@ -274,6 +274,19 @@ if a transfer check fails.
   the 960-step picks (AdamW → AdamW 6.55e-4, AdamW → Muon 8.87e-4, Muon → AdamW 6.55e-4, Muon → Muon 8.87e-4),
   all interior (`results/e8/finetune_pilot_long_starcoderdata_summary.json`).
 
+- **Long WikiText-103 pilot (decided 2026-11-26, Harry):** extend the seed-42 LR pilot to the same
+  1,920- and 3,200-step horizons as StarCoderData, with 60/240/720-step decay branches plus 1,920.
+  The scientific intent is the baseline mismatch effect and its length dependence, before the
+  correlational and replay analyses of routing in the paper. Each arm initially tests ×1, ×½,
+  ×¼ its selected 720-step LR, fine-tuning seeds 1–3; apply the same edge rule until all long
+  winners are interior. Preserve the existing best-fit D0/D1, paired shuffled batch order,
+  warmup (8), final 20% linear decay, fresh optimizer and base checkpoints. Multiple training
+  epochs are intentionally permitted: 3,200 steps uses approximately 4.28 best-fit passes of
+  WikiText versus approximately one pass of StarCoderData, a caveat for cross-corpus comparisons.
+  Seed-43/44 long training is not part of this extension. Report all tested lengths; show the
+  seed-42 long results separately from the three-base main grid. The primary matched-learning
+  threshold remains to be declared before a formal mismatch contrast is computed.
+
 ## Before the first real run
 
 - Download data: `python -m nanochat.dataset --dataset fineweb-edu-100b -n 100` (3B training
