@@ -61,7 +61,8 @@ from nanochat.finetune_metrics import (
     token_weighted_mean,
 )
 from nanochat.train_config import (
-    add_optimizer_args, file_sha256, git_state, wsd_lr_multiplier, write_json_atomic, write_run_record,
+    add_optimizer_args, file_sha256, git_state, replace_atomic, wsd_lr_multiplier, write_json_atomic,
+    write_run_record,
 )
 from nanochat.training_stats import update_batch_fingerprint
 
@@ -236,7 +237,7 @@ def train_steps(args, ctx, optimizer, loader, state, first, last, branch, on_che
         lrm = wsd_lr_multiplier(step - 1, branch.steps, ctx["warmup"], branch.decay, 0.0)
         for group in optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-        loss_sum = 0.0
+        loss_sum, step_counts = 0.0, 0
         for _ in range(ctx["accum"]):
             x, y = next(loader)
             state["fingerprint"], state["fp_weights"] = update_batch_fingerprint(state["fingerprint"], x,
@@ -245,12 +246,14 @@ def train_steps(args, ctx, optimizer, loader, state, first, last, branch, on_che
             (loss / ctx["accum"]).backward()
             loss_sum += loss.detach()
             if router_stats:
-                counts = torch.stack([s["expert_counts"] for s in router_stats])
-                state["counts"] += counts
-                if model.config.balancer == "bias" and args.balancer_mode == "active":
-                    model.update_expert_bias(counts)
+                step_counts = step_counts + torch.stack([s["expert_counts"] for s in router_stats])
         optimizer.step()
         model.zero_grad(set_to_none=True)
+        if torch.is_tensor(step_counts):
+            state["counts"] += step_counts
+            # as in pretraining: one bias update per optimizer step from the step's summed counts
+            if model.config.balancer == "bias" and args.balancer_mode == "active":
+                model.update_expert_bias(step_counts)
         state["step"] = step
         train_loss = float(loss_sum) / ctx["accum"]
         if not math.isfinite(train_loss):
@@ -269,6 +272,12 @@ def run_cell(args, cell, ctx):
     branches = [Branch(args, n, f"-T{n}" if len(lengths) > 1 else "") for n in lengths]
     run_dirs = {b.steps: ctx["out_dir"] / (name + b.suffix) for b in branches}
     if all((d / "result.json").exists() for d in run_dirs.values()):
+        for b in branches:  # never skip on a result of a different cell that shares the directory name
+            done = json.loads((run_dirs[b.steps] / "result.json").read_text())
+            if (done.get("lr"), done.get("steps"), done.get("warmup_steps")) != (lr, b.steps, ctx["warmup"]):
+                raise RuntimeError(f"{run_dirs[b.steps]}/result.json has lr {done.get('lr')!r}, steps "
+                                   f"{done.get('steps')}, warmup {done.get('warmup_steps')}; this cell has "
+                                   f"lr {lr!r}, steps {b.steps}, warmup {ctx['warmup']}")
         print0(f"Skipping {name}: result.json exists")
         return
     for run_dir in run_dirs.values():  # an interrupted cell restarts from scratch
@@ -340,8 +349,10 @@ def run_cell(args, cell, ctx):
         run_dir = run_dirs[b.steps]
         rows = [json.loads(line) for line in (run_dir / "metrics.jsonl").read_text().splitlines()] \
             if (run_dir / "metrics.jsonl").exists() else []
-        if rows:
-            pq.write_table(pa.Table.from_pylist(rows), run_dir / "metrics.parquet")
+        if rows:  # columns from every row (from_pylist would keep only the first row's keys)
+            keys = dict.fromkeys(k for row in rows for k in row)
+            pq.write_table(pa.Table.from_pydict({k: [row.get(k) for row in rows] for k in keys}),
+                           run_dir / "metrics.parquet")
         final = b.curve[-1] if b.curve else {}
         write_json_atomic(run_dir / "result.json", {
             "status": status, **meta[b.steps], "steps": b.steps, "steps_completed": b.steps_completed,
@@ -468,6 +479,9 @@ def main(argv=None):
     parser.add_argument("--device-type", default="")
     args = parser.parse_args(argv)
     lrs = parse_lrs(args.lrs)
+    for name, grid in lrs.items():  # cell directories are named by lr_tag (3 significant digits)
+        if len({lr_tag(lr) for lr in grid}) != len(grid):
+            parser.error(f"--lrs {name}: learning rates must differ in their first 3 significant digits")
     for tokens in (args.train_tokens, *args.branch_tokens):
         if tokens % args.total_batch_size:
             parser.error("--train-tokens and --branch-tokens must be multiples of --total-batch-size")
@@ -517,7 +531,8 @@ def main(argv=None):
                               "seq_len": seq_len, "scored_tokens": s.n_scored, "documents": s.n_docs,
                               "packing": s.packing} for s in (d0, d1)}
     for s in (d0, d1):
-        s.save(out_dir / "base" / f"eval_set_{s.name}.pt")
+        # atomic: concurrent jobs of the same base model and dataset write the same base files
+        replace_atomic(out_dir / "base" / f"eval_set_{s.name}.pt", s.save)
 
     # Base model at step 0 (once per base model and dataset)
     base_d0 = evaluate_base(model0, d0, args.eval_batch_size, device)
@@ -542,11 +557,11 @@ def main(argv=None):
     if model.config.balancer == "bias":
         base_summary["expert_bias"] = model.expert_bias_state().cpu().tolist()
     write_json_atomic(out_dir / "base" / "base_metrics.json", base_summary)
-    np.savez_compressed(out_dir / "base" / "base_arrays.npz",
-                        d0_doc_loss=base_d0["doc_sums"].numpy(), d0_doc_tokens=base_d0["doc_counts"].numpy(),
-                        d1_doc_loss=base_d1["doc_sums"].numpy(), d1_doc_tokens=base_d1["doc_counts"].numpy(),
-                        d0_routes=torch.stack([base_d0["routes"][l] for l in layers]).numpy(),
-                        d1_routes=torch.stack([base_d1["routes"][l] for l in layers]).numpy(), layers=np.array(layers))
+    replace_atomic(out_dir / "base" / "base_arrays.npz", lambda f: np.savez_compressed(
+        f, d0_doc_loss=base_d0["doc_sums"].numpy(), d0_doc_tokens=base_d0["doc_counts"].numpy(),
+        d1_doc_loss=base_d1["doc_sums"].numpy(), d1_doc_tokens=base_d1["doc_counts"].numpy(),
+        d0_routes=torch.stack([base_d0["routes"][l] for l in layers]).numpy(),
+        d1_routes=torch.stack([base_d1["routes"][l] for l in layers]).numpy(), layers=np.array(layers)))
     print0(f"Base: D0 loss {base_summary['loss_d0']:.4f}, D1 loss {base_summary['loss_d1']:.4f}")
 
     ctx = {

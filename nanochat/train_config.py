@@ -12,6 +12,7 @@ import os
 import platform
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -254,10 +255,25 @@ def write_run_record(path, *, args, model, optimizer, device_type, world_size, c
     return record
 
 
-def write_json_atomic(path, data):
-    """Write JSON so that readers never see a half-written file."""
+def replace_atomic(path, write):
+    """Call write(file object) on a temporary file next to `path`, then rename it over `path`, so
+    readers never see a half-written file. The temporary name is unique, so concurrent writers of
+    the same path (e.g. several fine-tuning jobs writing one base directory) do not collide."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    tmp.replace(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    umask = os.umask(0)
+    os.umask(umask)
+    try:
+        os.chmod(tmp, 0o666 & ~umask)  # mkstemp makes 0600; keep the usual permissions (other accounts read results)
+        with os.fdopen(fd, "wb") as f:
+            write(f)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def write_json_atomic(path, data):
+    """Write JSON so that readers never see a half-written file."""
+    text = json.dumps(data, indent=2, default=str).encode()
+    replace_atomic(path, lambda f: f.write(text))

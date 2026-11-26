@@ -359,3 +359,78 @@ def test_bestfit_eval_set_reproduces_the_pretraining_loader_rows(tmp_path):
         build_eval_set("D0", path, tok, seq_len, (capacity + 1) * seq_len, buffer_size=20)
     es.save(tmp_path / "set.pt")
     assert torch.equal(EvalSet.load(tmp_path / "set.pt").doc_rows, es.doc_rows)
+
+
+# ---------------------------------------------------------------------------
+# Review checks (2026-11-25): bias balancer, metrics.parquet, concurrent writes, cell naming
+
+def _bias_update_after_one_step(finetune_module):
+    from types import SimpleNamespace
+    torch.manual_seed(0)
+    config = GPTConfig(sequence_len=16, vocab_size=64, n_layer=2, n_head=2, n_kv_head=2, n_embd=32, ffn_type="moe",
+                       n_experts=4, balancer="bias", bias_update_rate=0.01)
+    model = GPT(config)
+    model.init_weights(seed=1)
+    model.train()
+    optimizer = model.setup_optimizer(optimizer_name="adamw", adamw_matrix_lr=0.0, embedding_lr=0.0, unembedding_lr=0.0)
+    batches = [(torch.randint(1, 64, (2, 16)), torch.randint(1, 64, (2, 16))) for _ in range(2)]
+    with torch.no_grad():  # the step's counts, as the micro-batches route them with the starting bias
+        counts = sum(torch.stack([s["expert_counts"] for s in model(x, y, return_metrics=True)[2]]) for x, y in batches)
+    before = model.expert_bias_state()
+    state = {"step": 0, "counts": torch.zeros(2, 4, dtype=torch.long), "fingerprint": torch.zeros((), dtype=torch.long),
+             "fp_weights": None}
+    ctx = {"model": model, "compiled": model, "warmup": 0, "accum": 2}
+    finetune_module.train_steps(SimpleNamespace(balancer_mode="active"), ctx, optimizer, iter(batches), state, 1, 1,
+                                SimpleNamespace(steps=1, decay=0), lambda step, loss: None)
+    return model.expert_bias_state() - before, counts, state["counts"]
+
+
+def test_bias_balancer_updates_once_per_optimizer_step_from_summed_counts():
+    """As in pretraining (base_train.py): with gradient accumulation the bias moves once per step,
+    by u * sign(mean - load) of the counts summed over the micro-batches."""
+    from scripts import finetune
+    delta, counts, recorded = _bias_update_after_one_step(finetune)
+    expected = 0.01 * torch.sign(counts.float().mean(dim=-1, keepdim=True) - counts.float())
+    torch.testing.assert_close(delta, expected)
+    assert torch.equal(recorded, counts)
+
+
+def test_metrics_parquet_keeps_every_column(tiny_setup):
+    out = run_finetune(tiny_setup, "--lrs", "adamw=2e-3", "--seeds", "3", "--checkpoint-spacing", "linear",
+                       "--n-checkpoints", "2")
+    run = out / "adamw-lr0.002-s3"
+    rows = [json.loads(line) for line in (run / "metrics.jsonl").read_text().splitlines()]
+    table = pq.read_table(run / "metrics.parquet")
+    assert set(table.column_names) == {k for row in rows for k in row}  # incl. flip_rate, rho, D1 loss, ...
+    back = [{k: v for k, v in row.items() if v is not None} for row in table.to_pylist()]
+    assert back == rows
+
+
+def _write_json_repeatedly(path, n):
+    from nanochat.train_config import write_json_atomic
+    for _ in range(n):
+        write_json_atomic(path, {"x": list(range(20000))})
+
+
+def test_write_json_atomic_survives_concurrent_writers(tmp_path):
+    """Several fine-tuning jobs of one base model write the same base/ files at the same time."""
+    import multiprocessing as mp
+    path = tmp_path / "base" / "base_metrics.json"
+    ctx = mp.get_context("spawn")
+    procs = [ctx.Process(target=_write_json_repeatedly, args=(path, 150)) for _ in range(2)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    assert [p.exitcode for p in procs] == [0, 0]
+    assert len(json.loads(path.read_text())["x"]) == 20000
+    assert [p.name for p in path.parent.iterdir()] == ["base_metrics.json"]  # no temporary files left
+
+
+def test_cells_with_colliding_directory_names_are_rejected(tiny_setup):
+    with pytest.raises(SystemExit):  # 1.0e-3 and 1.0004e-3 would share the directory adamw-lr0.001-s1
+        run_finetune(tiny_setup, "--lrs", "adamw=1e-3,1.0004e-3", "--seeds", "1")
+    out = run_finetune(tiny_setup, "--lrs", "adamw=1e-3", "--seeds", "4", "--train-tokens", "256")
+    with pytest.raises(RuntimeError, match="result.json has lr"):  # another job's cell, same directory name
+        run_finetune(tiny_setup, "--lrs", "adamw=1.0004e-3", "--seeds", "4", "--train-tokens", "256")
+    assert json.loads((out / "adamw-lr0.001-s4" / "result.json").read_text())["lr"] == 1e-3
