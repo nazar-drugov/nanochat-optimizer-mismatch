@@ -1,10 +1,18 @@
-# Handoff: MoE optimizer-mismatch study (state on 2026-11-25, 18:40 EST)
+# Handoff: MoE optimizer-mismatch study (state on 2026-11-26, 13:45 EST)
 
-Written for the agents taking over on Nazar's compute. Read this first, then
-`PRETRAINING_PROTOCOL.md` (every decision with its date, including the fine-tuning decisions near
-the end), `LOG_CHANGES.md` (what changed and every run's outcome, newest last) and `docs/report.tex`
-(the paper draft; `% NOTE` lines mark what is not yet agreed). The original `EXPERIMENT_SPEC.md` is
-not in the repo; the protocol and report supersede it.
+Written for the next agent. Read this first, then `PRETRAINING_PROTOCOL.md` (every decision with its
+date; fine-tuning decisions near the end), `LOG_CHANGES.md` (every change and run outcome, newest
+last; the 2026-11-26 entries cover today) and `docs/report.tex` (the paper draft; `% NOTE` lines mark
+what is not yet agreed). The original `EXPERIMENT_SPEC.md` is not in the repo; the protocol and report
+supersede it.
+
+**Where things stand in one paragraph.** All E = 8 base models are trained. Both seed-42 fine-tuning
+pilots (StarCoderData, WikiText-103) were rerun after a decay-branch bug (§5) and every LR selection is
+final and interior. The seed-43/44 main grids for both datasets are complete at the seed-42 LRs. A long
+StarCoderData pilot (to 3,200 steps) is complete. The analysis script handles the main grid and has been
+run without ℓ0 for every dataset and length. **Nothing is running on the cluster. The work is blocked on
+two user decisions: the main fine-tuning length and ℓ0 (§6).** The hourly check-in loop that the
+previous agent ran is stopped; nothing needs monitoring.
 
 ## 1. Goal and where we are
 
@@ -17,12 +25,14 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | E = 8 LR sweep (0.5B tokens) | Done |
 | LR transfer check at 3B tokens | Done; AdamW moved to the 3B optimum |
 | E = 8 base models, AdamW and Muon × seeds 42, 43, 44 (3B tokens) | **All six done** |
-| Fine-tuning data | **Both built** 2026-11-25: StarCoderData (Python); WikiText-103 rebuilt with a 1.1M-token D1 |
+| Fine-tuning data | **Both built**: StarCoderData (Python); WikiText-103 with a 1.1M-token D1 |
 | Fine-tuning protocol | LR selection, checkpoints, length pilot **decided** 2026-11-25 (§4) |
-| Fine-tuning length pilot (StarCoderData) | **Done**, all four pairs plus edge extensions; seed-42 LR selection final (LOG_CHANGES 2026-11-25; `results/e8/finetune_pilot_starcoderdata_summary.json`) |
-| Fine-tuning length pilot (WikiText-103) | **Assigned to Nazar** (2026-11-25): all four pairs, seed-42 bases, 60 / 240 / 720 steps (§5) |
-| Fine-tuning main grid | Waits for the WikiText pilot, the main-length decision and ℓ0 |
-| Analysis script | **Built** (`scripts/analyze_finetune.py`, §6 step 6); needs all runs on one evaluation packing (best-fit) |
+| Seed-42 pilots (StarCoderData 60/240/960, WikiText 60/240/720 steps) | **Done** (clean rerun 2026-11-26); all selections interior (§6) |
+| Seed-43/44 main grids (both datasets, all pilot lengths) | **Done** 2026-11-26 at the seed-42 LRs |
+| Long StarCoderData pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; the 960-step LRs stay optimal |
+| Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
+| Main length and ℓ0 | **Waiting for the user** |
+| Forgetting contrast at ℓ0, bootstrap CIs, routing share | Not run (needs ℓ0) |
 | Other E (1, 4, 16) | Deferred until fine-tuning results |
 
 ## 2. Pretraining: design and results
@@ -69,8 +79,26 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
   - `logs/<run>.jsonl|.log` — pretraining logs.
 - Pool copy of all small outputs: `/orcd/pool/006/hgo/nanochat-optimizer-mismatch/results/`.
   Note: `meta_*.json` files there are 0.4–0.8 GB each (12 GB total); worth slimming.
-- Job scripts and Slurm outputs: `/home/hgo/jobs/` (pilot scripts in `/home/hgo/jobs/ft-pilot/`).
-- hgo checkout: `/home/hgo/nanochat-optimizer-mismatch` at 756a9fe or later.
+- Fine-tuning outputs (scratch root above; all copied to pool `results/` by the jobs):
+  - `finetune_pilot/` — **clean** seed-42 pilots, both datasets, every grid LR (12 GB).
+  - `finetune_main/` — seed-43/44 main grids (StarCoderData 960-step trunks with 60/240 branches;
+    WikiText 240-step trunks with 60 branches), one trunk per distinct selected LR.
+  - `finetune_pilot_long/` — long StarCoderData pilot, seed 42, 3,200-step trunks with 60/240/960/1,920
+    branches at ×¼, ×½, ×1, ×2 the 960-step picks.
+  - `analysis/<dataset>-<T>-pilot/` and `analysis/<dataset>-<T>-main/` — `analyze_finetune` outputs without
+    ℓ0; `analysis/staging_nazar_wt/` = symlinks to Nazar's seed-43/44 WikiText runs (see §6).
+  - `finetune_pilot_v1_replaybug/`, `finetune_pilot_long_v1_replaybug/` — **invalid** (replay bug), kept for
+    the record; never analyse them.
+- Nazar's root `/orcd/scratch/orcd/010/ndrugov/finetune_pilot/`: his unbranched 720-step WikiText runs on
+  seeds 43/44 (valid, reused as the 720-step main-grid cells) **and his old seed-42 pilot runs (invalid,
+  replay bug)**. Never pass this root directly to the analysis; use the staging root.
+- Job scripts and Slurm outputs: `/home/hgo/jobs/` (`ft-pilot2/` clean pilots, `ft-main2*/` main grids,
+  `ft-long2*/` long pilot). Helper scripts there (not in the repo):
+  `run_analysis.sh` (all pilot + main analyses), `pilot_summary.py <root> <dataset> <out.json>` (per-cell
+  summary + selection with edge flags), `main_table.py` (s42/s43/s44 comparison at the selected LRs),
+  `wt_repro.py` (WikiText reproducibility check vs Nazar), `make_ext_jobs.py` / `make_long_ext_jobs.py`
+  (edge-extension jobs through the reviewed `render_finetune_job`).
+- hgo checkout: `/home/hgo/nanochat-optimizer-mismatch` (at f4e814e; fine-tuning code unchanged since 6506351).
 
 ## 4. Fine-tuning protocol (decided 2026-11-25; protocol section "Fine-tuning: LR selection, checkpoints and length pilot")
 
@@ -102,135 +130,91 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
   checkpoints catch the first change. It can also show whether a mismatch penalty grows, shrinks or
   vanishes with length (Zhao's "ephemeral" claim, for an MoE). It says nothing across base seeds or E.
 
-## 5. Pilots: StarCoderData done, WikiText assigned to Nazar
+## 5. Decay-branch replay bug (fixed; all affected runs redone)
 
-> **Decay-branch replay bug (found 2026-11-25, fixed in the commit after d704870).** Before the fix,
-> `ReplayLoader` kept references to the loader's reused buffer, so after each branch the trunk
-> replayed the branch's *last* batch in place of all of its batches. With `--branch-tokens`, the first
-> (shortest) branch is correct; every longer length is not: at 60/240/960 (or 720), the 240-step runs
-> trained steps 49–60 on step 60's batch, and the longest runs also steps 193–240 on step 240's batch.
-> Runs without `--branch-tokens` (e.g. single 720-step runs) are unaffected. Do not launch branched
-> runs from a commit before the fix. Measured impact (LOG_CHANGES): at the final step learning is
-> 0.02–0.03 nats lower and forgetting higher, and the damage grows with LR and is larger for Muon
-> fine-tuning, so the 240/720/960-step LR selections and results are invalid.
->
-> **Reruns (user, 2026-11-25): hgo reruns BOTH seed-42 pilots** (StarCoderData first, then WikiText;
-> commit 1c91504, jobs `ftp2-*`, output `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_pilot/`;
-> old outputs renamed `finetune_pilot_v1_replaybug/`). Nazar: please do not rerun the WikiText pilot.
-> Nazar's unbranched seed-43/44 WikiText runs (720 steps) have correct data and will be reused wherever
-> the rerun selects the same LR; hgo then runs the remaining main-grid cells under the protocol.
+Found 2026-11-25 and fixed in d330586. `ReplayLoader` kept references to the loader's reused buffer,
+so after each branch the trunk replayed the branch's *last* batch in place of all of its batches: every
+branched run longer than the shortest branch trained on repeated batches. All 240/720/960-step pilot
+results from before the fix were invalid. Both seed-42 pilots were rerun from scratch on hgo
+(`finetune_pilot/`); unbranched runs (Nazar's 720-step WikiText seed-43/44 runs) were unaffected. The
+rerun moved only one selection (AdamW → Muon at 60 steps, to 3.55e-3). Impact measurement and the fix's
+tests: LOG_CHANGES 2026-11-25. Do not launch branched runs from a commit before d330586.
 
-### StarCoderData pilot (done 2026-11-25)
+## 6. Results so far and next steps
 
-All four pairs on the seed-42 bases, 60 / 240 / 960 steps, 5-point grid plus 2× and 4× extensions
-where the best LR hit the top edge, 3 seeds; 78 cells, all completed, all on the best-fit evaluation.
-Selected LRs and every cell's mean learning / forgetting: LOG_CHANGES ("Seed-42 StarCoderData
-learning-rate selection final") and `results/e8/finetune_pilot_starcoderdata_summary.json`. Report
-for the team: https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx. Outputs:
+### Seed-42 LR selections (final; lowest mean final D1 loss over seeds 1–3, all interior)
 
-- hgo (AdamW → Muon, Muon → AdamW): `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_pilot/`
-- Nazar (AdamW → AdamW, Muon → Muon): `/orcd/scratch/orcd/010/ndrugov/finetune_pilot/`
+| pretrain → fine-tune | SC 60 | SC 240 | SC 960 | SC 1,920 / 3,200 | WT 60 | WT 240 | WT 720 |
+|---|---|---|---|---|---|---|---|
+| AdamW → AdamW | 1.31e-3 | 1.31e-3 | 6.55e-4 | 6.55e-4 | 3.28e-4 | 6.55e-4 | 6.55e-4 |
+| AdamW → Muon | 3.55e-3 | 1.77e-3 | 8.87e-4 | 8.87e-4 | 8.87e-4 | 8.87e-4 | 8.87e-4 |
+| Muon → AdamW | 3.28e-4 | 6.55e-4 | 6.55e-4 | 6.55e-4 | 1.64e-4 | 3.28e-4 | 3.28e-4 |
+| Muon → Muon | 1.77e-3 | 8.87e-4 | 8.87e-4 | 8.87e-4 | 4.44e-4 | 4.44e-4 | 4.44e-4 |
 
-What it taught for WikiText: the first 5-point grid put the best LR at the top edge for Muon
-fine-tuning in every case and for AdamW → AdamW at short lengths; AdamW → AdamW at 4× (5.24e-3)
-diverged. One 960-step trunk with its branches took ~4.8 min on a B200; one job (5 LRs × 3 seeds)
-~75 min; seeds agree to ≤ 0.006 nats in learning.
+Per-cell means and SDs: `results/e8/finetune_pilot_starcoderdata_summary.json`,
+`results/e8/finetune_pilot_wikitext103_summary.json`, `results/e8/finetune_pilot_long_starcoderdata_summary.json`
+(lists of {pre, ft, T, lr, n, seeds, learn, forget, d1, learn_sd, forget_sd}). Seeds agree closely
+(SD ≤ 0.023 nats at the selected LRs).
 
-### WikiText pilot: Nazar runs all four pairs (user decision, 2026-11-25)
+### Main grids (seeds 43/44, done)
 
-Same conventions as the StarCoderData pilot, on Nazar's account. Nothing has been run on WikiText yet
-by either account.
+Every selected cell has 3 completed seeds on both base seeds. Seeds 43/44 track seed 42: forgetting
+within ~0.05, learning offset by a roughly constant amount per base model. WikiText 720-step cells are
+Nazar's runs; all 36 shared-LR hgo 240-step trunks match them at steps 2–128 (GPU noise level; one
+transient at step 32), so his locally edited code is equivalent.
 
-1. **Code:** commit ed76421 or later (`git pull`). It includes the best-fit evaluation, the
-   seed-42 checkpoint pin and `PYTHONUNBUFFERED=1` in generated jobs.
-2. **Data** (built, readable and writable by all users; do not rebuild):
-   `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/wikitext103/`
-   (training 28,934 articles, 110.6M tokens; D1 = `val_00000.parquet`, 632 articles: validation + test +
-   510 sampled training articles; manifest in `results/e8/wikitext103_manifest.json`).
-3. **Generate the four jobs** (5-point grid, seeds 1–3, lengths 60 / 240 / 720 steps):
+### Long pilot (done)
+
+At ×1 the 960-step pick, per doubling past 960 steps learning gains ~0.05–0.08 nats and forgetting
+~0.11–0.19. The ×½ LR forgets much less for nearly the same learning (Muon → Muon at 3,200 steps:
+×½ 1.812 / 0.946 vs ×1 1.815 / 1.455 learning / forgetting).
+
+### Analyses already run (no ℓ0)
+
+`/home/hgo/jobs/run_analysis.sh` runs, per dataset and length, `analyze_finetune` on the seed-42 pilot
+(`analysis/<ds>-<T>-pilot/`), then on all six bases with `--lr-selection` pointing at that pilot
+analysis (`analysis/<ds>-<T>-main/`). All checks passed. **Common D1-learning support** (largest
+admissible ℓ0) over all six bases: StarCoderData 1.095 / 1.375 / 1.576 at 60 / 240 / 960 steps;
+WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
+
+### Next steps
+
+1. **User decisions (ask; do not choose):**
+   - **Main fine-tuning length.** If it is one of the pilot lengths (StarCoderData 60/240/960, WikiText
+     60/240/720), no more training is needed. If StarCoderData 1,920 or 3,200: seeds 43/44 need 3,200-step
+     trunks at the 960-step picks (see step 3). WikiText cannot go past ~740 steps without repeating data
+     (§7).
+   - **ℓ0** (protocol safeguard: choose it from the learning curves, before computing the forgetting
+     contrast, and also report the contrast across the whole common learning range).
+2. **Analysis with ℓ0** (once decided): rerun `run_analysis.sh` with `--ell0 <value>` added to the main
+   analyses (bootstrap defaults to 500 repetitions; it reads every checkpoint's per-document arrays, so it
+   may be worth a CPU Slurm job rather than the login node). For the "whole range" safeguard, repeat at a
+   grid of ℓ0 values up to the common support. Outputs: `contrasts` (per base), `pooled_contrasts` (mean
+   over base seeds per pretraining optimizer), `bootstrap.mismatch_ci` / `pooled_mismatch_ci` (the pooled CI
+   holds base runs fixed; report the per-base spread beside it), `matched_runs.csv` (F_route / F_fixed
+   share), router CSVs and plots.
+3. **Only if the main length is 1,920 or 3,200 steps (StarCoderData):** generate seed-43/44 jobs with the
+   reviewed generator, e.g.
    ```
    .venv/bin/python -m scripts.finetune_jobs --selection results/e8/lr_selection_3b.json \
-     --base-runs e8-main-adamw-s42 e8-main-muon-s42 \
-     --dataset wikitext103=/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/wikitext103 \
+     --base-runs e8-main-adamw-s43 e8-main-adamw-s44 e8-main-muon-s43 e8-main-muon-s44 \
+     --dataset starcoderdata=/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_data/starcoderdata \
      --d0-file /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/heldout/fineweb-edu-100b/d0.parquet \
-     --seeds 1 2 3 --branch-tokens 3932160 47185920 \
-     --out-root /orcd/scratch/orcd/010/ndrugov/finetune_pilot --job-prefix ftpilot --out ~/jobs/ft-pilot-wikitext
+     --pair-lr-fractions adamw:adamw=0.5 adamw:muon=1 muon:adamw=0.5 muon:muon=1 \
+     --branch-tokens 3932160 62914560 125829120 209715200 --seeds 1 2 3 --time-limit 02:30:00 \
+     --out-root /orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_main_long \
+     --job-prefix ftml --out ~/jobs/ft-main-long
    ```
-   Keep the default `--train-tokens` (15,728,640): it fixes warmup at 8 steps, so the 60- and
-   240-step runs match the StarCoderData pilot's. **720, not 960, steps:** best-fit cropping gives only
-   23,924 rows per pass over WikiText's training articles; 720 steps use 23,040 (one pass), 960 would
-   repeat 22% of the data during the decay. Check `--exclude` for your account's bad nodes (ours:
-   node5800-c1, node5702-c1). Submit all four (`sbatch ~/jobs/ft-pilot-wikitext/*.sbatch`); with
-   2 GPUs per user they run in two waves. Expected ~3.7 min per 720-step trunk, ~1 h per job,
-   ~4 GPU-hours, ~2 h of wall time.
-4. **Check the first job early:**
-   - `config.json` of any run: `data.eval_sets.D0.packing` and `D1.packing` are `"bestfit"`;
-     `branch.lengths` is `[60, 240, 720]`; `warmup_steps` is 8.
-   - `<out-root>/<base>/wikitext103/base/base_metrics.json`: base D0 loss ≈ 2.94 (AdamW s42) /
-     ≈ 2.90 (Muon s42), as in the StarCoderData pilot (same D0 set).
-   - The D1 set should score 1,048,461 tokens from 627 articles (`config.json`,
-     `data.eval_sets.D1.scored_tokens` / `documents`).
-5. **Edge rule** (protocol): for each (pair, length), the selected LR = lowest mean final D1 loss over
-   the 3 seeds. If it is the top grid point, run `--lr-fractions 2 4`; if the bottom,
-   `--lr-fractions 0.03125 0.015625`; same arguments otherwise, `--job-prefix ftpilot-ext`, and submit
-   only the pair that needs it. Repeat until every selection is interior. Given the StarCoderData
-   result, expect the Muon pairs (and maybe AdamW → AdamW) to need the upward extension.
-6. **Analyse** (CPU, no GPU needed), once per length:
-   ```
-   .venv/bin/python -m scripts.analyze_finetune --root /orcd/scratch/orcd/010/ndrugov/finetune_pilot \
-     --dataset wikitext103 --steps <60|240|720> --seeds 1 2 3 --out /orcd/scratch/orcd/010/ndrugov/finetune_pilot/analysis/wikitext103/T<steps>
-   ```
-   No `--ell0` yet: ℓ0 is chosen by the user after seeing the curves (protocol, "Fine-tuning main grid").
-7. **Record** in LOG_CHANGES (jobs, times, per-cell mean learning / forgetting, selected LR per pair
-   and length, any divergence) and save a summary like
-   `results/e8/finetune_pilot_starcoderdata_summary.json` as `results/e8/finetune_pilot_wikitext103_summary.json`.
-   Update this file's status table. Do not change the evaluation or data between jobs: all WikiText
-   cells must share one D1 identity and packing (the analysis refuses mixes).
-
-## 6. Next steps (in order)
-
-Status 2026-11-26 03:40 (hgo, after the replay fix; details in LOG_CHANGES):
-- **StarCoderData seed-42 pilot rerun: done.** `results/e8/finetune_pilot_starcoderdata_summary.json`
-  (84 cells × 3 seeds). Selected LR (lowest mean final D1 loss), 60 / 240 / 960 steps, all interior:
-
-  | pretrain → fine-tune | 60 | 240 | 960 |
-  |---|---|---|---|
-  | AdamW → AdamW | 1.31e-3 | 1.31e-3 | 6.55e-4 |
-  | AdamW → Muon | 3.55e-3 | 1.77e-3 | 8.87e-4 |
-  | Muon → AdamW | 3.28e-4 | 6.55e-4 | 6.55e-4 |
-  | Muon → Muon | 1.77e-3 | 8.87e-4 | 8.87e-4 |
-
-- **WikiText seed-42 pilot rerun: done.** `results/e8/finetune_pilot_wikitext103_summary.json` (72 cells ×
-  3 seeds). Selected, 60 / 240 / 720 steps, all interior: AdamW → AdamW 3.28e-4 / 6.55e-4 / 6.55e-4;
-  AdamW → Muon 8.87e-4 ×3; Muon → AdamW 1.64e-4 / 3.28e-4 / 3.28e-4; Muon → Muon 4.44e-4 ×3.
-- **WikiText main grid, seeds 43/44: complete on hgo** (`ftm2-*-wikitext103-*`, 60/240 steps, output
-  `finetune_main/`); the 720-step cells are Nazar's existing unbranched runs (same LRs).
-- **StarCoderData main grid, seeds 43/44: complete on hgo** (`ftm2-*`, `ftm2x4-*`, output
-  `finetune_main/`), one trunk per distinct selected LR above.
-- **Long StarCoderData pilot (seed 42, 3,200 steps): complete on hgo** (`ftl2-*`, ×2 extension `ftl2x-*`,
-  `finetune_pilot_long/`; `results/e8/finetune_pilot_long_starcoderdata_summary.json`): the 960-step picks
-  stay optimal (interior) at 1,920 and 3,200 steps for every pair. Per doubling past 960 steps learning
-  gains ~0.05–0.08 nats and forgetting ~0.11–0.19 (LOG_CHANGES 2026-11-26 10:30 / 11:30).
-- **Main-grid analyses without ℓ0** (all six bases, per dataset and length): `$SCRATCH/analysis/`
-  (`/home/hgo/jobs/run_analysis.sh`); common learning support StarCoderData 1.095 / 1.375 / 1.576 at
-  60 / 240 / 960 steps, WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
-
-1. Done: the WikiText main grid's 240-step trunks match Nazar's 720-step runs at steps 2–128 (all 36; one transient at step 32).
-2. **User decisions (all evidence in):** the main fine-tuning length (if 1,920 or 3,200 steps, seeds 43/44 need
-   runs at the 960-step picks with those branches) and ℓ0 (from the learning curves, before computing
-   the forgetting contrast; protocol "Fine-tuning main grid").
-3. Done (0d4fdd0): `analyze_finetune --bases ... --lr-selection <seed-42 analysis.json>` for the main grid; diverged runs handled.
-4. Seed 42 reuses the pilot runs in the main analysis.
-5. **Analysis** across all output roots (`scripts/analyze_finetune.py`, repeated `--root`): forgetting at
-   matched learning ℓ0 with the paired seed/document bootstrap, mismatch contrasts, routing share. It
-   requires one evaluation packing and identical D0/D1 identity across roots; runs from before
-   0c86b24 (contiguous packing) cannot be mixed in.
-6. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
+   (fractions are of the fine-tuning optimizer's 3B LR: 0.5 × 1.311e-3 = 6.55e-4, 1 × 8.874e-4.) Use a
+   separate out-root: its 60/240/960 branches duplicate `finetune_main/` cells, and the analysis refuses
+   duplicates. Analyse 1,920/3,200 with `--root finetune_pilot_long --root finetune_main_long` (seed-42
+   selection from a `finetune_pilot_long` pilot analysis at that length, `--min-lrs 4`). Diff one generated
+   sbatch against `~/jobs/ft-long2/` before submitting; ~40 min per job. Subagent review first if any code
+   changed (§10).
+4. **Update the pilot report** (https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx, a Claude Doc): it is
+   current to 2026-11-26 06:30 and lacks the main-grid and long-pilot results.
+5. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
    at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
-
-Background for step 2 of §6 in earlier versions (kept for reference): **D0 loss gap explained and fixed
-2026-11-25** (LOG_CHANGES, `results/e8/d0_eval_gap/`): the old contiguous evaluation cut the context of
-~49% of scored tokens (~0.2 of the ~0.24-nat gap); the evaluation now uses the pretraining best-fit rows.
 
 ## 7. Open decisions (raise with the team; do not resolve silently)
 
@@ -239,9 +223,9 @@ Background for step 2 of §6 in earlier versions (kept for reference): **D0 loss
   did not use AI to draft it). D1 composition decided: best-fit, short files (protocol).
 - WikiText beyond ~740 steps (only if the main length goes past that): accept a shorter WikiText length
   or split long articles.
-- Main fine-tuning length (pilot lengths vs adding a longer one) and ℓ0. Decided 2026-11-25: 3 fine-tuning seeds,
-  all three base seeds, seeds 43/44 reuse the seed-42 LRs, ℓ0 after the curves (protocol, "Fine-tuning main grid").
-  The seed-42 checkpoint pin in `nanochat/pretrain_sweep.py` must admit seeds 43/44 (with SHA-256) first.
+- **Main fine-tuning length and ℓ0 (the current blockers).** Decided 2026-11-25: 3 fine-tuning seeds,
+  all three base seeds, seeds 43/44 reuse the seed-42 LRs, ℓ0 after the curves (protocol, "Fine-tuning
+  main grid"). All six base checkpoints are pinned by SHA-256 in `FINETUNE_BASE_CHECKPOINTS`.
 - Transfer check at other E (proposal above).
 
 ## 8. Code map
@@ -255,11 +239,13 @@ Background for step 2 of §6 in earlier versions (kept for reference): **D0 loss
 | Fixed eval sets with document IDs | `nanochat/eval_set.py` |
 | Fine-tuning metrics | `nanochat/finetune_metrics.py` |
 | Fine-tuning driver (cells, log checkpoints, decay branches) | `scripts/finetune.py` |
-| Fine-tuning Slurm jobs (`--branch-tokens`, `--out-root`, `--job-prefix`) | `scripts/finetune_jobs.py` |
+| Fine-tuning Slurm jobs (`--branch-tokens`, `--out-root`, `--job-prefix`, `--pair-lr-fractions`) | `scripts/finetune_jobs.py` |
+| Fine-tuning analysis (`--bases`, `--lr-selection`, `--ell0`, bootstrap) | `scripts/analyze_finetune.py` |
 | LR selections and data manifest | `results/e8/` |
 | Tests | `tests/` (`.venv/bin/python -m pytest -q tests`) |
 
-Tests: `tests/test_finetune.py` and `tests/test_pretrain_sweep.py` pass (32). Locally,
+Tests: `tests/test_finetune.py`, `tests/test_pretrain_sweep.py` and `tests/test_analyze_finetune.py`
+pass. Locally,
 `tests/test_base_train_smoke.py` fails 6 tests with `ModuleNotFoundError: setuptools` (environment,
 not code); on the B200 the full suite passed at b7edc71.
 
@@ -272,13 +258,27 @@ data and eval-set SHA-256s) and `result.json` (status and summary). Fine-tuning 
 
 - Partition `mit_normal_gpu`, `--gres=gpu:b200:1`, max 6 h per job, 2 GPUs per user. B200 waits were
   minutes when under the limit; H200 waits are hours. Jobs ask for `-c 16 --mem=128G`.
+- To use idle GPUs beyond the 2-GPU limit, submit with `sbatch -p mit_normal_gpu,mit_preemptable --requeue
+  --nice=<N> job.sbatch`: preempted jobs requeue automatically on both partitions; finished cells are
+  skipped on restart and an interrupted cell reruns from scratch. Users can raise `--nice` (lower priority)
+  to order their own jobs; `scontrol top` is denied.
+- SSH from the local machine goes through a control socket
+  (`-o ControlPath=$HOME/.ssh/cm_socket/orcd-%C hgo@orcd-login.mit.edu`, with `-n -o BatchMode=yes`). If
+  it has died ("Permission denied"), the user must reopen it themselves:
+  `ssh -fN -o ControlMaster=yes -o ControlPersist=yes -o ControlPath=$HOME/.ssh/cm_socket/orcd-%C hgo@orcd-login.mit.edu`.
 - `.venv`: `module load miniforge/26.7.2-0; uv sync --extra gpu --group dev` (torch 2.9.1+cu128).
 - Credentials: W&B key in `~/.netrc`, HF token in `~/.cache/huggingface/token` (mode 600). Never print
   or commit them.
 
 ## 10. Conventions for agents
 
-- Commit with the attribution lines your session provides and push to `origin master`.
+- **Standing rule (user): before any cluster job runs new or changed code, a subagent bug-reviews and
+  tests it.** Job scripts regenerated by the already-reviewed generator with only names, LRs or time
+  limits changed do not need a new review (diff them against a reviewed one).
+- LR selection is mechanical: lowest mean final D1 loss over the seeds; if it is a grid end, run the next
+  point (edge rule) until interior. Seeds 43/44 never get their own grid.
+- Commit with the attribution lines your session provides and push to `origin master`. Locally there is
+  no git identity; commit with `git -c user.name=... -c user.email=...` as the user's setup requires.
 - Record every decision with its date in `PRETRAINING_PROTOCOL.md`, every change and run outcome in
   `LOG_CHANGES.md`. Write prose plainly for humans.
 - Tracker dashboard: https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo (may be stale since 2026-11-24).
