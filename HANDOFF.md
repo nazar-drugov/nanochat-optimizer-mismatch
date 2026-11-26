@@ -110,8 +110,15 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
 > (shortest) branch is correct; every longer length is not: at 60/240/960 (or 720), the 240-step runs
 > trained steps 49–60 on step 60's batch, and the longest runs also steps 193–240 on step 240's batch.
 > Runs without `--branch-tokens` (e.g. single 720-step runs) are unaffected. Do not launch branched
-> runs from a commit before the fix; pilot results at 240 and 960/720 steps are pending a decision on
-> reruns (user).
+> runs from a commit before the fix. Measured impact (LOG_CHANGES): at the final step learning is
+> 0.02–0.03 nats lower and forgetting higher, and the damage grows with LR and is larger for Muon
+> fine-tuning, so the 240/720/960-step LR selections and results are invalid.
+>
+> **Reruns (user, 2026-11-25): hgo reruns BOTH seed-42 pilots** (StarCoderData first, then WikiText;
+> commit 1c91504, jobs `ftp2-*`, output `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/finetune_pilot/`;
+> old outputs renamed `finetune_pilot_v1_replaybug/`). Nazar: please do not rerun the WikiText pilot.
+> Nazar's unbranched seed-43/44 WikiText runs (720 steps) have correct data and will be reused wherever
+> the rerun selects the same LR; hgo then runs the remaining main-grid cells under the protocol.
 
 ### StarCoderData pilot (done 2026-11-25)
 
