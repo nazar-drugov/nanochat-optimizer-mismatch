@@ -2,13 +2,13 @@
 
 2026-11-25 · Harry
 
-Exported 2026-11-26 from https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx (doc revision 28, current to about 06:30 on 26 November). Since then the seed-43/44 main grids and the long StarCoderData pilot have completed; see `HANDOFF.md` §6 and `LOG_CHANGES.md` for those results.
+Exported 2026-11-26 from https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx (doc revision 28, current to about 06:30 on 26 November). Since then the seed-43/44 main grids and the long StarCoderData pilot have completed; see `HANDOFF.md` §6 and `LOG_CHANGES.md` for those results. The before/after replay-fix comparison was added locally on 26 November.
 
 ## Summary
 
-The fine-tuning pilot has run all four optimizer pairs on the seed-42 base models, on StarCoderData (60, 240 and 960 steps) and WikiText (60, 240 and 720 steps), three seeds per cell. Both pilots were rerun on 26 November after a data-replay bug; every selected learning rate is inside its grid, and the bug changed only one StarCoderData pick.
+The fine-tuning pilot has run all four optimizer pairs on the seed-42 base models, on StarCoderData (60, 240 and 960 steps) and WikiText (60, 240 and 720 steps), three seeds per cell. Both pilots were rerun on 26 November after a data-replay bug; every selected learning rate is inside its grid, and 22 of 24 LR winners are unchanged. Two winners changed on rerun: StarCoderData AdamW → Muon at 60 steps (unaffected by the bug) and WikiText Muon → AdamW at 240 steps (affected).
 
-**Replay bug (fixed).** In the first pilot, the 240-step runs trained steps 49–60 on one repeated batch, and the 960/720-step runs also steps 193–240. It cut learning by up to 1 nat mid-run and 6–8% at the end; 60-step runs were unaffected. All numbers here are from the clean rerun.
+**Replay bug (fixed).** In the first pilot, the 240-step runs trained steps 49–60 on one repeated batch, and the 960/720-step runs also steps 193–240. It cut WikiText learning by up to 1 nat mid-run and approximately 6–8% at the end; 60-step runs were unaffected. Except for the explicitly labeled before/after comparison, results here are from the clean rerun.
 
 - Seeds agree closely: learning varies by 0.005 nats or less between seeds, so 3 fine-tuning seeds are enough.
 - Length matters: from 240 to 960 steps learning rises another 0.18–0.19 nats at the selected rates, while forgetting at a given rate rises up to 2.5×.
@@ -59,7 +59,7 @@ All were decided on 25 November 2026 and are recorded with reasons in `PRETRAINI
 
 ## Learning-rate sweeps
 
-Every selected learning rate is inside its grid, and for every pair the best rate falls or holds as runs get longer. The rerun changed one pick: AdamW → Muon at 60 steps moves to 3.55e-3, and its 8× point (7.10e-3) is clearly worse.
+Every selected learning rate is inside its grid. In StarCoderData the selected rates fall or hold from 240 to 960 steps. The rerun changed one StarCoderData pick: AdamW → Muon at 60 steps moves to 3.55e-3, and its 8× point (7.10e-3) is clearly worse. The WikiText Muon → AdamW pick at 240 steps also changed (see the comparison below).
 
 ![StarCoderData pilot: final learning and forgetting against the learning rate, one panel per optimizer pair, one line per length](../results/e8/figures/finetune_pilot_starcoderdata_lr.png)
 
@@ -86,6 +86,55 @@ WikiText picks lower rates, all inside its 1/16 … 2× grid:
 | Muon → Muon | 4.44e-4 | 4.44e-4 | 4.44e-4 |
 
 The 720-step WikiText rates equal those of Nazar's earlier seed-43/44 runs, which had no branches and so no bug; they are reused in the main grid.
+
+## Before vs. after the replay fix (added 2026-11-26)
+
+The tables compare the winning LR in each pilot, chosen by minimum mean final D1 loss over fine-tuning seeds 1–3 on the same seed-42 bases. Values are old → clean; learning and forgetting are in nats/token, and LR is in units of 10⁻³. The old 240/720/960-step runs are **invalid** and shown solely to document the impact of the bug. The old 60-step branches were unaffected. This is an endpoint comparison, not a matched-learning mismatch contrast.
+
+**22 of 24 LR winners are unchanged.** Both changed winners doubled their rate, but only the 240-step WikiText change is in a replay-affected run. The 60-step StarCoderData change is a near-tie between two independently rerun, unaffected branches.
+
+### StarCoderData (Python)
+
+| Pretrain → fine-tune | Steps | LR (×10⁻³), old → clean | Learning, old → clean | Forgetting, old → clean |
+|---|---:|---:|---:|---:|
+| AdamW → AdamW | 60 | 1.311 | 1.262 → 1.255 | 0.323 → 0.323 |
+| AdamW → AdamW | 240 | 1.311 | 1.511 → 1.521 | 0.718 → 0.685 |
+| AdamW → AdamW | 960 | 0.655 | 1.689 → 1.699 | 0.719 → 0.692 |
+| AdamW → Muon | 60 | **1.775 → 3.550** | 1.270 → 1.271 | 0.396 → 0.827 |
+| AdamW → Muon | 240 | 1.775 | 1.528 → 1.543 | 0.882 → 0.841 |
+| AdamW → Muon | 960 | 0.887 | 1.710 → 1.724 | 0.802 → 0.772 |
+| Muon → AdamW | 60 | 0.328 | 1.151 → 1.151 | 0.319 → 0.320 |
+| Muon → AdamW | 240 | 0.655 | 1.436 → 1.447 | 0.860 → 0.817 |
+| Muon → AdamW | 960 | 0.655 | 1.631 → 1.641 | 1.206 → 1.170 |
+| Muon → Muon | 60 | 1.775 | 1.260 → 1.260 | 0.643 → 0.641 |
+| Muon → Muon | 240 | 0.887 | 1.502 → 1.515 | 0.668 → 0.651 |
+| Muon → Muon | 960 | 0.887 | 1.684 → 1.698 | 1.145 → 1.108 |
+
+### WikiText-103
+
+| Pretrain → fine-tune | Steps | LR (×10⁻³), old → clean | Learning, old → clean | Forgetting, old → clean |
+|---|---:|---:|---:|---:|
+| AdamW → AdamW | 60 | 0.328 | 0.162 → 0.162 | 0.084 → 0.084 |
+| AdamW → AdamW | 240 | 0.655 | 0.257 → 0.271 | 0.250 → 0.229 |
+| AdamW → AdamW | 720 | 0.655 | 0.367 → 0.388 | 0.363 → 0.342 |
+| AdamW → Muon | 60 | 0.887 | 0.163 → 0.163 | 0.133 → 0.133 |
+| AdamW → Muon | 240 | 0.887 | 0.267 → 0.281 | 0.262 → 0.256 |
+| AdamW → Muon | 720 | 0.887 | 0.378 → 0.405 | 0.381 → 0.366 |
+| Muon → AdamW | 60 | 0.164 | 0.135 → 0.135 | 0.099 → 0.099 |
+| Muon → AdamW | 240 | **0.164 → 0.328** | 0.219 → 0.227 | 0.162 → 0.222 |
+| Muon → AdamW | 720 | 0.328 | 0.318 → 0.337 | 0.330 → 0.315 |
+| Muon → Muon | 60 | 0.444 | 0.156 → 0.156 | 0.113 → 0.113 |
+| Muon → Muon | 240 | 0.444 | 0.259 → 0.272 | 0.211 → 0.206 |
+| Muon → Muon | 720 | 0.444 | 0.364 → 0.391 | 0.315 → 0.304 |
+
+### What changed
+
+- **StarCoderData, AdamW → Muon, 60 steps:** the winner moved from 1.775e-3 to 3.550e-3. The old D1 losses were 1.5790 vs 1.5798 (favoring the lower rate); the clean losses are 1.5801 vs 1.5786 (favoring the higher rate). At the clean lower rate, forgetting is 0.3954; at the higher rate it is 0.8268. Both 60-step runs were unaffected by the replay bug; the near-tie changed under rerun variability. The additional 7.10e-3 point lost clearly.
+- **WikiText, Muon → AdamW, 240 steps:** the winner moved from 1.638e-4 to 3.277e-4. Old D1 losses were 2.9421 vs 2.9442; clean losses are 2.9345 vs 2.9336. At the *same* old LR, learning rose by 0.0077 and forgetting fell by 0.0078; at the *same* new LR, learning rose by 0.0106 and forgetting fell by 0.0148. The higher-rate winner adds only about 0.0008 nats of learning over the clean lower rate but increases forgetting from 0.1544 to 0.2222.
+- At the original winning rates, every affected arm and length learned more and forgot less after the fix. StarCoderData learning increased by 0.0098–0.0145 nats and forgetting fell by 0.0173–0.0434. WikiText learning increased by 0.0077–0.0269 nats and forgetting fell by 0.0056–0.0214. At the longest WikiText length, the improvement was 0.0189–0.0269 nats (about 6–7% of the old learning).
+- The final selected LRs on the longest horizons were unchanged for all four optimizer pairs in both corpora, and all clean winners are interior. The old WikiText 1× Muon LR for AdamW → Muon was a grid edge; the clean 2× extension brackets it.
+
+Sources: the original 78-cell StarCoderData summary at Git revision `ed76421`, the reconstructed [old WikiText summary](../results/e8/archive/finetune_pilot_wikitext103_pre_replay_fix_summary.json) (60 cells, archived for diagnostics only), and the clean [StarCoderData](../results/e8/finetune_pilot_starcoderdata_summary.json) and [WikiText](../results/e8/finetune_pilot_wikitext103_summary.json) summaries (84 and 72 cells, respectively). Old and clean WikiText runs were checked to share best-fit D0/D1 hashes; all archived cells contained the three completed seeds.
 
 ## Observations
 

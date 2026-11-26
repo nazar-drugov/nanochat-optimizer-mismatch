@@ -137,7 +137,9 @@ so after each branch the trunk replayed the branch's *last* batch in place of al
 branched run longer than the shortest branch trained on repeated batches. All 240/720/960-step pilot
 results from before the fix were invalid. Both seed-42 pilots were rerun from scratch on hgo
 (`finetune_pilot/`); unbranched runs (Nazar's 720-step WikiText seed-43/44 runs) were unaffected. The
-rerun moved only one selection (AdamW → Muon at 60 steps, to 3.55e-3). Impact measurement and the fix's
+rerun moved two of 24 selections: StarCoderData AdamW → Muon at 60 steps (to 3.55e-3,
+a near-tie in an unaffected branch), and WikiText Muon → AdamW at 240 steps (from 1.64e-4
+to 3.28e-4). See `reports/finetune_pilot_report.md` for the verified before/after table. Impact measurement and the fix's
 tests: LOG_CHANGES 2026-11-25. Do not launch branched runs from a commit before d330586.
 
 ## 6. Results so far and next steps
