@@ -329,6 +329,35 @@ def test_main_grid_jobs_use_each_pairs_lrs_on_every_pinned_base_seed(tmp_path):
         finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s45",
                             "--dataset", "sc=/d", "--d0-file", "/d0", "--out", str(tmp_path / "bad")])
 
+
+def test_pair_lr_fractions_reject_bad_input_and_out_root_results_are_persisted(tmp_path, capsys):
+    import pytest
+    from scripts import finetune_jobs
+    (tmp_path / "sel.json").write_text(json.dumps({"adamw": {"full_lr": 1e-3}, "muon": {"full_lr": 2e-3}}))
+    common = ["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s43", "--dataset",
+              "sc=/d", "--d0-file", "/d0", "--repo-dir", str(tmp_path)]
+    for bad in (["adamw:adamw=1,0.5", "adamw:adamw=4"], ["adamw:muon=0"], ["adamw:muon=-1"], ["adamw:muon=nan"],
+                ["adamw:muon=1,1"], ["adamw:muon=1,1.001"], ["adamw:muon=1,"], ["adamw:muon=inf"]):
+        with pytest.raises(SystemExit):
+            finetune_jobs.main(common + ["--out", str(tmp_path / "bad"), "--pair-lr-fractions", *bad])
+    for bad in (["1", "1"], ["-1"], ["nan"]):
+        with pytest.raises(SystemExit):
+            finetune_jobs.main(common + ["--out", str(tmp_path / "bad"), "--lr-fractions", *bad])
+    assert not list((tmp_path / "bad").glob("*.sbatch"))
+    capsys.readouterr()
+    finetune_jobs.main(common + ["--out", str(tmp_path / "ok"), "--out-root", "/scratch/ft_main/",
+                                 "--pair-lr-fractions", "adamw:adamw=1"])
+    assert "WARNING: pairs" in capsys.readouterr().err  # the other three pairs fall back to --lr-fractions
+    text = (tmp_path / "ok" / "ft-e8-main-adamw-s43-sc-adamw.sbatch").read_text()
+    assert "FT_ROOT=/scratch/ft_main" in text.splitlines()
+    copy = next(l for l in text.splitlines() if l.startswith("rsync -aH") and '"$FT_ROOT"' in l)
+    assert '"$POOL/results/"' in copy and "--include='*.json'" in copy and "--include='*.npz'" in copy
+    assert text.splitlines()[-1] == 'exit "$failed"'
+    finetune_jobs.main(common + ["--out", str(tmp_path / "default"), "--pair-lr-fractions", "adamw:adamw=1"])
+    text = (tmp_path / "default" / "ft-e8-main-adamw-s43-sc-adamw.sbatch").read_text()
+    assert 'FT_ROOT="$SCRATCH/finetune"' in text.splitlines()
+
+
 def test_transfer_check_runs_are_3b_runs_at_half_and_double_without_checkpoints():
     full = {"adamw": 6.5e-4, "muon": 8.9e-4}
     runs = transfer_check_runs(full)

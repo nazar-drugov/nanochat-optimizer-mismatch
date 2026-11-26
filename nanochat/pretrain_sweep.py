@@ -380,5 +380,15 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
         '"$PYTHON" -m scripts.finetune ' + " ".join(shlex.quote(a) for a in args) + " || failed=1",
     ]
     lines += PERSIST_LINES
+    # The fine-tuning output root, including the per-document arrays (*.npz) and saved eval sets (*.pt) the
+    # analysis checks; PERSIST_LINES copies only $SCRATCH/finetune's json/jsonl/log/parquet files.
+    extra = list(map(str, extra_args))
+    root = (shlex.quote(extra[extra.index("--out-root") + 1].rstrip("/")) if "--out-root" in extra
+            else '"$SCRATCH/finetune"')
+    # -H: decay branches hard-link their shared checkpoint arrays
+    lines += [f"FT_ROOT={root}",
+              "rsync -aH --prune-empty-dirs --include='*/' --include='*.json' --include='*.jsonl' --include='*.log' "
+              "--include='*.parquet' --include='*.npz' --include='*.pt' --exclude='*' \"$FT_ROOT\" \"$POOL/results/\" "
+              '|| echo "WARNING: could not copy $FT_ROOT results to $POOL/results" >&2']
     lines.append('exit "$failed"')
     return "\n".join(lines) + "\n"

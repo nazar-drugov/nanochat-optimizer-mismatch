@@ -17,6 +17,7 @@ fractions, e.g. --pair-lr-fractions adamw:adamw=1,0.5 muon:adamw=0.25,0.5 (pairs
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from nanochat.pretrain_sweep import (
@@ -51,6 +52,16 @@ def main(argv=None):
                         help="LR fractions for one (pretraining, fine-tuning) optimizer pair")
     args = parser.parse_args(argv)
     selection = json.loads(Path(args.selection).read_text())
+
+    def checked(values, ft, what):
+        """Positive finite fractions whose LRs differ in their first 3 significant digits (cell names)."""
+        if not values or not all(0 < v < float("inf") for v in values) \
+                or len({f"{v * selection[ft]['full_lr']:.3g}" for v in values}) != len(values):
+            parser.error(f"non-positive, non-finite or duplicate LR fractions: {what}")
+        return values
+
+    for ft in OPTIMIZERS:
+        checked(args.lr_fractions, ft, f"--lr-fractions {args.lr_fractions}")
     grid = finetune_lr_grid(selection, args.lr_fractions)
     pair_grid = {}
     for spec in args.pair_lr_fractions:
@@ -58,7 +69,17 @@ def main(argv=None):
         pre, _, ft = pair.partition(":")
         if pre not in OPTIMIZERS or ft not in OPTIMIZERS or not fractions:
             parser.error(f"bad --pair-lr-fractions entry: {spec!r}")
-        pair_grid[pre, ft] = finetune_lr_grid(selection, [float(f) for f in fractions.split(",")])[ft]
+        if (pre, ft) in pair_grid:
+            parser.error(f"pair given twice in --pair-lr-fractions: {spec!r}")
+        try:
+            values = [float(f) for f in fractions.split(",")]
+        except ValueError:
+            parser.error(f"bad --pair-lr-fractions entry: {spec!r}")
+        pair_grid[pre, ft] = finetune_lr_grid(selection, checked(values, ft, repr(spec)))[ft]
+    if pair_grid and len(pair_grid) < len(OPTIMIZERS) ** 2:
+        missing = sorted({(p, f) for p in OPTIMIZERS for f in OPTIMIZERS} - set(pair_grid))
+        print(f"WARNING: pairs {missing} not in --pair-lr-fractions use --lr-fractions {args.lr_fractions}",
+              file=sys.stderr)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     extra = (["--branch-tokens", *map(str, args.branch_tokens)] if args.branch_tokens else []) \
