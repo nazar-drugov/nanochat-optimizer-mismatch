@@ -83,6 +83,24 @@ authors, not a single-agent project.
   why if known, what remains affected, and what permitted alternatives are
   available. Do not silently degrade the work or bypass applicable restrictions.
 
+## Weights & Biases experiment tracking
+
+- Log **every experimental run** (pretraining, fine-tuning, LR sweeps, pilot
+  length branches, main grids, ablations, and reruns) to W&B. Keep the project
+  organized: stable descriptive run names, explicit stage/dataset/optimizer
+  metadata, pretraining and fine-tuning seeds, LR, run length, and tags/groups
+  separating sweeps, pilot, main, and extended runs. Distinguish failed and
+  invalid runs from valid scientific evidence; never silently mix them.
+- Verify logging is working before committing new compute, and verify that
+  completed runs are present. If a run was executed without W&B, backfill it
+  from the authoritative saved metrics rather than rerunning training merely
+  for logging. Avoid duplicate tracking runs when requeueing or resuming.
+- Keep the local experiment records authoritative and preserve them even if
+  W&B is unavailable: log offline and sync later if needed; explicitly alert
+  Harry to logging failures or missing credentials. Never print or commit API
+  keys or upload raw training/evaluation documents or checkpoints just for
+  tracking.
+
 ## Scientific reporting
 
 - After **every scientifically significant milestone**, create a human-readable
