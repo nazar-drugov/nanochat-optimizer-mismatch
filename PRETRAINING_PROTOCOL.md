@@ -245,11 +245,13 @@ if a transfer check fails.
 - **Main length:** open (see LOG_CHANGES 2026-11-25): the pilot lengths (60 / 240 / 960 steps;
   WikiText 60 / 240 / 720) are the candidate main lengths; a longer StarCoderData length is being
   piloted (below).
-- **StarCoderData main grid on seeds 43 and 44 (started 2026-11-25, user):** one trunk per selected LR
-  to 960 steps with 60/240 branches, fine-tuning seeds 1–3, at both seed-42 selections of each pair
-  (AdamW → AdamW 1.31e-3, 6.55e-4; AdamW → Muon 1.77e-3, 8.87e-4; Muon → AdamW 3.28e-4, 6.55e-4;
-  Muon → Muon 1.77e-3, 8.87e-4). `--pair-lr-fractions adamw:adamw=1,0.5 adamw:muon=2,1
-  muon:adamw=0.25,0.5 muon:muon=2,1`. Base checkpoints pinned by SHA-256 like seed 42.
+- **StarCoderData main grid on seeds 43 and 44 (started 2026-11-25, user; relaunched 2026-11-26 after the
+  replay fix):** one trunk per selected LR to 960 steps with 60/240 branches, fine-tuning seeds 1–3, at
+  each seed-42 selection of each pair from the clean pilot rerun (identical to the contaminated
+  selection): AdamW → AdamW 1.31e-3, 6.55e-4; AdamW → Muon 1.77e-3, 8.87e-4 (+ the 60-step pick, ×4
+  or ×8 pending the edge extension); Muon → AdamW 3.28e-4, 6.55e-4; Muon → Muon 1.77e-3, 8.87e-4.
+  `--pair-lr-fractions adamw:adamw=1,0.5 adamw:muon=2,1 muon:adamw=0.25,0.5 muon:muon=2,1`, output
+  root `finetune_main/`. Base checkpoints pinned by SHA-256 like seed 42.
 - **Long StarCoderData length pilot (started 2026-11-25, user), seed 42:** trunk to 3,200 steps
   (209.7M tokens, 97% of one best-fit pass of the training file; 3,840 would need 1.17 passes) with
   branches at 60, 240, 960 and 1,920 steps; 3-point grid per pair at ×1, ×1/2, ×1/4 the 960-step
