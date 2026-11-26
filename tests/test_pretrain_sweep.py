@@ -276,12 +276,15 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert grid["muon"] == [2e-3 * f for f in FINETUNE_LR_FRACTIONS]
     # Run one job against a fake python that records its arguments
     fake = tmp_path / "fake_python.sh"
-    fake.write_text('#!/bin/bash\necho "$@" > "$CALL_LOG"\n')
+    fake.write_text('#!/bin/bash\nif [[ "$2" == scripts.log_finetune_wandb ]]; then\n'
+                    '  echo "$@" >> "$CALL_LOG.wandb"\n'
+                    'else echo "$@" > "$CALL_LOG"; fi\n')
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     script = tmp_path / "jobs" / "ft-e8-main-adamw-s42-wikitext103-adamw.sbatch"
     (tmp_path / "scratch").mkdir()
     env = dict(os.environ, NANOCHAT_PYTHON=str(fake), NANOCHAT_SCRATCH_BASE=str(tmp_path / "scratch"),
-               NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "call.log"))
+               NANOCHAT_POOL_BASE=str(tmp_path / "pool"), CALL_LOG=str(tmp_path / "call.log"),
+               WANDB_MODE="offline")
     assert subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, timeout=60).returncode == 0
     call = (tmp_path / "call.log").read_text().split()
     assert call[:2] == ["-m", "scripts.finetune"] and call[call.index("--ft-name") + 1] == "wikitext103"
@@ -290,6 +293,10 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert call[call.index("--base-step") + 1] == str(FINETUNE_BASE_STEP)
     assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
     assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]
+    wb_call = (tmp_path / "call.log.wandb").read_text().split()
+    assert wb_call == ["-m", "scripts.log_finetune_wandb", "--root", str(tmp_path / "scratch" / "finetune"),
+                       "--stage", "finetune", "--dataset", "wikitext103", "--base-run", "e8-main-adamw-s42",
+                       "--ft-optimizer", "adamw", "--mode", "offline"]
     # Length pilot: branch lengths, output root and job prefix are passed through
     finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s42",
                         "--dataset", "starcoderdata=/data/sc", "--d0-file", "/data/d0.parquet",
@@ -298,6 +305,8 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
                         "--job-prefix", "ftpilot"])
     pilot = (tmp_path / "pilot" / "ftpilot-e8-main-adamw-s42-starcoderdata-muon.sbatch").read_text()
     assert "--seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root /scratch/finetune_pilot" in pilot
+    assert '--stage finetune_pilot --dataset starcoderdata --base-run e8-main-adamw-s42 --ft-optimizer muon' in pilot
+    assert 'WANDB_MODE=disabled' not in pilot
 
 
 

@@ -287,6 +287,15 @@ data and eval-set SHA-256s) and `result.json` (status and summary). Fine-tuning 
 - `.venv`: `module load miniforge/26.7.2-0; uv sync --extra gpu --group dev` (torch 2.9.1+cu128).
 - Credentials: W&B key in `~/.netrc`, HF token in `~/.cache/huggingface/token` (mode 600). Never print
   or commit them.
+- W&B tracking (Harry, 2026-11-26): existing project `hgo-mit/nanochat`; organized groups
+  `optimizer-mismatch-e8/pretrain/{sweep,transfer,main}` and
+  `optimizer-mismatch-e8/finetune/<dataset>/<stage>`. Fine-tuning historically disabled W&B; backfill
+  saved finalized branch histories via `python -m scripts.log_finetune_wandb --root <root> --stage <root-basename>
+  --query-existing`. Stable IDs are independent of where the run is mirrored; use the same stage/source
+  across accounts for the same run, and a distinct source and `--invalid` for contaminated archives.
+  Use `--verify-online` to check the explicit checkpoint `step` history; online reads can lag uploads.
+  Future generated jobs upload at completion, with an explicit offline fallback. Do not rerun a model
+  to repair tracking, and never upload raw document arrays or weights. See AGENTS.md.
 
 ## 10. Conventions for agents
 

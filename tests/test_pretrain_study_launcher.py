@@ -128,6 +128,19 @@ def test_wandb_is_online_with_a_key_and_offline_without(setup, tmp_path):
         assert "secret-key-123" not in result.stdout + result.stderr
 
 
+def test_wandb_study_group_matches_run_stage(setup):
+    environ = {k: v for k, v in setup["environ"].items()
+               if k not in ("WANDB_RUN_GROUP", "WANDB_JOB_TYPE", "WANDB_TAGS")}
+    for name, stage, opt, seed in (("e8-main-adamw-s43", "main", "adamw", 43),
+                                  ("e8-xfer-muon-lr0.000444-s42", "transfer", "muon", 42)):
+        result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT,
+                                env={**environ, "RUN_NAME": name}, capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0
+        assert f"WANDB_RUN_GROUP=optimizer-mismatch-e8/pretrain/{stage}\n" in result.stdout
+        assert f"WANDB_JOB_TYPE=pretrain-{stage}\n" in result.stdout
+        assert f"WANDB_TAGS=optimizer-mismatch,E8,pretrain,{stage},{opt},base-seed-{seed}\n" in result.stdout
+
+
 def test_validation_uses_the_validation_shard_and_d0_is_only_logged(setup):
     result = subprocess.run(["bash", str(LAUNCHER), "dry-run", "--train-tokens=1"], cwd=REPO_ROOT, env=setup["environ"],
                             capture_output=True, text=True, timeout=120)

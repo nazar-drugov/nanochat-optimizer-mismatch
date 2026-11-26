@@ -292,6 +292,17 @@ case "$mode" in
         else
             export WANDB_MODE="${WANDB_MODE:-offline}"
         fi
+        # Keep the research runs grouped in the existing nanochat W&B project.
+        if [[ "$RUN_NAME" =~ ^e([0-9]+)-(sweep|xfer|main)-(adamw|muon)-.*s([0-9]+)$ ]]; then
+            wb_experts="${BASH_REMATCH[1]}"
+            wb_stage="${BASH_REMATCH[2]}"
+            wb_opt="${BASH_REMATCH[3]}"
+            wb_seed="${BASH_REMATCH[4]}"
+            if [[ "$wb_stage" == xfer ]]; then wb_stage=transfer; fi
+            export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-optimizer-mismatch-e${wb_experts}/pretrain/${wb_stage}}"
+            export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-pretrain-${wb_stage}}"
+            export WANDB_TAGS="${WANDB_TAGS:-optimizer-mismatch,E${wb_experts},pretrain,${wb_stage},${wb_opt},base-seed-${wb_seed}}"
+        fi
         export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"
         export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
         log_file="$SCRATCH_BASE/logs/$RUN_NAME.log"
@@ -307,6 +318,8 @@ case "$mode" in
             # Preview only: do not run torchrun or check that data exists.
             printf 'NANOCHAT_BASE_DIR=%s\nWANDB_DIR=%s\nWANDB_MODE=%s\nTIKTOKEN_CACHE_DIR=%s\n' \
                 "$NANOCHAT_BASE_DIR" "$WANDB_DIR" "$WANDB_MODE" "$TIKTOKEN_CACHE_DIR"
+            printf 'WANDB_RUN_GROUP=%s\nWANDB_JOB_TYPE=%s\nWANDB_TAGS=%s\n' \
+                "${WANDB_RUN_GROUP:-}" "${WANDB_JOB_TYPE:-}" "${WANDB_TAGS:-}"
             printf 'Console log: %s\nMetrics JSONL: %s\nCommand: ' "$log_file" "$stats_file"
             printf '%q ' "${cmd[@]}"
             printf '\n'

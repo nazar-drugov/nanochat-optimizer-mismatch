@@ -371,23 +371,42 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
             "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
             "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds),
             *map(str, extra_args)]
+    extra = list(map(str, extra_args))
+    out_root = extra[extra.index("--out-root") + 1].rstrip("/") if "--out-root" in extra else None
+    root = shlex.quote(out_root) if out_root else '"$SCRATCH/finetune"'
+    stage = Path(out_root).name if out_root else "finetune"
+    sync_args = " ".join(shlex.quote(a) for a in ["--stage", stage, "--dataset", ft_name,
+                                                    "--base-run", base_run, "--ft-optimizer", optimizer])
     lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [
         'PYTHON="${NANOCHAT_PYTHON:-.venv/bin/python}"',
         'export NANOCHAT_BASE_DIR="$SCRATCH"',
         'export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$HOME/.cache/nanochat/tiktoken_cache}"',
-        'export WANDB_MODE=disabled',
         'export PYTHONUNBUFFERED=1  # progress lines reach the Slurm log as they happen',
         '"$PYTHON" -m scripts.finetune ' + " ".join(shlex.quote(a) for a in args) + " || failed=1",
+        # Log finalized branch histories, rather than doing network I/O in the GPU training loop.
+        # Keep local metrics authoritative and retain offline recordings if online upload fails.
+        f"FT_ROOT={root}",
+        'export WANDB_DIR="${WANDB_DIR:-$SCRATCH}"',
+        'netrc_file="${NETRC:-$HOME/.netrc}"',
+        'wb_mode=offline',
+        'if [[ -n "${WANDB_API_KEY:-}" ]] || { [[ -r "$netrc_file" ]] && grep -q "machine api.wandb.ai" "$netrc_file"; }; then',
+        '    wb_mode=online',
+        'fi',
+        'if [[ "${WANDB_MODE:-}" == offline ]]; then wb_mode=offline; fi',
+        'wb_sync() { "$PYTHON" -m scripts.log_finetune_wandb --root "$FT_ROOT" ' + sync_args + ' "$@"; }',
+        'if [[ "$wb_mode" == online ]]; then',
+        '    wb_sync --mode online --query-existing || { echo "WARNING: W&B upload failed; preparing offline histories" >&2; wb_mode=offline; }',
+        'fi',
+        'if [[ "$wb_mode" == offline ]]; then',
+        '    echo "WARNING: fine-tuning W&B histories are offline; sync and verify them later" >&2',
+        '    wb_sync --mode offline || { echo "ERROR: W&B logging failed; results remain in $FT_ROOT" >&2; failed=1; }',
+        'fi',
     ]
     lines += PERSIST_LINES
     # The fine-tuning output root, including the per-document arrays (*.npz) and saved eval sets (*.pt) the
     # analysis checks; PERSIST_LINES copies only $SCRATCH/finetune's json/jsonl/log/parquet files.
-    extra = list(map(str, extra_args))
-    root = (shlex.quote(extra[extra.index("--out-root") + 1].rstrip("/")) if "--out-root" in extra
-            else '"$SCRATCH/finetune"')
     # -H: decay branches hard-link their shared checkpoint arrays
-    lines += [f"FT_ROOT={root}",
-              "rsync -aH --prune-empty-dirs --include='*/' --include='*.json' --include='*.jsonl' --include='*.log' "
+    lines += ["rsync -aH --prune-empty-dirs --include='*/' --include='*.json' --include='*.jsonl' --include='*.log' "
               "--include='*.parquet' --include='*.npz' --include='*.pt' --exclude='*' \"$FT_ROOT\" \"$POOL/results/\" "
               '|| echo "WARNING: could not copy $FT_ROOT results to $POOL/results" >&2']
     lines.append('exit "$failed"')
