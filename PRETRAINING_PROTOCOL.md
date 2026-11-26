@@ -270,6 +270,9 @@ if a transfer check fails.
   branches (a replication of the pilot cells at those LRs) do not overwrite the pilot's.
   Result (2026-11-26): at 1,920 and 3,200 steps every pair's pick is ×1, the top of this grid; edge
   extension at ×2 (AdamW fine-tuning 1.31e-3, Muon 1.77e-3) submitted, same branches and output root.
+  Final (2026-11-26): ×2 loses at 1,920 and 3,200 steps for every pair, so the selected LRs there equal
+  the 960-step picks (AdamW → AdamW 6.55e-4, AdamW → Muon 8.87e-4, Muon → AdamW 6.55e-4, Muon → Muon 8.87e-4),
+  all interior (`results/e8/finetune_pilot_long_starcoderdata_summary.json`).
 
 ## Before the first real run
 

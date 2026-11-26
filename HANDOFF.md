@@ -203,14 +203,21 @@ Status 2026-11-26 03:40 (hgo, after the replay fix; details in LOG_CHANGES):
 - **WikiText seed-42 pilot rerun: done.** `results/e8/finetune_pilot_wikitext103_summary.json` (72 cells ×
   3 seeds). Selected, 60 / 240 / 720 steps, all interior: AdamW → AdamW 3.28e-4 / 6.55e-4 / 6.55e-4;
   AdamW → Muon 8.87e-4 ×3; Muon → AdamW 1.64e-4 / 3.28e-4 / 3.28e-4; Muon → Muon 4.44e-4 ×3.
-- **WikiText main grid, seeds 43/44: submitted on hgo** (`ftm2-*-wikitext103-*`, 60/240 steps, output
+- **WikiText main grid, seeds 43/44: complete on hgo** (`ftm2-*-wikitext103-*`, 60/240 steps, output
   `finetune_main/`); the 720-step cells are Nazar's existing unbranched runs (same LRs).
-- **StarCoderData main grid, seeds 43/44: submitted on hgo** (`ftm2-*`, `ftm2x4-*`, output
+- **StarCoderData main grid, seeds 43/44: complete on hgo** (`ftm2-*`, `ftm2x4-*`, output
   `finetune_main/`), one trunk per distinct selected LR above.
-- **Long StarCoderData pilot (seed 42, 3,200 steps): submitted on hgo** (`ftl2-*`, `finetune_pilot_long/`).
+- **Long StarCoderData pilot (seed 42, 3,200 steps): complete on hgo** (`ftl2-*`, ×2 extension `ftl2x-*`,
+  `finetune_pilot_long/`; `results/e8/finetune_pilot_long_starcoderdata_summary.json`): the 960-step picks
+  stay optimal (interior) at 1,920 and 3,200 steps for every pair. Per doubling past 960 steps learning
+  gains ~0.05–0.08 nats and forgetting ~0.11–0.19 (LOG_CHANGES 2026-11-26 10:30 / 11:30).
+- **Main-grid analyses without ℓ0** (all six bases, per dataset and length): `$SCRATCH/analysis/`
+  (`/home/hgo/jobs/run_analysis.sh`); common learning support StarCoderData 1.095 / 1.375 / 1.576 at
+  60 / 240 / 960 steps, WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
 
-1. Check the WikiText main grid's 240-step trunks against Nazar's 720-step runs in the constant phase (passed for the 9 runs done by 07:30: max |ΔD1| ≤ 6.4e-4 at steps 2–128; finish for the rest).
-2. **User decisions:** the main fine-tuning length and ℓ0 (from the learning curves, before computing
+1. Done: the WikiText main grid's 240-step trunks match Nazar's 720-step runs at steps 2–128 (all 36; one transient at step 32).
+2. **User decisions (all evidence in):** the main fine-tuning length (if 1,920 or 3,200 steps, seeds 43/44 need
+   runs at the 960-step picks with those branches) and ℓ0 (from the learning curves, before computing
    the forgetting contrast; protocol "Fine-tuning main grid").
 3. Done (0d4fdd0): `analyze_finetune --bases ... --lr-selection <seed-42 analysis.json>` for the main grid; diverged runs handled.
 4. Seed 42 reuses the pilot runs in the main analysis.
