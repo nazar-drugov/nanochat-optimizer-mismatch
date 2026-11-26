@@ -243,7 +243,19 @@ if a transfer check fails.
   curves (the range every cell reaches) before computing the forgetting contrast at it, and report the
   contrast over the whole common learning range as well, so the choice of ℓ0 cannot steer the result.
 - **Main length:** open (see LOG_CHANGES 2026-11-25): the pilot lengths (60 / 240 / 960 steps;
-  WikiText 60 / 240 / 720) are the candidate main lengths; whether to add a longer one is pending.
+  WikiText 60 / 240 / 720) are the candidate main lengths; a longer StarCoderData length is being
+  piloted (below).
+- **StarCoderData main grid on seeds 43 and 44 (started 2026-11-25, user):** one trunk per selected LR
+  to 960 steps with 60/240 branches, fine-tuning seeds 1–3, at both seed-42 selections of each pair
+  (AdamW → AdamW 1.31e-3, 6.55e-4; AdamW → Muon 1.77e-3, 8.87e-4; Muon → AdamW 3.28e-4, 6.55e-4;
+  Muon → Muon 1.77e-3, 8.87e-4). `--pair-lr-fractions adamw:adamw=1,0.5 adamw:muon=2,1
+  muon:adamw=0.25,0.5 muon:muon=2,1`. Base checkpoints pinned by SHA-256 like seed 42.
+- **Long StarCoderData length pilot (started 2026-11-25, user), seed 42:** trunk to 3,200 steps
+  (209.7M tokens, 97% of one best-fit pass of the training file; 3,840 would need 1.17 passes) with
+  branches at 60, 240, 960 and 1,920 steps; 3-point grid per pair at ×1, ×1/2, ×1/4 the 960-step
+  selection (the selected LR fell or held from 240 to 960 steps for every pair); same edge rule and
+  selection rule (lowest mean final D1 loss over seeds 1–3). Separate output root so its 60–960-step
+  branches (a replication of the pilot cells at those LRs) do not overwrite the pilot's.
 
 ## Before the first real run
 

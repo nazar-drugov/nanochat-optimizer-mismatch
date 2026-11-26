@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS
+from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS, base_run_seed
 
 BASES = ("e8-main-adamw-s42", "e8-main-muon-s42")
 OPTS = ("adamw", "muon")
@@ -80,7 +80,7 @@ def load_runs(roots, dataset, steps, seeds):
                 for field in ("base_run", "ft_optimizer", "seed", "lr", "ft_steps"):
                     check(cell.get(field) == result.get(field), f"config/result {field} mismatch: {path}")
                 identity = config.get("base", {})
-                check(identity.get("step") == 11445 and identity.get("user_config", {}).get("seed") == 42,
+                check(identity.get("step") == 11445 and identity.get("user_config", {}).get("seed") == base_run_seed(base),
                       f"wrong base checkpoint step or seed: {path}")
                 check(identity["user_config"].get("optimizer_name") == base.split("-")[2],
                       f"wrong base optimizer: {path}")

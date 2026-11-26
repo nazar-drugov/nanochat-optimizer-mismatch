@@ -54,7 +54,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bo
 from nanochat.dataset import list_parquet_files
 from nanochat.eval_set import EvalSet, build_eval_set, per_doc_sums
 from nanochat.pretrain_sweep import (
-    FINETUNE_BASE_CHECKPOINTS, FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP,
+    FINETUNE_BASE_CHECKPOINTS, FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP, base_run_seed,
 )
 from nanochat.finetune_metrics import (
     expert_relative_change, flip_cause_counts, load_shares, maxvio, route_comparison, separation, top2_margin,
@@ -434,7 +434,7 @@ def main(argv=None):
     parser.add_argument("--base-checkpoints-dir", default=str(FINETUNE_BASE_CHECKPOINTS_DIR),
                         help=f"default: {FINETUNE_BASE_CHECKPOINTS_DIR}")
     parser.add_argument("--base-step", type=int, default=FINETUNE_BASE_STEP,
-                        help=f"default: seed-42 best checkpoint, step {FINETUNE_BASE_STEP}")
+                        help=f"default: final checkpoint of the main runs, step {FINETUNE_BASE_STEP}")
     parser.add_argument("--ft-data-dir", required=True, help="train_*.parquet + val_*.parquet (scripts/make_finetune_data.py)")
     parser.add_argument("--ft-name", required=True, help="dataset name used in outputs, e.g. wikitext103")
     parser.add_argument("--d0-file", required=True, help="held-out pretraining-distribution parquet (D0)")
@@ -484,7 +484,7 @@ def main(argv=None):
         parser.error(f"checkpoint step mismatch in {meta_path}")
     if using_shared_checkpoints:
         expected_optimizer, expected_sha256 = FINETUNE_BASE_CHECKPOINTS[args.base_run]
-        if (base_step != FINETUNE_BASE_STEP or user_config.get("seed") != 42
+        if (base_step != FINETUNE_BASE_STEP or user_config.get("seed") != base_run_seed(args.base_run)
                 or user_config.get("optimizer_name") != expected_optimizer):
             parser.error(f"unexpected base checkpoint metadata in {meta_path}")
     model_sha256 = file_sha256(model_path)

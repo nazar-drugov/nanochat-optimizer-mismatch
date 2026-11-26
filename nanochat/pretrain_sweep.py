@@ -339,7 +339,19 @@ FINETUNE_BASE_STEP = 11445
 FINETUNE_BASE_CHECKPOINTS = {
     "e8-main-adamw-s42": ("adamw", "de13193a8de30cb460a891b97bf67d195b97d611fc53d26b37b523507fcbd8d2"),
     "e8-main-muon-s42": ("muon", "2eff018763ccde5fd70b3a60df18a3e0a812f4b126ec0860fac8cf0be286c926"),
+    "e8-main-adamw-s43": ("adamw", "78f88110ad8efad1243d4e9f265959d51774f2ef38248b7bc115e0c27f3c382a"),
+    "e8-main-muon-s43": ("muon", "5ea0be1bfdd93e1fc8ec9115f27db6a7aff467e5ad0686866e1681402a4785bd"),
+    "e8-main-adamw-s44": ("adamw", "f893d26a7261ef6c2faf5ab3a2aefaa52f9de15d7e22a821c17e91f358af9035"),
+    "e8-main-muon-s44": ("muon", "13e89b545f96d2b8a34d6bab008d97496cfd142b98d505044c9b56a815b40c23"),
 }
+
+
+def base_run_seed(base_run):
+    """Pretraining seed of a pinned base run, from its name (e8-main-<optimizer>-s<seed>)."""
+    match = re.fullmatch(r"e8-main-(adamw|muon)-s(\d+)", base_run)
+    if match is None:
+        raise ValueError(f"not a main base run name: {base_run!r}")
+    return int(match.group(2))
 # Fine-tuning LR grid per fine-tuning optimizer: fractions of that optimizer's selected
 # 3B-token pretraining LR, spaced x2 (EXPERIMENT_SPEC.md §6: 5-point grid per cell).
 FINETUNE_LR_FRACTIONS = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
@@ -353,7 +365,7 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
                         seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings(), extra_args=()):
     """One process runs every (LR, seed) cell of one base model, dataset and fine-tuning optimizer."""
     if not RUN_NAME_PATTERN.match(base_run) or base_run not in FINETUNE_BASE_CHECKPOINTS:
-        raise ValueError(f"fine-tuning base run must be a pinned seed-42 checkpoint: {base_run!r}")
+        raise ValueError(f"fine-tuning base run must be a pinned main-run checkpoint: {base_run!r}")
     args = ["--base-run", base_run, "--base-checkpoints-dir", str(FINETUNE_BASE_CHECKPOINTS_DIR),
             "--base-step", str(FINETUNE_BASE_STEP),
             "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),

@@ -300,6 +300,35 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert "--seeds 1 2 3 --branch-tokens 3932160 62914560 --out-root /scratch/finetune_pilot" in pilot
 
 
+
+def test_main_grid_jobs_use_each_pairs_lrs_on_every_pinned_base_seed(tmp_path):
+    import pytest
+    from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS, base_run_seed
+    from scripts import finetune_jobs
+    assert {base_run_seed(r) for r in FINETUNE_BASE_CHECKPOINTS} == {42, 43, 44}
+    assert all(FINETUNE_BASE_CHECKPOINTS[r][0] == r.split("-")[2] for r in FINETUNE_BASE_CHECKPOINTS)
+    selection = {"adamw": {"full_lr": 1e-3}, "muon": {"full_lr": 2e-3}}
+    (tmp_path / "sel.json").write_text(json.dumps(selection))
+    finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s43",
+                        "e8-main-muon-s44", "--dataset", "starcoderdata=/data/sc", "--d0-file", "/data/d0.parquet",
+                        "--out", str(tmp_path / "jobs"), "--repo-dir", str(tmp_path), "--seeds", "1", "2", "3",
+                        "--pair-lr-fractions", "adamw:adamw=1,0.5", "muon:adamw=0.25,0.5", "adamw:muon=2,1"])
+    lrs = {}
+    for job in (tmp_path / "jobs").glob("*.sbatch"):
+        line = next(l for l in job.read_text().splitlines() if "--lrs" in l).split()
+        lrs[job.stem] = line[line.index("--lrs") + 1]
+    assert lrs["ft-e8-main-adamw-s43-starcoderdata-adamw"] == f"adamw={1e-3!r},{5e-4!r}"
+    assert lrs["ft-e8-main-muon-s44-starcoderdata-adamw"] == f"adamw={2.5e-4!r},{5e-4!r}"
+    assert lrs["ft-e8-main-adamw-s43-starcoderdata-muon"] == f"muon={4e-3!r},{2e-3!r}"
+    assert lrs["ft-e8-main-muon-s44-starcoderdata-muon"].count(",") == 4  # not listed: the default grid
+    with pytest.raises(SystemExit):
+        finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s43",
+                            "--dataset", "sc=/d", "--d0-file", "/d0", "--out", str(tmp_path / "bad"),
+                            "--pair-lr-fractions", "adam:muon=1"])
+    with pytest.raises(ValueError):
+        finetune_jobs.main(["--selection", str(tmp_path / "sel.json"), "--base-runs", "e8-main-adamw-s45",
+                            "--dataset", "sc=/d", "--d0-file", "/d0", "--out", str(tmp_path / "bad")])
+
 def test_transfer_check_runs_are_3b_runs_at_half_and_double_without_checkpoints():
     full = {"adamw": 6.5e-4, "muon": 8.9e-4}
     runs = transfer_check_runs(full)
