@@ -97,7 +97,7 @@ def write_grid(root, packing="bestfit", n_docs=2, with_eval_sets=False, bases=a.
                             "lr": lr, "ft_steps": 2}
                     config = {"cell": cell, "moe_layer_indices": [0],
                               "model_config": {"n_experts": 8},
-                              "base": {"step": 11445, "user_config": {"seed": 42,
+                              "base": {"step": 11445, "user_config": {"seed": a.base_run_seed(base),
                                       "optimizer_name": base.split("-")[2]}},
                               "args": {"total_batch_size": 65536},
                               "data": {"eval_sets": {d: eval_identity(d, packing, n_docs, **identity_changes)
@@ -264,3 +264,83 @@ def test_real_bestfit_and_contiguous_sets_pass_the_per_document_checks(tmp_path)
         assert es.doc_ids.max() == es.n_docs - 1 and counts.sum() == es.n_scored
         if packing == "bestfit":
             assert es.doc_rows is not None and es.doc_rows.numel() == es.n_docs
+
+
+MAIN_BASES = ("e8-main-adamw-s42", "e8-main-adamw-s43", "e8-main-adamw-s44",
+              "e8-main-muon-s42", "e8-main-muon-s43", "e8-main-muon-s44")
+
+
+def test_main_grid_reuses_the_seed42_lrs_on_every_base_and_pools_the_contrast(tmp_path):
+    pilot = write_grid(tmp_path / "pilot")
+    run_main([pilot], tmp_path)
+    selection = json.loads((tmp_path / "out" / "analysis.json").read_text())
+    sel = tmp_path / "selection.json"
+    sel.write_text(json.dumps(selection))
+    main = write_grid(tmp_path / "main", bases=MAIN_BASES[1:3] + MAIN_BASES[4:])
+    argv = ["--root", str(pilot), "--root", str(main), "--dataset", "data", "--steps", "2",
+            "--seeds", "1", "2", "--bases", *MAIN_BASES, "--lr-selection", str(sel),
+            "--ell0", ".1", "--bootstrap", "10", "--out", str(tmp_path / "out6")]
+    with pytest.raises(ValueError, match="grid edge"):       # the 2-LR pilot grid picks its lowest LR
+        a.main(argv)
+    for row in selection["lr_selection"]:
+        row["edge"] = False
+    sel.write_text(json.dumps(selection))
+    a.main(argv)
+    summary = json.loads((tmp_path / "out6" / "analysis.json").read_text())
+    assert summary["status"] == "fixed_lrs" and summary["bases"] == list(MAIN_BASES)
+    assert {r["lr"] for r in summary["lr_selection"]} == {.01} and len(summary["lr_selection"]) == 12
+    assert len(summary["matched_runs"]) == 24 and len(summary["contrasts"]) == 6
+    assert set(summary["pooled_contrasts"]) == {"adamw", "muon"}
+    assert set(summary["bootstrap"]["pooled_mismatch_ci"]) == {"adamw", "muon"}
+    assert (tmp_path / "out6" / "matched_forgetting.png").is_file()
+    shutil.copytree(main / MAIN_BASES[1], tmp_path / "copy" / MAIN_BASES[1])
+    with pytest.raises(ValueError, match="duplicate run"):
+        a.main([*argv, "--root", str(tmp_path / "copy")])
+    sel.write_text(json.dumps({**selection, "steps": 3}))
+    with pytest.raises(ValueError, match="3 steps, not data, 2"):
+        a.main(argv)
+    sel.write_text(json.dumps(selection))
+    with pytest.raises(ValueError, match="pinned base runs"):
+        a.main([*argv, "--bases", "e8-main-adamw-s45"])
+    wrong = json.loads(sel.read_text())                      # a selection made on other runs
+    wrong["lr_selection"][0]["mean_final_d1_loss"] += .01
+    sel.write_text(json.dumps(wrong))
+    with pytest.raises(ValueError, match="differ from those"):
+        a.main(argv)
+    for change, message in ((lambda x: x["lr_selection"][0].update(base_run="e8-main-adamw-s43"), "seed-42"),
+                            (lambda x: x.update(seeds=[1, 2, 3]), "used seeds"),
+                            (lambda x: x["eval_sets"]["D1"].update(sha256="other"), "D1 evaluation set")):
+        wrong = json.loads(json.dumps(selection))
+        change(wrong)
+        sel.write_text(json.dumps(wrong))
+        with pytest.raises(ValueError, match=message):
+            a.main(argv)
+
+
+def test_a_diverged_seed_makes_its_lr_the_worst_and_never_selected(tmp_path):
+    root = write_grid(tmp_path / "runs")
+    path = next(root.glob(f"{a.BASES[0]}/data/adamw-lr0.01-s1/result.json"))
+    result = json.loads(path.read_text())
+    result.update(status="diverged", curve=result["curve"][:1])
+    path.write_text(json.dumps(result))
+    run_main([root], tmp_path)
+    summary = json.loads((tmp_path / "out" / "analysis.json").read_text())
+    rows = {(r["base_run"], r["ft_optimizer"], r["lr"]): r for r in summary["lr_selection"]}
+    assert rows[(a.BASES[0], "adamw", .01)]["mean_final_d1_loss"] is None
+    assert rows[(a.BASES[0], "adamw", .01)]["diverged_seeds"] == 1
+    assert rows[(a.BASES[0], "adamw", .02)]["selected"] and rows[(a.BASES[1], "adamw", .01)]["selected"]
+    assert len(summary["diverged_runs"]) == 1
+    result["status"] = "running"
+    path.write_text(json.dumps(result))
+    with pytest.raises(ValueError, match="incomplete run"):
+        run_main([root], tmp_path)
+
+
+def test_runs_with_different_warmup_or_decay_are_rejected(tmp_path):
+    root = write_grid(tmp_path / "runs")
+    for i, path in enumerate(sorted(root.glob("*/data/*/result.json"))):
+        result = json.loads(path.read_text())
+        result.update(warmup_steps=8, decay_steps=48 if i else 47)
+        path.write_text(json.dumps(result))
+    with pytest.raises(ValueError, match="warmup/decay steps differ"):
+        run_main([root], tmp_path)

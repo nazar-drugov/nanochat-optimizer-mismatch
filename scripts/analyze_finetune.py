@@ -4,6 +4,14 @@ Run after the grid finishes, e.g.:
   python -m scripts.analyze_finetune --root <hgo-output> --root <nazar-output> \
       --dataset starcoderdata --steps 240 --seeds 1 2 3 --out <analysis-output>
 Add --ell0 only after declaring a common D1-learning target. No GPU or W&B needed.
+
+Main grid (seeds 43/44 reuse the seed-42 LRs): first analyze the seed-42 pilot at the same length,
+then pass its analysis.json with --lr-selection and list every base run with --bases, e.g.
+  python -m scripts.analyze_finetune --root <pilot> --root <main> --dataset starcoderdata --steps 960 \
+      --seeds 1 2 3 --bases e8-main-adamw-s42 e8-main-adamw-s43 e8-main-adamw-s44 \
+      e8-main-muon-s42 e8-main-muon-s43 e8-main-muon-s44 --lr-selection <pilot-analysis>/analysis.json --out <dir>
+A (base, optimizer, seed, LR) cell found under two roots is an error: point --root at directories that
+hold one copy of each run (e.g. a staging root of symlinked <base>/<dataset> directories).
 """
 import argparse
 import csv
@@ -48,17 +56,20 @@ class Run:
     curve: list
     config: dict
     fingerprint: int | None = None
+    status: str = "completed"
+    schedule: tuple = (None, None)  # (warmup_steps, decay_steps)
 
     @property
     def arm(self):
         return self.base, self.ft
 
 
-def load_runs(roots, dataset, steps, seeds):
+def load_runs(roots, dataset, steps, seeds, bases=BASES):
+    """Completed and diverged runs; a diverged run keeps its curve up to the divergence."""
     if isinstance(roots, Path):
         roots = [roots]
-    runs = []
-    for base in BASES:
+    runs, seen = [], {}
+    for base in bases:
         for root in roots:
             folder = root / base / dataset
             if not folder.is_dir():
@@ -71,7 +82,8 @@ def load_runs(roots, dataset, steps, seeds):
                 check(config_path.is_file(), f"missing config: {config_path}")
                 config = read(config_path)
                 cell = config.get("cell", {})
-                check(result.get("status") == "completed", f"incomplete run: {path}")
+                status = result.get("status")
+                check(status in ("completed", "diverged"), f"incomplete run: {path}")
                 check(result.get("base_run") == base and result.get("ft_dataset") == dataset,
                       f"result identity mismatch: {path}")
                 ft, seed, lr = result["ft_optimizer"], result["seed"], result["lr"]
@@ -90,7 +102,10 @@ def load_runs(roots, dataset, steps, seeds):
                 check(config.get("model_config", {}).get("n_experts", 8) == 8,
                       f"unexpected expert count: {path}")
                 curve = result.get("curve", [])
-                check(curve and curve[-1]["step"] == steps, f"missing final checkpoint: {path}")
+                if status == "completed":
+                    check(curve and curve[-1]["step"] == steps, f"missing final checkpoint: {path}")
+                else:
+                    check(not curve or curve[-1]["step"] <= steps, f"checkpoint past the end: {path}")
                 check(all(a["step"] < b["step"] for a, b in zip(curve, curve[1:])),
                       f"nonmonotone checkpoints: {path}")
                 for point in curve:
@@ -98,9 +113,15 @@ def load_runs(roots, dataset, steps, seeds):
                         check(math.isfinite(point[field]), f"nonfinite {field}: {path}")
                     check(abs(point["F_route"] + point["F_fixed"] - point["forgetting"]) < 1e-7,
                           f"replay identity fails: {path}, step {point['step']}")
+                key = base, ft, int(seed), f"{float(lr):.6g}"
+                check(key not in seen, f"duplicate run: {path} and {seen.get(key)}")
+                seen[key] = path
                 runs.append(Run(path.parent, base, ft, int(seed), float(lr), steps, curve, config,
-                                result.get("data_fingerprint")))
+                                result.get("data_fingerprint"), status,
+                                (result.get("warmup_steps"), result.get("decay_steps"))))
     check(runs, f"no completed runs for {dataset}, {steps} steps")
+    schedules = {r.schedule for r in runs if r.schedule != (None, None)}
+    check(len(schedules) <= 1, f"warmup/decay steps differ across runs: {sorted(schedules, key=str)}")
     eval_packing(runs)
     for d in ("D0", "D1"):
         identities = {tuple(eval_identity(r, d).get(field) for field in EVAL_IDENTITY_FIELDS) for r in runs}
@@ -111,14 +132,22 @@ def load_runs(roots, dataset, steps, seeds):
     train_sets = {json.dumps(r.config["data"].get("ft_train_files"), sort_keys=True) for r in runs}
     check(len(train_sets) == 1, "fine-tuning training data differ across runs")
     for seed in seeds:
-        fingerprints = {r.fingerprint for r in runs if r.seed == seed and r.fingerprint is not None}
+        fingerprints = {r.fingerprint for r in runs
+                        if r.seed == seed and r.fingerprint is not None and r.status == "completed"}
         check(len(fingerprints) <= 1, f"paired data order differs for seed {seed}")
     return runs
 
 
-def select_lrs(runs, seeds, min_lrs):
+def mean_final_d1(cells):
+    """Mean final D1 loss over seeds; None (worst) if any seed diverged."""
+    if any(r.status != "completed" for r in cells):
+        return None
+    return float(np.mean([r.curve[-1]["loss_d1"] for r in cells]))
+
+
+def select_lrs(runs, seeds, min_lrs, bases=BASES):
     selected, rows = {}, []
-    for base in BASES:
+    for base in bases:
         for ft in OPTS:
             arm = base, ft
             group = [r for r in runs if r.arm == arm]
@@ -130,15 +159,66 @@ def select_lrs(runs, seeds, min_lrs):
                 check(len(cells) == len(seeds) and {r.seed for r in cells} == set(seeds),
                       f"{arm}, LR {lr}: missing or duplicate seeds")
                 row = {"base_run": base, "ft_optimizer": ft, "lr": lr,
-                       "mean_final_d1_loss": float(np.mean([r.curve[-1]["loss_d1"] for r in cells])),
-                       "seeds": len(cells), "selected": False, "edge": False}
+                       "mean_final_d1_loss": mean_final_d1(cells),
+                       "seeds": len(cells), "diverged_seeds": sum(r.status != "completed" for r in cells),
+                       "selected": False, "edge": False}
                 group_rows.append(row)
-            choice = min(group_rows, key=lambda x: (x["mean_final_d1_loss"], x["lr"]))
+            finite = [x for x in group_rows if x["mean_final_d1_loss"] is not None]
+            check(finite, f"{arm}: every LR diverged")
+            choice = min(finite, key=lambda x: (x["mean_final_d1_loss"], x["lr"]))
             choice["selected"] = True
             choice["edge"] = choice["lr"] in (grid[0], grid[-1])
             selected[arm] = choice["lr"]
             rows.extend(group_rows)
     return selected, rows
+
+
+def fixed_lrs(runs, seeds, path, dataset, steps, bases=BASES):
+    """Use the LR selected for each (pretraining optimizer, fine-tuning optimizer) pair in an earlier
+    analysis (the seed-42 pilot) for every base run, as the protocol prescribes for seeds 43 and 44."""
+    source = read(Path(path))
+    check(source.get("dataset") == dataset and source.get("steps") == steps,
+          f"{path} is for {source.get('dataset')}, {source.get('steps')} steps, not {dataset}, {steps}")
+    check(not source.get("lr_selection_source"), f"{path} reused LRs itself; give the analysis that selected them")
+    check(all(row["base_run"].endswith("-s42") for row in source["lr_selection"]),
+          f"{path} did not select on the seed-42 base runs")
+    check(sorted(source.get("seeds", [])) == sorted(seeds), f"{path} used seeds {source.get('seeds')}, not {seeds}")
+    for d in ("D0", "D1"):
+        current = {f: eval_identity(runs[0], d).get(f) for f in EVAL_IDENTITY_FIELDS}
+        check(source.get("eval_sets", {}).get(d) == current, f"{path} used a different {d} evaluation set")
+    picks, source_d1 = {}, {}
+    for row in source["lr_selection"]:
+        if row["selected"]:
+            source_d1[row["base_run"], row["ft_optimizer"]] = row["mean_final_d1_loss"]
+            pair = row["base_run"].split("-")[2], row["ft_optimizer"]
+            check(pair not in picks, f"{path}: more than one selected LR for {pair}")
+            check(not row["edge"], f"{path}: {pair} was selected at the grid edge")
+            picks[pair] = row["lr"]
+    selected, rows = {}, []
+    for base in bases:
+        for ft in OPTS:
+            pair = base.split("-")[2], ft
+            check(pair in picks, f"{path} selects no LR for {pair}")
+            cells = [r for r in runs if r.arm == (base, ft) and math.isclose(r.lr, picks[pair], rel_tol=1e-6)]
+            check(len(cells) == len(seeds) and {r.seed for r in cells} == set(seeds),
+                  f"{(base, ft)}, LR {picks[pair]}: missing or duplicate seeds")
+            check(all(r.status == "completed" for r in cells), f"{(base, ft)}, LR {picks[pair]}: a seed diverged")
+            if (base, ft) in source_d1:  # the seed-42 runs must be the ones the selection used
+                check(math.isclose(mean_final_d1(cells), source_d1[(base, ft)], rel_tol=1e-9, abs_tol=1e-12),
+                      f"{(base, ft)}: the runs found differ from those {path} selected on")
+            selected[(base, ft)] = cells[0].lr
+            rows.append({"base_run": base, "ft_optimizer": ft, "lr": cells[0].lr,
+                         "mean_final_d1_loss": mean_final_d1(cells), "seeds": len(cells), "diverged_seeds": 0,
+                         "selected": True, "edge": False})
+    return selected, rows
+
+
+def pooled(penalties_by_base):
+    """Mean mismatch penalty over the base runs of each pretraining optimizer."""
+    by_opt = {}
+    for base, value in penalties_by_base.items():
+        by_opt.setdefault(base.split("-")[2], []).append(value)
+    return {opt: float(np.mean(values)) for opt, values in by_opt.items()}
 
 
 def match_curve(curve, ell0):
@@ -303,7 +383,7 @@ def resampled_curve(run, data, idx0, idx1):
              "F_fixed": float(rep[i]-l00)} for i, p in enumerate(run.curve)]
 
 
-def bootstrap(runs, seeds, ell0, repetitions, random_seed):
+def bootstrap(runs, seeds, ell0, repetitions, random_seed, bases=BASES):
     if repetitions == 0:
         return None
     data = {id(r): doc_data(r) for r in runs}
@@ -313,8 +393,9 @@ def bootstrap(runs, seeds, ell0, repetitions, random_seed):
     n0, n1 = n0.pop(), n1.pop()
     rng = np.random.default_rng(random_seed)
     lookup = {(r.base, r.ft, r.seed): r for r in runs}
-    values = {(base, ft): [] for base in BASES for ft in OPTS}
-    penalties = {base: [] for base in BASES}
+    values = {(base, ft): [] for base in bases for ft in OPTS}
+    penalties = {base: [] for base in bases}
+    pooled_penalties = {}
     rejected = 0
     for _ in range(repetitions):
         sample_seeds = rng.choice(seeds, size=len(seeds), replace=True)
@@ -337,18 +418,24 @@ def bootstrap(runs, seeds, ell0, repetitions, random_seed):
             continue
         for arm, value in arm_f.items():
             values[arm].append(value)
-        for base in BASES:
+        sample = {}
+        for base in bases:
             opt = base.split("-")[2]
             other = "muon" if opt == "adamw" else "adamw"
-            penalties[base].append(arm_f[(base, other)]-arm_f[(base, opt)])
+            sample[base] = arm_f[(base, other)]-arm_f[(base, opt)]
+            penalties[base].append(sample[base])
+        for opt, value in pooled(sample).items():
+            pooled_penalties.setdefault(opt, []).append(value)
     accepted = repetitions-rejected
     check(accepted >= max(1, math.ceil(0.8*repetitions)),
           f"too many bootstrap samples cannot reach ell0 ({rejected}/{repetitions}); lower ell0")
     ci = lambda x: [float(v) for v in np.quantile(x, [0.025, 0.975])]
     return {"repetitions": repetitions, "accepted": accepted, "rejected": rejected,
-            "method": "paired seed and common D0/D1 document resampling, selected LRs fixed",
+            "method": "paired seed and common D0/D1 document resampling, selected LRs fixed"
+                      + (", base runs fixed (not resampled)" if len(bases) > 2 else ""),
             "arm_ci": {"/".join(k): ci(v) for k, v in values.items()},
-            "mismatch_ci": {k: ci(v) for k, v in penalties.items()}}
+            "mismatch_ci": {k: ci(v) for k, v in penalties.items()},
+            "pooled_mismatch_ci": {k: ci(v) for k, v in pooled_penalties.items()}}
 
 
 def midranks(values):
@@ -384,12 +471,18 @@ def write_csv(path, rows):
         writer.writeheader()
         writer.writerows(rows)
 
-def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, ell0):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
-    for ax, base in zip(axes, BASES):
+def arm_label(base, ft):
+    _, _, pre, seed = base.split("-")
+    return f"{pre[0].upper()}{seed}→{ft[0].upper()}"
+
+
+def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, ell0, bases=BASES):
+    fig, axes = plt.subplots(1, len(bases), figsize=(5.5*len(bases), 4), sharey=True, squeeze=False)
+    axes = axes[0]
+    for ax, base in zip(axes, bases):
         for ft in OPTS:
-            rows = sorted((x for x in lr_rows if (x["base_run"], x["ft_optimizer"]) == (base, ft)),
-                          key=lambda x: x["lr"])
+            rows = sorted((x for x in lr_rows if (x["base_run"], x["ft_optimizer"]) == (base, ft)
+                           and x["mean_final_d1_loss"] is not None), key=lambda x: x["lr"])
             ax.plot([x["lr"] for x in rows], [x["mean_final_d1_loss"] for x in rows], "o-", label=ft)
             chosen = next(x for x in rows if x["selected"])
             ax.scatter(chosen["lr"], chosen["mean_final_d1_loss"], s=130,
@@ -399,16 +492,16 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
         ax.set_xlabel("Fine-tuning matrix LR")
         ax.grid(alpha=.25)
     axes[0].set_ylabel("Mean final D1 loss (nats/token)")
-    axes[1].legend(title="FT optimizer")
+    axes[-1].legend(title="FT optimizer")
     fig.tight_layout()
     fig.savefig(out / "lr_selection.png", dpi=180)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for run in runs:
-        if selected[run.arm] != run.lr:
+        if not math.isclose(selected[run.arm], run.lr, rel_tol=1e-6):
             continue
-        label = f"{run.base.split('-')[2]}→{run.ft}, s{run.seed}"
+        label = f"{arm_label(*run.arm)}, s{run.seed}"
         ax.plot([0, *[p["learning"] for p in run.curve]],
                 [0, *[p["forgetting"] for p in run.curve]], alpha=.5, label=label)
     if ell0 is not None:
@@ -421,37 +514,37 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
     plt.close(fig)
 
     if matches:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        for i, base in enumerate(BASES):
-            opt = base.split("-")[2]
+        arms = [(base, ft) for base in bases for ft in OPTS]
+        labels = [arm_label(*arm) for arm in arms]
+        width_in = max(7, 0.9*len(arms))
+        fig, ax = plt.subplots(figsize=(width_in, 4))
+        for i, base in enumerate(bases):
             for j, ft in enumerate(OPTS):
                 values = [r["forgetting"] for r in matches
                           if (r["base_run"], r["ft_optimizer"]) == (base, ft)]
                 ax.scatter([i*3+j]*len(values), values, alpha=.6)
                 ax.plot(i*3+j, np.mean(values), "k_", markersize=18)
-        ax.set_xticks([0, 1, 3, 4], ["A→A", "A→M", "M→A", "M→M"])
+        ax.set_xticks([i*3+j for i in range(len(bases)) for j in range(len(OPTS))], labels)
         ax.set_ylabel(f"D0 forgetting at learning {ell0:g}")
         ax.grid(axis="y", alpha=.25)
         fig.tight_layout()
         fig.savefig(out / "matched_forgetting.png", dpi=180)
         plt.close(fig)
 
-        labels = ["A→A", "A→M", "M→A", "M→M"]
-        arms = [(base, ft) for base in BASES for ft in OPTS]
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        fig, axes = plt.subplots(1, 2, figsize=(2*width_in, 4))
         for ax, field, title in zip(axes, ("flip_rate", "maxvio"),
                                     ("D0 route flip rate", "D0 maximum load violation")):
             means = [np.mean([r[field] for r in router_rows
                               if (r["base_run"], r["ft_optimizer"]) == arm]) for arm in arms]
-            ax.bar(range(4), means)
-            ax.set_xticks(range(4), labels)
+            ax.bar(range(len(arms)), means)
+            ax.set_xticks(range(len(arms)), labels)
             ax.set_title(title)
             ax.grid(axis="y", alpha=.25)
         fig.tight_layout()
         fig.savefig(out / "router_diagnostics.png", dpi=180)
         plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(7, 4))
+        fig, ax = plt.subplots(figsize=(width_in, 4))
         width = .35
         for i, arm in enumerate(arms):
             rows = [r for r in matches if (r["base_run"], r["ft_optimizer"]) == arm]
@@ -459,7 +552,7 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
                    color="tab:blue", label="F_route" if i == 0 else None)
             ax.bar(i+width/2, np.mean([r["F_fixed"] for r in rows]), width,
                    color="tab:orange", label="F_fixed" if i == 0 else None)
-        ax.set_xticks(range(4), labels)
+        ax.set_xticks(range(len(arms)), labels)
         ax.set_ylabel("D0 loss change (nats/token)")
         ax.legend(); ax.grid(axis="y", alpha=.25)
         fig.tight_layout()
@@ -471,7 +564,7 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
             for arm in arms:
                 rows = [r for r in router_runs if (r["base_run"], r["ft_optimizer"]) == arm]
                 ax.scatter([r[f"mean_{field}"] for r in rows], [r["forgetting"] for r in rows],
-                           label=f"{arm[0].split('-')[2]}→{arm[1]}")
+                           label=arm_label(*arm))
             ax.set_xlabel(f"Mean layer {field}")
             ax.grid(alpha=.25)
         axes[0].set_ylabel("D0 forgetting at matched learning")
@@ -493,14 +586,26 @@ def main(argv=None):
     p.add_argument("--bootstrap", type=int, default=500)
     p.add_argument("--random-seed", type=int, default=0)
     p.add_argument("--min-lrs", type=int, default=5)
+    p.add_argument("--bases", nargs="+", default=list(BASES),
+                   help="base runs to analyze (default: the seed-42 pair)")
+    p.add_argument("--lr-selection", type=Path, default=None,
+                   help="analysis.json of the seed-42 pilot at this dataset and length: use its selected "
+                        "LR per optimizer pair for every base run instead of selecting")
     args = p.parse_args(argv)
+    check(len(set(args.bases)) == len(args.bases) and all(b in FINETUNE_BASE_CHECKPOINTS for b in args.bases),
+          f"--bases must be distinct pinned base runs: {sorted(FINETUNE_BASE_CHECKPOINTS)}")
     check(args.steps > 0 and args.seeds and len(set(args.seeds)) == len(args.seeds)
           and args.bootstrap >= 0 and args.min_lrs > 0, "invalid steps, seeds, bootstrap or min-lrs")
     if args.ell0 is not None:
         check(math.isfinite(args.ell0) and args.ell0 > 0, "ell0 must be positive and finite")
-    runs = load_runs(args.root, args.dataset, args.steps, args.seeds)
-    selected, lr_rows = select_lrs(runs, args.seeds, args.min_lrs)
-    chosen = [r for r in runs if selected[r.arm] == r.lr]
+    bases = tuple(args.bases)
+    runs = load_runs(args.root, args.dataset, args.steps, args.seeds, bases)
+    if args.lr_selection is not None:
+        selected, lr_rows = fixed_lrs(runs, args.seeds, args.lr_selection, args.dataset, args.steps, bases)
+    else:
+        selected, lr_rows = select_lrs(runs, args.seeds, args.min_lrs, bases)
+    chosen = [r for r in runs if math.isclose(selected[r.arm], r.lr, rel_tol=1e-6)]
+    check(all(r.status == "completed" for r in chosen), "a seed diverged at a selected LR")
     support = min(max(0.0, *[p["learning"] for p in r.curve]) for r in chosen)
     matches, router_rows, contrasts = [], [], []
     if args.ell0 is not None:
@@ -513,7 +618,7 @@ def main(argv=None):
                             "route_share": m["F_route"]/m["forgetting"]
                             if abs(m["forgetting"]) >= 1e-6 else None})
             router_rows.extend(router_at(run, m))
-        for base in BASES:
+        for base in bases:
             opt = base.split("-")[2]
             other = "muon" if opt == "adamw" else "adamw"
             by_arm = {(r["ft_optimizer"], r["seed"]): r["forgetting"]
@@ -533,7 +638,7 @@ def main(argv=None):
     correlations = {field: spearman([r[f"mean_{field}"] for r in router_runs],
                                      [r["forgetting"] for r in router_runs])
                     for field in ("flip_rate", "maxvio")} if router_runs else {}
-    uncertainty = bootstrap(chosen, args.seeds, args.ell0, args.bootstrap, args.random_seed) \
+    uncertainty = bootstrap(chosen, args.seeds, args.ell0, args.bootstrap, args.random_seed, bases) \
         if args.ell0 is not None else None
     args.out.mkdir(parents=True, exist_ok=True)
     write_csv(args.out / "lr_selection.csv", lr_rows)
@@ -548,17 +653,22 @@ def main(argv=None):
                              for d in ("D0", "D1")},
                "ell0": args.ell0, "common_learning_support": [0.0, support],
                "lr_selection": lr_rows, "edge_winners": [x for x in lr_rows if x["edge"]],
-               "matched_runs": matches, "contrasts": contrasts, "bootstrap": uncertainty,
+               "matched_runs": matches, "contrasts": contrasts,
+               "pooled_contrasts": pooled({c["base_run"]: c["mean_penalty"] for c in contrasts}),
+               "bootstrap": uncertainty, "bases": list(bases),
+               "lr_selection_source": str(args.lr_selection) if args.lr_selection else None,
+               "diverged_runs": [str(r.path) for r in runs if r.status != "completed"],
                "router_correlations": correlations,
                "source_roots": [str(root) for root in args.root],
                "source_runs": [str(r.path) for r in runs],
                "runs_without_checkpoint_hash": [str(r.path) for r in runs
                                                  if not r.config["base"].get("model_sha256")],
-               "status": "needs_lr_extension" if any(x["edge"] for x in lr_rows) else "grid_brackets_optima",
+               "status": "fixed_lrs" if args.lr_selection else
+                         "needs_lr_extension" if any(x["edge"] for x in lr_rows) else "grid_brackets_optima",
                "note": "Exploratory until ell0 and main length are fixed; bootstrap holds selected LRs fixed. "
                        "LR selection and learning use the same D1 set."}
     (args.out / "analysis.json").write_text(json.dumps(summary, indent=2, allow_nan=False)+"\n")
-    make_plots(args.out, runs, lr_rows, selected, matches, router_rows, router_runs, args.ell0)
+    make_plots(args.out, runs, lr_rows, selected, matches, router_rows, router_runs, args.ell0, bases)
     print(f"Analyzed {len(runs)} runs; wrote {args.out}")
     print(f"Evaluation packing: {packing['packing']}" +
           (f" ({packing['runs_without_packing_field']} runs had no packing field: legacy)"
