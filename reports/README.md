@@ -8,6 +8,7 @@ newer; these are snapshots taken 2026-11-26 (each file's header names its source
 | `pretraining_summary.md` | https://claude.ai/artifact/TP3GZWWwJHK2EqVu3GHdyk | E=8 pretraining recipe, 0.5B LR sweep, 3B transfer check, the six base models | Current |
 | `finetune_pilot_report.md` | https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx | Seed-42 fine-tuning pilots (StarCoderData, WikiText): design, decisions, LR selections, observations | Current to 2026-11-26 06:30; main grids and long pilot finished later (see `HANDOFF.md` §6) |
 | `finetuning_mismatch_endpoints.md` | Local report | Learning–forgetting endpoint curves with seed SDs, raw results, and long-pilot status | Interim; WikiText long pilot submitted |
+| `finetune_replay_bug_impact.md` | Local report | Fixed-LR paired before/after comparison of the replay bug relative to seed spread | Complete |
 | `tracker.md` | https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo | Implementation tracker: stages, plan, implemented items, action items | Stale since 2026-11-24 (kept for its resolved decisions) |
 
 Charts are PNGs written by the repo's generators into their own output folders and linked from here, not
