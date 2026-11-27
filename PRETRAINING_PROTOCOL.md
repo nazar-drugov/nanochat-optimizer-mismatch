@@ -163,6 +163,14 @@ so that η·λ matches AdamW); seed-noise runs for the sweep.
 
 ### If other E are added: joint fit across E (decided 2026-11-24)
 
+- **E=1 dense-control routing-loss flag (agreed 2026-11-27):** retain the
+  one-expert SwiGLU MoE path with identity gate, explicitly disable both router
+  balance and z-loss contributions for this control in pretraining and FT, and
+  persist the resolved policy in checkpoint/config metadata. Verify dense
+  equivalence under AdamW and Muon and handle undefined single-expert routing
+  diagnostics. This agrees the dense-control design, not the remaining cross-E
+  training plan or job launch.
+
 Sweep every (optimizer, E) cell on 5 points spaced ×2 (AdamW centre 2e-3·E^-0.25; Muon centre
 4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16, so the four grids interleave), and choose
 LRs by one fit per optimizer: y = a_E + b·(log₂ LR − m₀ − α·log₂ E)², with one curvature b,

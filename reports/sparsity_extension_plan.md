@@ -70,10 +70,11 @@ At 3B tokens, a balanced expert receives approximately 3B/E assignments per laye
 parameter or equal-per-expert-exposure experiment would answer a different question,
 require different widths or token budgets, and is not the paper's primary design.
 
-### E=1 requires an explicit choice before training
+### E=1 dense control (routing-loss flag agreed 2026-11-27)
 
-Recommend keeping `--ffn-type=moe --n-experts=1 --balancer=none --z-coef=0` (confirm
-exact resolved config), not nanochat's legacy ReLU² `dense` MLP. An E=1 MoE routes
+Harry agreed to an explicit E=1 flag disabling routing losses (equivalent to
+`--ffn-type=moe --n-experts=1 --balancer=none --z-coef=0`; implementation and
+verification remain pending), not nanochat's legacy ReLU² `dense` MLP. An E=1 MoE routes
 every token to expert 0 with gate 1; its LM and expert weights are exactly the dense
 SwiGLU control. This preserves the existing FT evaluation plumbing, which rejects
 non-MoE bases (`scripts/finetune.py`), while preventing artificial router-mediated forgetting.
@@ -322,9 +323,9 @@ both account roots in CHECKPOINTS.md after milestones.
 1. **Claim and replication:** are we screening whether a sparsity trend exists at
    one initialization first, or making a primary replicated scaling claim? Recommend
    seed42 screen then seeds43/44 for all E if the claim is population-level.
-2. **Dense control:** approve E=1 MoE with inert one-expert gate and aux/z disabled
-   (recommended), vs literal dense SwiGLU without routing tensors, or retain default
-   E=1 z-loss as a separately labeled ablation? The last is not strictly dense.
+2. **Dense control (agreed):** E=1 MoE with inert one-expert gate and aux/z disabled
+   by an explicit flag. Literal dense SwiGLU is the equivalence test; default
+   E=1 z-loss could be used only as a separately approved ablation.
 3. **Fine-tuning scope:** option A, B or C above; recommend stage A and extend SC
    to common 5 horizons as needed for endpoint support and eventual B; keep
    multi-epoch WikiText optional. Both datasets or prioritize one for initial screening?
