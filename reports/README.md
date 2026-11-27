@@ -9,6 +9,8 @@ newer; these are snapshots taken 2026-11-26 (each file's header names its source
 | `finetune_pilot_report.md` | https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx | Seed-42 fine-tuning pilots (StarCoderData, WikiText): design, decisions, LR selections, observations | Current to 2026-11-26 06:30; main grids and long pilot finished later (see `HANDOFF.md` §6) |
 | `finetuning_mismatch_endpoints.md` | Local report | Learning–forgetting endpoint curves with seed SDs, raw results, and long-pilot status | Complete; StarCoderData all horizons replicated, WikiText long pilot only |
 | `finetune_validation_trajectories.md` | Local report | Eight D0/D1 raw validation NLL trajectory figures, baseline and endpoint tables, selected LRs and seed SDs | Complete; all five horizons per dataset |
+| `matched_learning_analysis.md` | Local report | Endpoint and within-run minimum-forgetting contrasts, paired seed SDs, common-support sensitivity and shared-target comparisons | Complete for E=8; document bootstrap and replay analysis remain open |
+| `sparsity_extension_plan.md` | Local report | E=1 dense control and E=4/16 extension design, LR tuning, implementation blockers, compute estimates, decisions | Proposal for review; not authorization to implement or launch |
 | `finetune_replay_bug_impact.md` | Local report | Fixed-LR paired before/after comparison of the replay bug relative to seed spread | Complete |
 | `starcoderdata_long_main_report.md` | Local report | Replicated StarCoderData long horizons, checks and endpoint interpretation | Complete |
 | `tracker.md` | https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo | Implementation tracker: stages, plan, implemented items, action items | Stale since 2026-11-24 (kept for its resolved decisions) |

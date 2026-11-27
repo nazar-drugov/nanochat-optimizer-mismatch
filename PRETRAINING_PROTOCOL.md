@@ -242,6 +242,21 @@ if a transfer check fails.
 - **ℓ0: chosen after seeing the fine-tuning curves** (user). Safeguard: choose it from the learning
   curves (the range every cell reaches) before computing the forgetting contrast at it, and report the
   contrast over the whole common learning range as well, so the choice of ℓ0 cannot steer the result.
+- **Matched-learning estimands and targets (2026-11-27; user-confirmed before computing contrasts):**
+  report both `endpoint` and `within-run`, each retaining the paper's minimum forgetting over the
+  piecewise-linear curve subject to learning ≥ ℓ0 (including all eligible vertices and threshold
+  crossings). For `endpoint`, connect fully LR-decayed endpoints in length order at each horizon's
+  selected peak LR, separately for each base and FT seed; do not extrapolate or add a synthetic
+  zero-length endpoint. Targets are 1.50 nats/token (StarCoderData) and 0.25 (WikiText-103).
+  Use all five StarCoderData horizons, the fully replicated 60/240/720 WikiText horizons, and
+  separately the five-horizon seed-42-only WikiText pilot. For `within-run`, use each individual
+  fixed-length trajectory (including measured/reconstructed step zero); targets are 1.00 and 0.12
+  respectively, so the shortest horizons also reach the targets. Compare the paired FT-seed
+  mismatch-minus-match differences within each base, then aggregate across bases; mark WikiText
+  long seed-42-only results as pilot. Plot sensitivity over common observed learning support for
+  each estimand. Targets differ intentionally; headline contrasts are not a controlled comparison
+  of the two estimands at an identical learning threshold. Interpolated endpoint results are not
+  actual model states, and router/replay inference remains a separate analysis.
 - **Main length:** open (see LOG_CHANGES 2026-11-25): the pilot lengths (60 / 240 / 960 steps;
   WikiText 60 / 240 / 720) are the candidate main lengths; a longer StarCoderData length is being
   piloted (below).

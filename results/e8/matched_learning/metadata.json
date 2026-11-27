@@ -1,0 +1,64 @@
+{
+  "targets": {
+    "endpoint": {
+      "starcoderdata": 1.5,
+      "wikitext103": 0.25
+    },
+    "within-run": {
+      "starcoderdata": 1.0,
+      "wikitext103": 0.12
+    }
+  },
+  "grid_size": 101,
+  "cohorts": [
+    {
+      "dataset": "starcoderdata",
+      "name": "main",
+      "bases": [
+        42,
+        43,
+        44
+      ],
+      "horizons": [
+        60,
+        240,
+        960,
+        1920,
+        3200
+      ]
+    },
+    {
+      "dataset": "wikitext103",
+      "name": "main",
+      "bases": [
+        42,
+        43,
+        44
+      ],
+      "horizons": [
+        60,
+        240,
+        720
+      ]
+    },
+    {
+      "dataset": "wikitext103",
+      "name": "pilot_seed42",
+      "bases": [
+        42
+      ],
+      "horizons": [
+        60,
+        240,
+        720,
+        1920,
+        3200
+      ]
+    }
+  ],
+  "uncertainty": "sample SD of paired penalties across base means, or FT seeds conditional on base 42",
+  "endpoint_definition": "horizon-ordered polyline, no origin; no extrapolation",
+  "within_run_definition": "checkpoint-ordered polyline at selected LR including genuine step zero",
+  "minimum": "min F among all eligible vertices and adjacent crossings L=target",
+  "sensitivity": "uniform grid incl. bounds and prespecified targets when supported; no bootstrap"
+}

@@ -34,6 +34,12 @@ authors, not a single-agent project.
   searching, specific questions and challenge assumptions constructively until
   the ambiguity is resolved. Do not silently choose an unagreed scientific
   design. Obtain agreement to the experiment plan before carrying it out.
+- When a scientific question or request has multiple plausible interpretations,
+  explicitly present the alternative ways to answer it, explain how their
+  estimands, assumptions, controls, and implementation differ, and ask Harry
+  which reflects his intent. Continue asking focused, substantive questions
+  until confident the scientific intent and implementation details are settled;
+  do not mistake a convenient interpretation for the intended one.
 
 ## Execute agreed plans to completion
 

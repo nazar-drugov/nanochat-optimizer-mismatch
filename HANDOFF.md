@@ -12,7 +12,8 @@ final and interior. The seed-43/44 main grids for both datasets are complete at 
 StarCoderData pilot (to 3,200 steps) is complete. The analysis script handles the main grid and has been
 run without ℓ0 for every original dataset and length. **Both long seed-42 pilots (StarCoderData and
 WikiText) are complete, with interior LR selections at 1,920/3,200 steps.** All long WikiText jobs
-finished successfully 2026-11-26. Main length and ℓ0 for the formal mismatch analysis remain open.
+finished successfully 2026-11-26. Both matched-learning estimands and their targets have now been
+agreed and analyzed (see below).
 Harry's StarCoderData-only long main-grid extension has completed all 120 branch records, including
 48 missing long endpoints, with W&B and scratch/pool verification (see §6). All StarCoderData
 horizons are six-base replicated. No additional WikiText extension is authorized. The Slurm
@@ -22,8 +23,13 @@ New validation trajectory report (2026-11-27): `reports/finetune_validation_traj
 shows D0/D1 absolute NLL versus steps in eight optimizer-pair/dataset figures, all selected
 lengths and LRs, with seed SDs. The enriched endpoint and trajectory CSVs contain all 312
 selected run endpoints and 3,768 checkpoint rows including step zero. Actual next-token top-1
-accuracy was not logged. D1-only common support over every horizon is 1.095406 for StarCoderData
-and 0.132103 for WikiText; all-horizon ℓ0 remains to be agreed with Harry.
+accuracy was not logged. D1-only common support over every within-run horizon is 1.095406 for
+StarCoderData and 0.132103 for WikiText. Harry selected endpoint targets 1.50/0.25 and within-run
+targets 1.00/0.12 respectively; `scripts/matched_learning.py` implements the two estimands using
+the paper's minimum forgetting above threshold. The endpoint contrasts are positive in both
+directions and datasets; within-run signs depend on direction and horizon. See
+`reports/matched_learning_analysis.md` for the matched-learning results and sensitivity. Separate cross-E design
+proposal: `reports/sparsity_extension_plan.md`; no additional experiments have been approved.
 
 ## 1. Goal and where we are
 
@@ -44,9 +50,9 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Long WikiText pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; multi-epoch pilot, all LRs bracketed |
 | Long StarCoderData main grid (seeds 43/44, both optimizers, 1,920/3,200) | **Done** 2026-11-27 (all 120 result records) |
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
-| Main length and ℓ0 | **Waiting for the user** |
-| Forgetting contrast at ℓ0, bootstrap CIs, routing share | Not run (needs ℓ0) |
-| Other E (1, 4, 16) | Deferred until fine-tuning results |
+| Endpoint and within-run ℓ0 | **Agreed:** endpoint 1.50/0.25, within-run 1.00/0.12 (SC/WT) |
+| Forgetting contrast at ℓ0 | **Done**, paired seed SD and whole-support sensitivity; document bootstrap and routing share not yet run |
+| Other E (1, 4, 16) | Design and implementation proposal reviewed; approval needed before implementation/compute |
 
 ## 2. Pretraining: design and results
 
@@ -253,9 +259,10 @@ branches remain the selected main data; only the 48 new long endpoints are incor
      horizons (60/240/960/1,920/3,200), or the original WikiText horizons (60/240/720). If 1,920 or
      3,200 WikiText is needed as a fully replicated main length, seeds 43/44 need longer runs;
      this is not currently authorized.
-   - **ℓ0** (protocol safeguard: choose it from the learning curves, before computing the forgetting
-     contrast, and also report the contrast across the whole common learning range).
-2. **Analysis with ℓ0** (once decided): rerun `run_analysis.sh` with `--ell0 <value>` added to the main
+   - **Sparsity extension:** see `reports/sparsity_extension_plan.md` for open design choices, E=1
+     control correctness, LR tuning, replication, and estimated resource costs.
+2. **Document bootstrap and router analysis** (separate scientific step; confirm intent): for the
+   within-run estimand, `run_analysis.sh` can be run with `--ell0 <value>` added to the main
    analyses (bootstrap defaults to 500 repetitions; it reads every checkpoint's per-document arrays, so it
    may be worth a CPU Slurm job rather than the login node). For the "whole range" safeguard, repeat at a
    grid of ℓ0 values up to the common support. Outputs: `contrasts` (per base), `pooled_contrasts` (mean
@@ -295,10 +302,11 @@ branches remain the selected main data; only the 48 new long endpoints are incor
 - WikiText beyond ~740 steps: multiple epochs are approved for the seed-42 long pilot. Decide whether
   to replicate the longer lengths on seeds 43/44 after examining the pilot; compare the corpora with
   the unequal effective epoch counts in mind.
-- **Main fine-tuning length and ℓ0 (the current blockers).** Decided 2026-11-25: 3 fine-tuning seeds,
-  all three base seeds, seeds 43/44 reuse the seed-42 LRs, ℓ0 after the curves (protocol, "Fine-tuning
-  main grid"). All six base checkpoints are pinned by SHA-256 in `FINETUNE_BASE_CHECKPOINTS`.
-- Transfer check at other E (proposal above).
+- **Matched-learning targets and definitions resolved.** Endpoint 1.50/0.25 and within-run 1.00/0.12;
+  main lengths are the completed replicated grids, with long WikiText separately conditional on seed 42.
+  Formal document bootstrap and router/replay comparisons remain open. All six base checkpoints are
+  pinned by SHA-256 in `FINETUNE_BASE_CHECKPOINTS`.
+- Other E: the proposed design and decisions are in `reports/sparsity_extension_plan.md`.
 
 ## 8. Code map
 

@@ -1,0 +1,17 @@
+dataset,cohort,estimand,horizon,support_min,support_max
+starcoderdata,main,endpoint,,1.3146224186709383,1.7038881212254329
+starcoderdata,main,within-run,60,0.0,1.0954057874389695
+starcoderdata,main,within-run,240,0.0,1.3747536166235175
+starcoderdata,main,within-run,960,0.0,1.5755959392924546
+starcoderdata,main,within-run,1920,0.0,1.654537578490674
+starcoderdata,main,within-run,3200,0.0,1.7038881212254329
+wikitext103,main,endpoint,,0.16662773688746402,0.33493455635060077
+wikitext103,main,within-run,60,0.0,0.1321027449065566
+wikitext103,main,within-run,240,0.0,0.22701453402923555
+wikitext103,main,within-run,720,0.0,0.33493455635060077
+wikitext103,pilot_seed42,endpoint,,0.1646442339811296,0.37426101827748903
+wikitext103,pilot_seed42,within-run,60,0.0,0.13249202334361465
+wikitext103,pilot_seed42,within-run,240,0.0,0.22701453402923555
+wikitext103,pilot_seed42,within-run,720,0.0,0.3361348162697788
+wikitext103,pilot_seed42,within-run,1920,0.0,0.37426101827748903
+wikitext103,pilot_seed42,within-run,3200,0.0,0.36677195574111154
