@@ -6,13 +6,14 @@ This is the canonical cross-author path map for the optimizer-mismatch study. It
 - [Checkpoint registry](results/checkpoint_registry/checkpoints.csv): actual checkpoint step and file paths. Includes model weights, optimizer state, metadata, routing probes and evaluation snapshots as applicable.
 - [W&B project](https://wandb.ai/hgo-mit/nanochat): organized pretraining and fine-tuning histories. Tracking records are not model checkpoints.
 
-**Inventory snapshot: 2026-11-26, 22:35 EST.** 1,816 registry records (including 1,757 fine-tuning branch directories, 23 scientific pretraining runs, seven legacy verification runs and 29 shared base-evaluation references). The checkpoint table has 18,419 step records: 86 actual model-weight checkpoints, 18,300 fine-tuning evaluation snapshots, 29 shared base-evaluation references and four model-related-only routing steps. Seven incomplete archived branch directories are retained and marked. Both scientific long pilots are complete.
+**Inventory snapshot: 2026-11-27, 02:28 EST.** 1,940 registry records (including 1,877 fine-tuning branch directories, 23 scientific pretraining runs, seven legacy verification runs and 33 shared base-evaluation references). The checkpoint table has 19,791 step records: 86 actual model-weight checkpoints, 19,668 fine-tuning evaluation snapshots, 33 shared base-evaluation references and four model-related-only routing steps. Seven incomplete archived branch directories are retained and marked. Both scientific long pilots and the StarCoderData-only long main grid are complete at the result-record level.
 
 | Owner / fine-tuning stage | Completed branches | Incomplete |
 |---|---:|---:|
 | Harry, clean original pilot | 468 | 0 |
 | Harry, clean main | 234 | 0 |
 | Harry, clean long StarCoderData | 240 | 0 |
+| Harry, clean long StarCoderData main grid (seeds 43/44) | 120 | 0 |
 | Harry, clean long WikiText | 315 | 0 |
 | Harry, replay-bug original archive | 126 | 0 |
 | Harry, replay-bug long archive | 1 | 4 |
@@ -76,6 +77,7 @@ An unbranched standalone run may omit `-T<length>`; the exact run name and lengt
 | Harry | `HARRY_SCRATCH/finetune_pilot` | Clean seed-42 LR sweeps and selected original pilot lengths |
 | Harry | `HARRY_SCRATCH/finetune_main` | Clean seed-43/44 selected-LR main grid (both datasets, excluding Nazar's standalone 720-step WikiText runs) |
 | Harry | `HARRY_SCRATCH/finetune_pilot_long` | Clean seed-42 StarCoderData extension, including repeat short branches |
+| Harry | `HARRY_SCRATCH/finetune_main_long` | Clean StarCoderData long main grid on seeds 43/44, with repeat short branches for validation |
 | Harry | `HARRY_SCRATCH/finetune_pilot_long_wikitext103` | Clean seed-42 WikiText extension; snapshot includes finalized and partial current runs |
 | Harry | `HARRY_SCRATCH/finetune_pilot_v1_replaybug` | Archived pre-fix results; longer-than-60 branches invalid, 60-step branches unaffected but superseded |
 | Harry | `HARRY_SCRATCH/finetune_pilot_long_v1_replaybug` | Archived pre-fix long-pilot attempts |

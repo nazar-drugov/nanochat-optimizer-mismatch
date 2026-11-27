@@ -305,6 +305,11 @@ if a transfer check fails.
   reproducibility checks, not as extra independent observations. Validate paired fingerprints,
   base/evaluation identities, W&B, and complete six-base analysis with ℓ0 omitted. Update the report,
   plots and checkpoint registry; the formal matched-learning threshold remains undecided.
+  **Final (2026-11-27):** all 120 branch records completed (48 new long endpoints, 72 repeat short
+  controls), all paired fingerprints/identities confirmed and 120 W&B runs verified. Six-base
+  common learning support at 1,920/3,200 is 1.65454/1.70389. All five StarCoderData horizons are
+  now fully replicated; WikiText remains seed-42-only at 1,920/3,200. See
+  `reports/starcoderdata_long_main_report.md` and `reports/finetuning_mismatch_endpoints.md`.
 
 ## Before the first real run
 

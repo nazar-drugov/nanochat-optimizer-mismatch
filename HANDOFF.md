@@ -13,8 +13,10 @@ StarCoderData pilot (to 3,200 steps) is complete. The analysis script handles th
 run without ℓ0 for every original dataset and length. **Both long seed-42 pilots (StarCoderData and
 WikiText) are complete, with interior LR selections at 1,920/3,200 steps.** All long WikiText jobs
 finished successfully 2026-11-26. Main length and ℓ0 for the formal mismatch analysis remain open.
-Harry approved the StarCoderData-only long main-grid extension; eight jobs 30673385/87/88/89/90/91/94/95
-are submitted (see §6); monitor hourly. No WikiText extension is authorized.
+Harry's StarCoderData-only long main-grid extension has completed all 120 branch records, including
+48 missing long endpoints, with W&B and scratch/pool verification (see §6). All StarCoderData
+horizons are six-base replicated. No additional WikiText extension is authorized. The Slurm
+controller was temporarily unreachable at the final check; see LOG_CHANGES for accounting status.
 
 ## 1. Goal and where we are
 
@@ -33,7 +35,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Seed-43/44 main grids (both datasets, all pilot lengths) | **Done** 2026-11-26 at the seed-42 LRs |
 | Long StarCoderData pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; the 960-step LRs stay optimal |
 | Long WikiText pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; multi-epoch pilot, all LRs bracketed |
-| Long StarCoderData main grid (seeds 43/44, both optimizers, 1,920/3,200) | Submitted 2026-11-26 |
+| Long StarCoderData main grid (seeds 43/44, both optimizers, 1,920/3,200) | **Done** 2026-11-27 (all 120 result records) |
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Main length and ℓ0 | **Waiting for the user** |
 | Forgetting contrast at ℓ0, bootstrap CIs, routing share | Not run (needs ℓ0) |
@@ -222,22 +224,28 @@ WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
 Long WikiText seed-42-only support: 0.374261 / 0.366772 at 1,920 / 3,200 (preliminary analysis
 with `--ell0` omitted in `analysis/wikitext103-<T>-pilot-long/`; not common across six bases).
 
-### Long StarCoderData main grid (submitted 2026-11-26)
+### Long StarCoderData main grid (completed 2026-11-27)
 
 Harry confirmed the intent is to quantify long-horizon persistence of mismatch across pretrained
 initializations. Eight jobs 30673385/30673387/30673388/30673389/30673390/30673391/30673394/30673395
 (`ft-main-long/`) cover four base runs × two FT optimizers × three FT seeds. All sbatch arguments and
 W&B filters checked; training code unchanged. Separate output `finetune_main_long/` with short
 reproducibility branches; select only 1,920/3,200 when combining with seed-42 `finetune_pilot_long/`.
-No new LR sweeps or WikiText jobs. Update report/plots and registry once complete.
+No new LR sweeps or WikiText jobs. All 120 branches completed and were verified online in W&B;
+all 1,368 evaluation NPZs present in scratch and pool. 72 paired short branches have identical
+fingerprints, base and eval identities; the largest 960-step forgetting repeat difference is
+0.03886 (Muon seed 43 → AdamW, FT seed 1; differences precede replay windows). Median 960 ΔL/F
+is 0.00021/0.00399. Six-base analysis passed at 1,920/3,200 (72 runs, 36 selected each); common
+learning support 1.65454/1.70389. Reports/plots/CSV and registry updated. The original short
+branches remain the selected main data; only the 48 new long endpoints are incorporated.
 
 ### Next steps
 
 1. **User decisions (ask; do not choose):**
-   - **Main fine-tuning length.** If it is one of the original pilot lengths (StarCoderData 60/240/960,
-     WikiText 60/240/720), no more training is needed. If StarCoderData or WikiText uses 1,920 or 3,200
-     as a fully replicated main length, seeds 43/44 need longer trunks at the selected LRs. The
-     WikiText long pilot intentionally repeats the training corpus; its seed-42 grid is now submitted.
+   - **Main fine-tuning length.** No more training is needed for any of the five StarCoderData
+     horizons (60/240/960/1,920/3,200), or the original WikiText horizons (60/240/720). If 1,920 or
+     3,200 WikiText is needed as a fully replicated main length, seeds 43/44 need longer runs;
+     this is not currently authorized.
    - **ℓ0** (protocol safeguard: choose it from the learning curves, before computing the forgetting
      contrast, and also report the contrast across the whole common learning range).
 2. **Analysis with ℓ0** (once decided): rerun `run_analysis.sh` with `--ell0 <value>` added to the main
@@ -247,8 +255,8 @@ No new LR sweeps or WikiText jobs. Update report/plots and registry once complet
    over base seeds per pretraining optimizer), `bootstrap.mismatch_ci` / `pooled_mismatch_ci` (the pooled CI
    holds base runs fixed; report the per-base spread beside it), `matched_runs.csv` (F_route / F_fixed
    share), router CSVs and plots.
-3. **Only if the main length is 1,920 or 3,200 steps (StarCoderData):** generate seed-43/44 jobs with the
-   reviewed generator, e.g.
+3. **Completed StarCoderData long-grid generation (for reproducibility):** seed-43/44 jobs used the
+   reviewed generator:
    ```
    .venv/bin/python -m scripts.finetune_jobs --selection results/e8/lr_selection_3b.json \
      --base-runs e8-main-adamw-s43 e8-main-adamw-s44 e8-main-muon-s43 e8-main-muon-s44 \
