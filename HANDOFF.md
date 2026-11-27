@@ -18,6 +18,13 @@ Harry's StarCoderData-only long main-grid extension has completed all 120 branch
 horizons are six-base replicated. No additional WikiText extension is authorized. The Slurm
 controller was temporarily unreachable at the final check; see LOG_CHANGES for accounting status.
 
+New validation trajectory report (2026-11-27): `reports/finetune_validation_trajectories.md`
+shows D0/D1 absolute NLL versus steps in eight optimizer-pair/dataset figures, all selected
+lengths and LRs, with seed SDs. The enriched endpoint and trajectory CSVs contain all 312
+selected run endpoints and 3,768 checkpoint rows including step zero. Actual next-token top-1
+accuracy was not logged. D1-only common support over every horizon is 1.095406 for StarCoderData
+and 0.132103 for WikiText; all-horizon ℓ0 remains to be agreed with Harry.
+
 ## 1. Goal and where we are
 
 Measure whether fine-tuning a top-1 MoE language model with a different optimizer than it was
