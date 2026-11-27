@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS, base_run_seed
+from nanochat.pretrain_sweep import FINETUNE_BASE_CHECKPOINTS, base_run_seed, base_run_experts, load_base_manifest, resolve_base_pin
 
 BASES = ("e8-main-adamw-s42", "e8-main-muon-s42")
 OPTS = ("adamw", "muon")
@@ -64,12 +64,20 @@ class Run:
         return self.base, self.ft
 
 
-def load_runs(roots, dataset, steps, seeds, bases=BASES):
+def load_runs(roots, dataset, steps, seeds, bases=BASES, base_manifest=None):
     """Completed and diverged runs; a diverged run keeps its curve up to the divergence."""
     if isinstance(roots, Path):
         roots = [roots]
     runs, seen = [], {}
+    experts = {base_run_experts(base) for base in bases}
+    check(len(experts) == 1, "one fine-tuning analysis must compare bases of one E")
+    if isinstance(base_manifest, (str, Path)):
+        base_manifest = load_base_manifest(base_manifest)
     for base in bases:
+        pin = resolve_base_pin(base, base_manifest)
+        E = pin.n_experts
+        strict_identity = E != 8
+        strict_hash = strict_identity or (base_manifest is not None and base in base_manifest)
         for root in roots:
             folder = root / base / dataset
             if not folder.is_dir():
@@ -92,18 +100,50 @@ def load_runs(roots, dataset, steps, seeds, bases=BASES):
                 for field in ("base_run", "ft_optimizer", "seed", "lr", "ft_steps"):
                     check(cell.get(field) == result.get(field), f"config/result {field} mismatch: {path}")
                 identity = config.get("base", {})
-                check(identity.get("step") == 11445 and identity.get("user_config", {}).get("seed") == base_run_seed(base),
+                check(identity.get("step") == pin.step and identity.get("user_config", {}).get("seed") == pin.seed,
                       f"wrong base checkpoint step or seed: {path}")
-                check(identity["user_config"].get("optimizer_name") == base.split("-")[2],
+                check(identity["user_config"].get("optimizer_name") == pin.optimizer,
                       f"wrong base optimizer: {path}")
-                if identity.get("model_sha256"):
-                    check(identity["model_sha256"] == FINETUNE_BASE_CHECKPOINTS[base][1],
+                if strict_hash or identity.get("model_sha256"):
+                    check(identity.get("model_sha256") == pin.model_sha256,
                           f"wrong base checkpoint SHA-256: {path}")
-                check(config.get("model_config", {}).get("n_experts", 8) == 8,
+                model_cfg = config.get("model_config", {})
+                check(model_cfg.get("n_experts", 8 if not strict_identity else None) == E,
                       f"unexpected expert count: {path}")
+                if strict_identity:
+                    check(cell.get("n_experts") == result.get("n_experts") == E and
+                          cell.get("pretrain_optimizer") == result.get("pretrain_optimizer") == pin.optimizer and
+                          identity.get("logical_run") == base and identity.get("n_experts") == E and
+                          identity.get("checkpoint_run") == pin.checkpoint_dir.name and
+                          Path(identity.get("dir") or "").resolve() == pin.checkpoint_dir.resolve() and
+                          Path(identity.get("model_file") or "").resolve() ==
+                          (pin.checkpoint_dir / f"model_{pin.step:06d}.pt").resolve(),
+                          f"wrong logical/actual checkpoint provenance: {path}")
+                    check(identity["user_config"].get(f"{pin.optimizer}_matrix_lr") == pin.matrix_lr,
+                          f"wrong base checkpoint matrix LR: {path}")
+                    check(config.get("warmup_steps") == result.get("warmup_steps") == 8 and
+                          config.get("decay_steps") == result.get("decay_steps") == round(.2 * steps) and
+                          config.get("args", {}).get("total_batch_size") == 65536 and
+                          config.get("args", {}).get("device_batch_size") == 32 and
+                          all(config.get("data", {}).get("eval_sets", {}).get(d, {}).get("packing") == "bestfit"
+                              for d in ("D0", "D1")), f"new-E pilot recipe differs: {path}")
+                    if status == "completed":
+                        check(result.get("data_fingerprint") is not None,
+                              f"missing paired data fingerprint: {path}")
+                if E == 1:
+                    check(model_cfg.get("disable_routing_loss") is True and model_cfg.get("balance_coef") == 0
+                          and model_cfg.get("z_coef") == 0, f"E=1 control routing loss enabled: {path}")
                 curve = result.get("curve", [])
                 if status == "completed":
                     check(curve and curve[-1]["step"] == steps, f"missing final checkpoint: {path}")
+                    if strict_identity:
+                        from scripts.finetune import checkpoint_steps
+                        expected = checkpoint_steps(steps, round(.2 * steps))
+                        check([p["step"] for p in curve] == config.get("checkpoint_steps") == expected,
+                              f"unexpected checkpoint schedule: {path}")
+                        check(result.get("final_learning") == curve[-1]["learning"] and
+                              result.get("final_forgetting") == curve[-1]["forgetting"],
+                              f"saved final learning/forgetting disagrees with curve: {path}")
                 else:
                     check(not curve or curve[-1]["step"] <= steps, f"checkpoint past the end: {path}")
                 check(all(a["step"] < b["step"] for a, b in zip(curve, curve[1:])),
@@ -113,6 +153,8 @@ def load_runs(roots, dataset, steps, seeds, bases=BASES):
                         check(math.isfinite(point[field]), f"nonfinite {field}: {path}")
                     check(abs(point["F_route"] + point["F_fixed"] - point["forgetting"]) < 1e-7,
                           f"replay identity fails: {path}, step {point['step']}")
+                    if E == 1:
+                        check(point["F_route"] == 0., f"E=1 route replay must be structural zero: {path}")
                 key = base, ft, int(seed), f"{float(lr):.6g}"
                 check(key not in seen, f"duplicate run: {path} and {seen.get(key)}")
                 seen[key] = path
@@ -180,6 +222,8 @@ def fixed_lrs(runs, seeds, path, dataset, steps, bases=BASES):
     check(source.get("dataset") == dataset and source.get("steps") == steps,
           f"{path} is for {source.get('dataset')}, {source.get('steps')} steps, not {dataset}, {steps}")
     check(not source.get("lr_selection_source"), f"{path} reused LRs itself; give the analysis that selected them")
+    check({base_run_experts(row["base_run"]) for row in source["lr_selection"]} ==
+          {base_run_experts(base) for base in bases}, f"{path} selected LRs for a different E")
     check(all(row["base_run"].endswith("-s42") for row in source["lr_selection"]),
           f"{path} did not select on the seed-42 base runs")
     check(sorted(source.get("seeds", [])) == sorted(seeds), f"{path} used seeds {source.get('seeds')}, not {seeds}")
@@ -240,7 +284,7 @@ def match_curve(curve, ell0):
         return None
     f, t, i, j, w = min(candidates, key=lambda x: (x[0], x[1]))
     value = lambda field: float(points[i][field] * (1-w) + points[j][field] * w)
-    return {"forgetting": f, "learning": float(ell0), "step": t,
+    return {"forgetting": f, "learning": value("learning"), "target_learning": float(ell0), "step": t,
             "F_route": value("F_route"), "F_fixed": value("F_fixed"),
             "left_step": points[i]["step"], "right_step": points[j]["step"], "weight": w}
 
@@ -265,7 +309,11 @@ def router_at(run, match):
         row = {"base_run": run.base, "ft_optimizer": run.ft, "seed": run.seed,
                "lr": run.lr, "layer": layer, "step": match["step"]}
         for field in ROUTER:
-            row[field] = float(left[field] * (1-match["weight"]) + right[field] * match["weight"])
+            w = match["weight"]
+            a, b = left.get(field), right.get(field)
+            row[field] = (None if a is None else float(a)) if w == 0 else (
+                (None if b is None else float(b)) if w == 1 else
+                (None if a is None or b is None else float(a * (1-w) + b * w)))
         result.append(row)
     return result
 
@@ -531,18 +579,19 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
         fig.savefig(out / "matched_forgetting.png", dpi=180)
         plt.close(fig)
 
-        fig, axes = plt.subplots(1, 2, figsize=(2*width_in, 4))
-        for ax, field, title in zip(axes, ("flip_rate", "maxvio"),
-                                    ("D0 route flip rate", "D0 maximum load violation")):
-            means = [np.mean([r[field] for r in router_rows
-                              if (r["base_run"], r["ft_optimizer"]) == arm]) for arm in arms]
-            ax.bar(range(len(arms)), means)
-            ax.set_xticks(range(len(arms)), labels)
-            ax.set_title(title)
-            ax.grid(axis="y", alpha=.25)
-        fig.tight_layout()
-        fig.savefig(out / "router_diagnostics.png", dpi=180)
-        plt.close(fig)
+        if router_rows:
+            fig, axes = plt.subplots(1, 2, figsize=(2*width_in, 4))
+            for ax, field, title in zip(axes, ("flip_rate", "maxvio"),
+                                        ("D0 route flip rate", "D0 maximum load violation")):
+                means = [np.mean([r[field] for r in router_rows
+                                  if (r["base_run"], r["ft_optimizer"]) == arm]) for arm in arms]
+                ax.bar(range(len(arms)), means)
+                ax.set_xticks(range(len(arms)), labels)
+                ax.set_title(title)
+                ax.grid(axis="y", alpha=.25)
+            fig.tight_layout()
+            fig.savefig(out / "router_diagnostics.png", dpi=180)
+            plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(width_in, 4))
         width = .35
@@ -559,19 +608,20 @@ def make_plots(out, runs, lr_rows, selected, matches, router_rows, router_runs, 
         fig.savefig(out / "replay_terms.png", dpi=180)
         plt.close(fig)
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
-        for ax, field in zip(axes, ("flip_rate", "maxvio")):
-            for arm in arms:
-                rows = [r for r in router_runs if (r["base_run"], r["ft_optimizer"]) == arm]
-                ax.scatter([r[f"mean_{field}"] for r in rows], [r["forgetting"] for r in rows],
-                           label=arm_label(*arm))
-            ax.set_xlabel(f"Mean layer {field}")
-            ax.grid(alpha=.25)
-        axes[0].set_ylabel("D0 forgetting at matched learning")
-        axes[1].legend(fontsize=7)
-        fig.tight_layout()
-        fig.savefig(out / "router_vs_forgetting.png", dpi=180)
-        plt.close(fig)
+        if router_runs:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+            for ax, field in zip(axes, ("flip_rate", "maxvio")):
+                for arm in arms:
+                    rows = [r for r in router_runs if (r["base_run"], r["ft_optimizer"]) == arm]
+                    ax.scatter([r[f"mean_{field}"] for r in rows], [r["forgetting"] for r in rows],
+                               label=arm_label(*arm))
+                ax.set_xlabel(f"Mean layer {field}")
+                ax.grid(alpha=.25)
+            axes[0].set_ylabel("D0 forgetting at matched learning")
+            axes[1].legend(fontsize=7)
+            fig.tight_layout()
+            fig.savefig(out / "router_vs_forgetting.png", dpi=180)
+            plt.close(fig)
 
 
 def main(argv=None):
@@ -588,18 +638,25 @@ def main(argv=None):
     p.add_argument("--min-lrs", type=int, default=5)
     p.add_argument("--bases", nargs="+", default=list(BASES),
                    help="base runs to analyze (default: the seed-42 pair)")
+    p.add_argument("--base-manifest", type=Path, help="required for non-E8: verified checkpoint pin manifest")
     p.add_argument("--lr-selection", type=Path, default=None,
                    help="analysis.json of the seed-42 pilot at this dataset and length: use its selected "
                         "LR per optimizer pair for every base run instead of selecting")
     args = p.parse_args(argv)
-    check(len(set(args.bases)) == len(args.bases) and all(b in FINETUNE_BASE_CHECKPOINTS for b in args.bases),
-          f"--bases must be distinct pinned base runs: {sorted(FINETUNE_BASE_CHECKPOINTS)}")
+    check(len(set(args.bases)) == len(args.bases), "--bases must be distinct pinned base runs")
+    pins = load_base_manifest(args.base_manifest) if args.base_manifest is not None else None
+    try:
+        expert_counts = {resolve_base_pin(b, pins).n_experts for b in args.bases}
+    except ValueError as exc:
+        raise ValueError(f"--bases must be distinct pinned base runs: {exc}") from None
+    check(len(expert_counts) == 1, "one analysis must compare bases of one E")
+    E = expert_counts.pop()
     check(args.steps > 0 and args.seeds and len(set(args.seeds)) == len(args.seeds)
           and args.bootstrap >= 0 and args.min_lrs > 0, "invalid steps, seeds, bootstrap or min-lrs")
     if args.ell0 is not None:
         check(math.isfinite(args.ell0) and args.ell0 > 0, "ell0 must be positive and finite")
     bases = tuple(args.bases)
-    runs = load_runs(args.root, args.dataset, args.steps, args.seeds, bases)
+    runs = load_runs(args.root, args.dataset, args.steps, args.seeds, bases, pins)
     if args.lr_selection is not None:
         selected, lr_rows = fixed_lrs(runs, args.seeds, args.lr_selection, args.dataset, args.steps, bases)
     else:
@@ -616,8 +673,9 @@ def main(argv=None):
             matches.append({"base_run": run.base, "ft_optimizer": run.ft, "seed": run.seed,
                             "lr": run.lr, **m,
                             "route_share": m["F_route"]/m["forgetting"]
-                            if abs(m["forgetting"]) >= 1e-6 else None})
-            router_rows.extend(router_at(run, m))
+                            if E > 1 and abs(m["forgetting"]) >= 1e-6 else None})
+            if E > 1:
+                router_rows.extend(router_at(run, m))
         for base in bases:
             opt = base.split("-")[2]
             other = "muon" if opt == "adamw" else "adamw"
@@ -628,12 +686,13 @@ def main(argv=None):
                               "mismatched_ft_optimizer": other,
                               "mean_penalty": float(np.mean(diffs)), "seed_penalties": diffs})
     router_runs = []
-    for match in matches:
+    for match in matches if E > 1 else []:
         rows = [r for r in router_rows if (r["base_run"], r["ft_optimizer"], r["seed"]) ==
                 (match["base_run"], match["ft_optimizer"], match["seed"])]
         router_runs.append({"base_run": match["base_run"], "ft_optimizer": match["ft_optimizer"],
                             "seed": match["seed"], "forgetting": match["forgetting"],
-                            **{f"mean_{field}": float(np.mean([r[field] for r in rows]))
+                            **{f"mean_{field}": (float(np.mean([r[field] for r in rows]))
+                                                 if rows and all(r[field] is not None for r in rows) else None)
                                for field in ROUTER}})
     correlations = {field: spearman([r[f"mean_{field}"] for r in router_runs],
                                      [r["forgetting"] for r in router_runs])
@@ -647,6 +706,9 @@ def main(argv=None):
     write_csv(args.out / "router_runs.csv", router_runs)
     packing = eval_packing(runs)
     summary = {"dataset": args.dataset, "steps": args.steps, "seeds": args.seeds,
+               **({"n_experts": E, "base_manifest": str(args.base_manifest),
+                   "router_diagnostics": "not applicable: E=1 has structural zero route change" if E == 1 else "active"}
+                  if E != 8 else {}),
                "eval_packing": packing["packing"],
                "runs_without_packing_field": packing["runs_without_packing_field"],
                "eval_sets": {d: {f: eval_identity(runs[0], d).get(f) for f in EVAL_IDENTITY_FIELDS}
@@ -659,8 +721,8 @@ def main(argv=None):
                "lr_selection_source": str(args.lr_selection) if args.lr_selection else None,
                "diverged_runs": [str(r.path) for r in runs if r.status != "completed"],
                "router_correlations": correlations,
-               "source_roots": [str(root) for root in args.root],
-               "source_runs": [str(r.path) for r in runs],
+               "source_roots": [str(root.resolve() if E != 8 else root) for root in args.root],
+               "source_runs": [str(r.path.resolve() if E != 8 else r.path) for r in runs],
                "runs_without_checkpoint_hash": [str(r.path) for r in runs
                                                  if not r.config["base"].get("model_sha256")],
                "status": "fixed_lrs" if args.lr_selection else

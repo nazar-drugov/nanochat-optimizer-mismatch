@@ -33,7 +33,8 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, 
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes, tokenizer_dir_for, TOKENIZERS
 from nanochat.checkpoint_manager import (
-    save_checkpoint, load_checkpoint, validate_checkpoint_seed, make_base_experiment_name, validate_experiment_name,
+    save_checkpoint, load_checkpoint, validate_checkpoint_seed, validate_checkpoint_routing_loss,
+    make_base_experiment_name, validate_experiment_name,
     patch_missing_expert_bias, train_shard_inventory, validate_checkpoint_training_data, validate_checkpoint_tokenizer,
 )
 from nanochat.routing_probe import routing_probe, save_routing_snapshot, load_routing_snapshot, snapshot_change_rates
@@ -281,6 +282,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     validate_checkpoint_seed(meta_data, args.seed)
+    validate_checkpoint_routing_loss(meta_data, model_config)
     validate_checkpoint_training_data(meta_data, train_shards)
     validate_checkpoint_tokenizer(meta_data, args.tokenizer, tokenizer_id)
     saved_val_sha256 = meta_data.get("val_data_sha256")
@@ -770,6 +772,8 @@ if master_process:
             "optimizer_name": args.optimizer_name,
             "matrix_lr": optimizer_kwargs["muon_matrix_lr" if args.optimizer_name == "muon" else "adamw_matrix_lr"],
             "ffn_type": args.ffn_type, "n_experts": args.n_experts, "depth": args.depth, "seed": args.seed,
+            "disable_routing_loss": model_config.disable_routing_loss,
+            "balancer": model_config.balancer, "balance_coef": model_config.balance_coef, "z_coef": model_config.z_coef,
             "total_batch_size": total_batch_size, "train_tokens": total_tokens,
             "warmup_steps": args.warmup_steps, "warmdown_ratio": args.warmdown_ratio,
             "weight_decay": args.weight_decay, "max_grad_norm": optimizer_kwargs["max_grad_norm"],

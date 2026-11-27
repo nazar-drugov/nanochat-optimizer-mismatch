@@ -54,7 +54,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Endpoint and within-run ℓ0 | **Agreed:** endpoint 1.50/0.25, within-run 1.00/0.12 (SC/WT) |
 | Forgetting contrast at ℓ0 | **Done**, paired seed SD and whole-support sensitivity; document bootstrap and routing share not yet run |
-| Other E (1, 4, 16) | Design and implementation proposal reviewed; approval needed before implementation/compute |
+| Other E (1, 4, 16) | Initial seed-42 three-horizon scope approved; E-aware pipeline and dense-control implementation being validated |
 
 ## 2. Pretraining: design and results
 
@@ -341,9 +341,10 @@ data and eval-set SHA-256s) and `result.json` (status and summary). Fine-tuning 
 
 - Partition `mit_normal_gpu`, `--gres=gpu:b200:1`, max 6 h per job, 2 GPUs per user. B200 waits were
   minutes when under the limit; H200 waits are hours. Jobs ask for `-c 16 --mem=128G`.
-- To use idle GPUs beyond the 2-GPU limit, submit with `sbatch -p mit_normal_gpu,mit_preemptable --requeue
-  --nice=<N> job.sbatch`: preempted jobs requeue automatically on both partitions; finished cells are
-  skipped on restart and an interrupted cell reruns from scratch. Users can raise `--nice` (lower priority)
+- For fine-tuning, use idle GPUs beyond the 2-GPU limit with `sbatch -p mit_normal_gpu,mit_preemptable
+  --requeue --nice=<N> job.sbatch`: finished cells are skipped on restart. **Pretraining** currently uses
+  `mit_normal_gpu --no-requeue`: the launcher refuses an existing config for an interrupted run unless
+  explicitly resumed, so blind preemption/requeue is not safe. Users can raise `--nice` (lower priority)
   to order their own jobs; `scontrol top` is denied.
 - SSH from the local machine goes through a control socket
   (`-o ControlPath=$HOME/.ssh/cm_socket/orcd-%C hgo@orcd-login.mit.edu`, with `-n -o BatchMode=yes`). If

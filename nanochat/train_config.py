@@ -19,7 +19,7 @@ from pathlib import Path
 
 import torch
 
-from nanochat.gpt import BALANCERS, FFN_TYPES, MOE_DISPATCH
+from nanochat.gpt import BALANCERS, FFN_TYPES, MOE_DISPATCH, resolve_routing_loss
 from nanochat.optim import MUON_VARIANTS
 
 # Default matrix learning rate per Muon variant. "moonlight" uses Moonlight's
@@ -49,6 +49,8 @@ def add_moe_args(parser):
     group.add_argument("--balance-coef", type=float, default=0.01, help="auxiliary balance loss weight (balancer=aux)")
     group.add_argument("--z-coef", type=float, default=None,
                        help="router z-loss weight (default: 0.001 with balancer=aux, 0 otherwise)")
+    group.add_argument("--disable-routing-loss", action="store_true",
+                       help="E=1 MoE dense control only: set balance and z-loss coefficients to zero, retain routing diagnostics")
     group.add_argument("--bias-update-rate", type=float, default=0.001, help="bias balancer step size u (balancer=bias)")
     group.add_argument("--moe-dispatch", choices=MOE_DISPATCH, default="auto",
                        help="auto: grouped GEMM for bf16 on CUDA, else loop; grouped; loop (reference). Same maths, different speed")
@@ -117,9 +119,12 @@ def resolve_optimizer_args(args):
 
 
 def resolve_moe_args(args):
-    """Fill the z-loss default in place and return GPTConfig keyword arguments."""
+    """Fill resolved routing-loss coefficients in place and return GPTConfig keywords."""
     if args.z_coef is None:
         args.z_coef = 0.001 if args.balancer == "aux" else 0.0
+    args.balance_coef, args.z_coef = resolve_routing_loss(
+        args.ffn_type, args.n_experts, args.disable_routing_loss, args.balance_coef, args.z_coef,
+    )
     return dict(
         ffn_type=args.ffn_type,
         n_experts=args.n_experts,
@@ -127,6 +132,7 @@ def resolve_moe_args(args):
         balancer=args.balancer,
         balance_coef=args.balance_coef,
         z_coef=args.z_coef,
+        disable_routing_loss=args.disable_routing_loss,
         bias_update_rate=args.bias_update_rate,
         moe_dispatch=args.moe_dispatch,
     )

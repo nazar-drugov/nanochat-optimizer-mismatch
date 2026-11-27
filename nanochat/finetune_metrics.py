@@ -27,6 +27,8 @@ def route_comparison(r0, r1, n_experts):
 
     flip_rate phi = P[r1 != r0]; chance_flip_rate = 1 - sum_i l0_i l1_i (the flip rate of
     independent routes with these loads); tv = 0.5 sum_i |l1_i - l0_i| <= phi; churn = phi - tv.
+    The normalized flip rate is undefined when chance == 0 (including E=1),
+    so report None (JSON null), not an invented value or a nonfinite JSON number.
     """
     r0, r1 = r0.reshape(-1).long(), r1.reshape(-1).long()
     l0, l1 = load_shares(r0, n_experts), load_shares(r1, n_experts)
@@ -35,7 +37,7 @@ def route_comparison(r0, r1, n_experts):
     tv = float(0.5 * (l1 - l0).abs().sum())
     return {
         "flip_rate": phi, "chance_flip_rate": chance,
-        "flip_rate_normalized": phi / chance if chance > 0 else float("nan"),
+        "flip_rate_normalized": phi / chance if chance > 0 else None,
         "tv": tv, "churn": phi - tv,
         "load": l1.tolist(), "maxvio": maxvio(l1), "base_maxvio": maxvio(l0),
     }
@@ -53,7 +55,9 @@ def select_experts(logits, bias=None):
 
 
 def top2_margin(logits):
-    """Per-token p_(1) - p_(2) of the router softmax."""
+    """Per-token p_(1) - p_(2) of the router softmax, or None if E=1."""
+    if logits.size(-1) == 1:
+        return None
     top2 = torch.topk(torch.softmax(logits.float(), dim=-1), 2, dim=-1).values
     return top2[..., 0] - top2[..., 1]
 

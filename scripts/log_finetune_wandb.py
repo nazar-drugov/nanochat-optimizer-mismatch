@@ -108,7 +108,7 @@ class Cell:
     source_digest: str
 
 
-def make_cell(result, config, *, stage, source=None, invalid=False):
+def make_cell(result, config, *, stage, source=None, invalid=False, base_manifest=None):
     """Validate saved branch identity/curve, construct a strictly whitelisted payload."""
     stage, source = label(stage), label(source if source is not None else stage)
     if result.get("status") not in ("completed", "diverged"):
@@ -120,6 +120,8 @@ def make_cell(result, config, *, stage, source=None, invalid=False):
     if not match:
         raise RecordError("invalid base run identity")
     experts, pre, pre_seed = int(match[1]), match[2], int(match[3])
+    if experts not in (1, 4, 8, 16):
+        raise RecordError("unsupported expert count")
     if result.get("pretrain_optimizer") != pre or result.get("n_experts", experts) != experts:
         raise RecordError("base optimizer/expert count mismatch")
     dataset = label(result.get("ft_dataset"))
@@ -140,6 +142,30 @@ def make_cell(result, config, *, stage, source=None, invalid=False):
         raise RecordError("config/result length mismatch")
     if cell.get("pretrain_optimizer", pre) != pre or cell.get("n_experts", experts) != experts:
         raise RecordError("config/result model identity mismatch")
+    pin = None
+    if experts != 8:
+        from nanochat.pretrain_sweep import resolve_base_pin
+        try:
+            pin = resolve_base_pin(base, base_manifest)
+        except ValueError as exc:
+            raise RecordError(str(exc)) from None
+        identity = config.get("base", {})
+        user = identity.get("user_config", {})
+        if (user.get("seed") != pin.seed or user.get("optimizer_name") != pin.optimizer or
+                user.get(f"{pin.optimizer}_matrix_lr") != pin.matrix_lr):
+            raise RecordError("base metadata disagrees with verified manifest")
+        model = config.get("model_config", {})
+        if experts == 1 and (model.get("disable_routing_loss") is not True or
+                             model.get("balance_coef") != 0 or model.get("z_coef") != 0):
+            raise RecordError("E1 routing-loss policy is not disabled")
+        if (identity.get("model_sha256") != pin.model_sha256 or identity.get("step") != pin.step or
+                identity.get("logical_run") != base or identity.get("checkpoint_run") != pin.checkpoint_dir.name or
+                identity.get("n_experts") != experts or result.get("n_experts") != experts or
+                cell.get("n_experts") != experts or config.get("model_config", {}).get("n_experts") != experts or
+                Path(identity.get("dir") or "").resolve() != pin.checkpoint_dir.resolve() or
+                Path(identity.get("model_file") or "").resolve() !=
+                (pin.checkpoint_dir / f"model_{pin.step:06d}.pt").resolve()):
+            raise RecordError("saved logical/actual base checkpoint identity disagrees with verified manifest")
     if config.get("stage", "finetune") != "finetune":
         raise RecordError("config is not fine-tuning")
     done = integer(result.get("steps_completed"), "steps_completed")
@@ -168,6 +194,9 @@ def make_cell(result, config, *, stage, source=None, invalid=False):
                 if v is None:
                     nonfinite += 1
                 point[key] = v
+        if experts == 1 and (point.get("F_route") != 0. or
+                not math.isclose(point["F_fixed"], point["forgetting"], rel_tol=0, abs_tol=1e-7)):
+            raise RecordError("E1 replay identity must be structural zero")
         points.append(point)
     if completed and (not points or last != steps):
         raise RecordError("missing final checkpoint")
@@ -184,6 +213,11 @@ def make_cell(result, config, *, stage, source=None, invalid=False):
         meta["batch_tokens"] = integer(batch, "batch_tokens", minimum=1)
     if (base_step := config.get("base", {}).get("step")) is not None:
         meta["base_checkpoint_step"] = integer(base_step, "base_checkpoint_step")
+    if pin is not None:
+        # Preserve existing E8 run IDs and source digests exactly. New E runs
+        # record actual checkpoint identity (no filesystem paths in W&B).
+        meta.update(base_checkpoint_run=pin.checkpoint_dir.name, base_model_sha256=pin.model_sha256,
+                    base_matrix_lr=pin.matrix_lr)
     summary = {"result_status": status, "invalid": bool(invalid), "steps_completed": done,
                "checkpoint_count": len(points), "nonfinite_measurement_count": nonfinite}
     for key in ("learning", "forgetting"):
@@ -209,13 +243,13 @@ def make_cell(result, config, *, stage, source=None, invalid=False):
     return Cell(run_id, name, group, tags, meta, tuple(points), summary, source_digest)
 
 
-def load_cell(path, *, stage, source=None, invalid=False):
+def load_cell(path, *, stage, source=None, invalid=False, base_manifest=None):
     path = Path(path)
     with path.open() as f:
         result = json.load(f)
     with (path.parent / "config.json").open() as f:
         config = json.load(f)
-    cell = make_cell(result, config, stage=stage, source=source, invalid=invalid)
+    cell = make_cell(result, config, stage=stage, source=source, invalid=invalid, base_manifest=base_manifest)
     base, dataset, run_label = path.parts[-4:-1]
     if (base != cell.metadata["base_run"] or dataset != cell.metadata["dataset"]
             or not run_label.startswith(cell.metadata["ft_optimizer"] + "-")):
@@ -393,6 +427,7 @@ def main(argv=None, *, wb=None):
     parser.add_argument("--root", action="append", type=Path, required=True)
     parser.add_argument("--stage", required=True)
     parser.add_argument("--source", "--source-label", help="defaults to --stage; distinct replication/archive label")
+    parser.add_argument("--base-manifest", type=Path, help="verify non-E8 saved base checkpoint pins before upload")
     parser.add_argument("--dataset", action="append")
     parser.add_argument("--base-run", action="append")
     parser.add_argument("--ft-optimizer", action="append", choices=sorted(OPTIMIZERS))
@@ -405,6 +440,11 @@ def main(argv=None, *, wb=None):
     parser.add_argument("--verify-online", action="store_true", help="verify uploaded checkpoint steps through API")
     parser.add_argument("--dry-run", action="store_true", help="validate/print run IDs without W&B or ledger writes")
     args = parser.parse_args(argv)
+    if args.base_manifest is not None:
+        from nanochat.pretrain_sweep import load_base_manifest
+        pins = load_base_manifest(args.base_manifest)
+    else:
+        pins = None
     try:
         args.entity, args.project = label(args.entity), label(args.project)
         args.stage = label(args.stage)
@@ -433,7 +473,7 @@ def main(argv=None, *, wb=None):
     seen = {}
     for path in result_paths(args.root, args.dataset, args.base_run, args.ft_optimizer):
         try:
-            cell = load_cell(path, stage=args.stage, source=args.source, invalid=args.invalid)
+            cell = load_cell(path, stage=args.stage, source=args.source, invalid=args.invalid, base_manifest=pins)
             if cell.run_id in seen:
                 if seen[cell.run_id] != cell.source_digest:
                     raise RecordError("different branch results share an identity; use distinct --source labels")

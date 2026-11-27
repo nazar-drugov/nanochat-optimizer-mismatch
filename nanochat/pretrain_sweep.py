@@ -1,7 +1,7 @@
 """
-The E = 8 pretraining plan (PRETRAINING_PROTOCOL.md, 2026-11-24): a short learning-rate
-sweep, the selection of each optimizer's LR from it, the 3B-token base models, and the
-Slurm job scripts that run them through runs/pretrain_study.sh.
+Pretraining plan (PRETRAINING_PROTOCOL.md): short learning-rate sweeps, local
+selection of each optimizer's LR at each E, 3B-token transfer checks and bases,
+and Slurm job scripts through runs/pretrain_study.sh.
 
 Pure functions only; scripts/pretrain_sweep.py is the command-line front end.
 
@@ -13,11 +13,14 @@ documents); the LR is the vertex of the parabola through the best point and its 
 neighbours in log2(LR), then multiplied by (3B / 0.5B)^-0.32 for the 3B-token runs.
 If the best point is at the edge of the grid, the sweep is extended by one point (x2).
 Transfer check (2026-11-25): 3B-token runs at x0.5 and x2 the transferred LR (the main
-run of the same seed is x1); the parabola vertex through the three shows how far the
-transferred LR is from the 3B optimum.
+run of the same seed is x1 for E8); the parabola vertex through the three shows how
+far the transferred LR is from the 3B optimum. New E=1/4/16 use five-point initial
+grids, separate x1 transfer directories with full checkpoint cadence, and an
+explicit logical-base manifest if the checked center is retained.
 """
 
 import json
+import hashlib
 import math
 import re
 import shlex
@@ -31,6 +34,7 @@ REFERENCE_WARMUP_TOKENS = 130_000_000  # warmup of the 3B-token runs (Ludziejews
 TRANSFER_EXPONENT = -0.32             # LR ∝ T^-0.32 (Bjorck et al. / Ren et al., as used by Hernanz)
 DEPTH = 10
 HEADLINE_EXPERTS = 8
+EXPERT_COUNTS = (1, 4, 8, 16)
 DEFAULT_SEED = 42
 DEVICE_BATCH_SIZE = 32                # x 2048 = 65,536 tokens; 4 micro-batches per step on one GPU
 VAL_EVAL_TOKENS = 10_485_760          # validation shard tokens per evaluation (160 micro-batches)
@@ -65,6 +69,17 @@ def format_lr(lr):
     return f"{lr:.3g}"
 
 
+def sweep_lr_grid(n_experts=HEADLINE_EXPERTS):
+    """Actual historic E8 grid; independent five-point grids for new E."""
+    if n_experts not in EXPERT_COUNTS:
+        raise ValueError(f"unsupported expert count {n_experts!r}")
+    if n_experts == HEADLINE_EXPERTS:
+        return SWEEP_LRS
+    centers = {"adamw": .002 * n_experts ** -.25,
+               "muon": .004 * 2 ** (-EXPERT_COUNTS.index(n_experts) / 4)}
+    return {o: tuple(centers[o] * f for f in (.25, .5, 1, 2, 4)) for o in OPTIMIZERS}
+
+
 @dataclass(frozen=True)
 class RunSpec:
     stage: str            # "sweep" (0.5B), "main" (3B base model) or "xfer" (3B transfer check)
@@ -72,6 +87,15 @@ class RunSpec:
     lr: float
     seed: int = DEFAULT_SEED
     n_experts: int = HEADLINE_EXPERTS
+    retain_checkpoints: bool = False  # new-E transfer center can serve as final base
+
+    def __post_init__(self):
+        if self.stage not in ("sweep", "main", "xfer") or self.optimizer not in OPTIMIZERS:
+            raise ValueError("invalid pretraining stage or optimizer")
+        if self.n_experts not in EXPERT_COUNTS or self.seed < 0:
+            raise ValueError("invalid expert count or seed")
+        if not math.isfinite(self.lr) or self.lr <= 0:
+            raise ValueError("learning rate must be positive and finite")
 
     @property
     def train_tokens(self):
@@ -79,7 +103,7 @@ class RunSpec:
 
     @property
     def keeps_checkpoints(self):
-        return self.stage == "main"  # the others need only their final evaluation
+        return self.stage == "main" or self.retain_checkpoints
 
     @property
     def name(self):
@@ -91,6 +115,7 @@ class RunSpec:
         validation, held-out and log paths and the run name)."""
         return [
             f"--depth={DEPTH}", "--ffn-type=moe", f"--n-experts={self.n_experts}",
+            *(["--disable-routing-loss"] if self.n_experts == 1 else []),
             f"--optimizer-name={self.optimizer}", f"{LR_FLAG[self.optimizer]}={self.lr!r}",
             f"--seed={self.seed}",
             f"--train-tokens={self.train_tokens}", f"--total-batch-size={TOTAL_BATCH_SIZE}",
@@ -103,23 +128,40 @@ class RunSpec:
         ]
 
 
-def sweep_runs(seed=DEFAULT_SEED, lrs=None):
-    lrs = SWEEP_LRS if lrs is None else lrs
-    return [RunSpec("sweep", optimizer, lr, seed) for optimizer in OPTIMIZERS for lr in lrs[optimizer]]
+def checked_run_names(runs):
+    """Reject different exact LRs that collide under the historic name rounding."""
+    if len(set(r.name for r in runs)) != len(runs):
+        raise ValueError("duplicate run names (possibly rounded LR collision)")
+    return runs
 
 
-def main_runs(full_lrs, seeds=(DEFAULT_SEED,)):
-    """3B-token E = 8 base models at the selected (transferred) LR of each optimizer."""
-    return [RunSpec("main", optimizer, full_lrs[optimizer], seed) for seed in seeds for optimizer in OPTIMIZERS]
+def sweep_runs(seed=DEFAULT_SEED, lrs=None, n_experts=HEADLINE_EXPERTS):
+    lrs = sweep_lr_grid(n_experts) if lrs is None else lrs
+    return checked_run_names([RunSpec("sweep", optimizer, lr, seed, n_experts)
+                              for optimizer in OPTIMIZERS for lr in lrs[optimizer]])
 
 
-def transfer_check_runs(full_lrs, seed=DEFAULT_SEED, factors=TRANSFER_CHECK_FACTORS):
+def main_runs(full_lrs, seeds=(DEFAULT_SEED,), n_experts=HEADLINE_EXPERTS):
+    """3B-token bases at the selected LR of each optimizer."""
+    return checked_run_names([RunSpec("main", optimizer, full_lrs[optimizer], seed, n_experts)
+                              for seed in seeds for optimizer in OPTIMIZERS])
+
+
+def transfer_check_runs(full_lrs, seed=DEFAULT_SEED, factors=None, n_experts=HEADLINE_EXPERTS):
     """3B-token runs at `factors` x each optimizer's transferred LR (the main run is x1).
     `factors` is one tuple for every optimizer or {optimizer: tuple} (e.g. to extend the
     check past an edge for one optimizer)."""
+    # New E uses a separately named full-budget center trial, never a provisional
+    # main path. E8 keeps the historical center-as-main workflow.
+    if factors is None:
+        factors = TRANSFER_CHECK_FACTORS
     per_optimizer = factors if isinstance(factors, dict) else {o: factors for o in OPTIMIZERS}
-    return [RunSpec("xfer", optimizer, full_lrs[optimizer] * f, seed)
-            for optimizer in OPTIMIZERS for f in per_optimizer[optimizer]]
+    return checked_run_names([
+        RunSpec("xfer", optimizer, full_lrs[optimizer] * f, seed, n_experts,
+                retain_checkpoints=(n_experts != HEADLINE_EXPERTS and f == 1))
+        for optimizer in OPTIMIZERS
+        for f in sorted(set(per_optimizer[optimizer]) | ({1.0} if n_experts != HEADLINE_EXPERTS else set()))
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -131,16 +173,50 @@ def read_result(checkpoint_dir):
     return json.loads(path.read_text()) if path.is_file() else None
 
 
+def validate_pretrain_result(run, result):
+    """Check resolved results, strictly for every new-E experiment.
+
+    The old E8 result reader retains compatibility with its historical records.
+    """
+    expected = {"matrix_lr": run.lr, "optimizer_name": run.optimizer}
+    if run.n_experts != HEADLINE_EXPERTS:
+        expected.update(n_experts=run.n_experts, seed=run.seed, ffn_type="moe", depth=DEPTH,
+                        total_batch_size=TOTAL_BATCH_SIZE, train_tokens=run.train_tokens,
+                        warmup_steps=warmup_steps(run.train_tokens), warmdown_ratio=.2,
+                        weight_decay=.1, max_grad_norm=1.,
+                        disable_routing_loss=run.n_experts == 1,
+                        balancer="aux",
+                        balance_coef=0. if run.n_experts == 1 else .01,
+                        z_coef=0. if run.n_experts == 1 else .001)
+    settings = result.get("settings", {})
+    if any(settings.get(k) != v for k, v in expected.items()):
+        raise ValueError(f"{run.name}: result.json settings do not match the planned run")
+    if result.get("status") not in ("completed", "diverged"):
+        raise ValueError(f"{run.name}: invalid or unfinished result")
+    if run.n_experts != HEADLINE_EXPERTS:
+        if result.get("run") != run.name or result.get("num_iterations") != num_steps(run.train_tokens):
+            raise ValueError(f"{run.name}: wrong run identity or target length")
+        if result["status"] == "completed" and (
+            result.get("steps_trained") != num_steps(run.train_tokens) or
+            result.get("tokens_trained") != run.train_tokens or
+            not isinstance(result.get("final_val_bpb"), (int, float)) or
+            not math.isfinite(result["final_val_bpb"]) or result["final_val_bpb"] <= 0
+        ):
+            raise ValueError(f"{run.name}: incomplete completed-run result or non-finite validation")
+
+
 def sweep_points(runs, checkpoints_root):
     """{optimizer: [(lr, final_val_bpb or None if diverged)]}; raises if a run has no result."""
+    checked_run_names(runs)
+    if len({(r.n_experts, r.seed, r.train_tokens) for r in runs}) > 1:
+        raise ValueError("cannot pool distinct expert counts, seeds, or token budgets")
     points, missing = {}, []
     for run in runs:
         result = read_result(Path(checkpoints_root) / run.name)
         if result is None:
             missing.append(run.name)
             continue
-        if result["settings"]["matrix_lr"] != run.lr or result["settings"]["optimizer_name"] != run.optimizer:
-            raise ValueError(f"{run.name}: result.json settings do not match the planned run")
+        validate_pretrain_result(run, result)
         bpb = result["final_val_bpb"] if result["status"] == "completed" else None
         points.setdefault(run.optimizer, []).append((run.lr, bpb))
     if missing:
@@ -206,15 +282,23 @@ def check_transfer(points, transferred_lr, sweep_lr, from_tokens=SWEEP_TOKENS, t
            "transferred_lr": transferred_lr, "best_lr": best_lr, "best_bpb": best_bpb,
            "assumed_exponent": TRANSFER_EXPONENT}
     i = [lr for lr, _ in points].index(best_lr)
-    if 0 < i < len(points) - 1 and all(points[j][1] is not None for j in (i - 1, i + 1)):
+    if 0 < i < len(points) - 1 and all(points[j][1] is not None and math.isfinite(points[j][1])
+                                       for j in (i - 1, i + 1)):
         xs = [math.log2(points[j][0]) for j in (i - 1, i, i + 1)]
         ys = [points[j][1] for j in (i - 1, i, i + 1)]
         vertex = 2 ** parabola_vertex(xs, ys)
         out.update(status="interior", vertex_lr=vertex,
                    vertex_octaves_from_transferred=math.log2(vertex / transferred_lr),
                    implied_exponent=math.log(vertex / sweep_lr) / math.log(to_tokens / from_tokens))
-    else:
+    elif i == 0 or i == len(points) - 1:
         out["status"] = "edge"  # the 3B optimum lies beyond the checked range
+        next_lr = best_lr / 2 if i == 0 else best_lr * 2
+        out["next_factor"] = next_lr / transferred_lr
+    else:
+        # There are tried LRs on each side, but a divergent neighbor prevents
+        # a local fit. This is not an edge; do not auto-extend into divergence.
+        out["status"] = "unfittable"
+        out["reason"] = "interior grid best has a diverged/nonfinite neighbor"
     return out
 
 
@@ -230,7 +314,7 @@ def selection_after_transfer(selection, report, threshold=TRANSFER_RERUN_OCTAVES
         r, c = report[optimizer], dict(choice)
         c["transferred_lr"] = choice["full_lr"]
         if r["status"] != "interior":
-            c.update(status="transfer-check-edge", full_lr_source=None)
+            c.update(status=f"transfer-check-{r['status']}", full_lr_source=None)
         elif abs(r["vertex_octaves_from_transferred"]) > threshold:
             c.update(full_lr=r["vertex_lr"], full_lr_source="transfer-check vertex",
                      octaves_from_transferred=r["vertex_octaves_from_transferred"])
@@ -307,6 +391,7 @@ def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=Sl
     others; the job exits non-zero if any run failed. Result files are then copied
     to pool storage.
     """
+    checked_run_names(runs)
     for run in runs:
         if not RUN_NAME_PATTERN.match(run.name):
             raise ValueError(f"invalid run name {run.name!r}")
@@ -318,6 +403,8 @@ def render_job(job_name, runs, time_limit, repo_dir, scratch_base=None, slurm=Sl
         '    if [[ -f "$SCRATCH/base_checkpoints/$name/result.json" ]]; then',
         '        echo "Skipping $name: result.json exists"; return 0',
         "    fi",
+        # The launcher derives canonical E/optimizer/seed/stage W&B metadata
+        # from RUN_NAME, with xfer mapped to the established transfer group.
         '    RUN_NAME="$name" bash "$LAUNCHER" train "$@" || { echo "FAILED: $name" >&2; failed=1; }',
         "}",
     ]
@@ -346,12 +433,148 @@ FINETUNE_BASE_CHECKPOINTS = {
 }
 
 
-def base_run_seed(base_run):
-    """Pretraining seed of a pinned base run, from its name (e8-main-<optimizer>-s<seed>)."""
-    match = re.fullmatch(r"e8-main-(adamw|muon)-s(\d+)", base_run)
+def base_run_identity(base_run):
+    """(E, optimizer, seed) from a logical main base name."""
+    match = re.fullmatch(r"e(1|4|8|16)-main-(adamw|muon)-s(\d+)", base_run)
     if match is None:
         raise ValueError(f"not a main base run name: {base_run!r}")
-    return int(match.group(2))
+    return int(match.group(1)), match.group(2), int(match.group(3))
+
+
+def base_run_seed(base_run):
+    return base_run_identity(base_run)[2]
+
+
+def base_run_experts(base_run):
+    return base_run_identity(base_run)[0]
+
+
+@dataclass(frozen=True)
+class BasePin:
+    """Logical main identity plus actual source checkpoint directory and digest."""
+    checkpoint_dir: Path
+    step: int
+    optimizer: str
+    n_experts: int
+    seed: int
+    matrix_lr: float | None
+    model_sha256: str
+
+
+def _manifest_pins(document):
+    if not isinstance(document, dict) or document.get("version") != 1 or not isinstance(document.get("bases"), dict):
+        raise ValueError("invalid base manifest: expected version 1 and bases mapping")
+    pins = {}
+    required = {"checkpoint_dir", "step", "optimizer", "n_experts", "seed", "matrix_lr", "model_sha256"}
+    for name, record in document["bases"].items():
+        if not isinstance(record, dict) or not required <= set(record):
+            raise ValueError(f"{name}: incomplete base manifest entry")
+        expert_count, optimizer, seed = base_run_identity(name)
+        if (record["optimizer"], record["n_experts"], record["seed"], record["step"]) != (
+            optimizer, expert_count, seed, FINETUNE_BASE_STEP
+        ):
+            raise ValueError(f"{name}: wrong base pin identity or checkpoint step")
+        if not isinstance(record["matrix_lr"], (int, float)) or not math.isfinite(record["matrix_lr"]) or record["matrix_lr"] <= 0:
+            raise ValueError(f"{name}: invalid base pin matrix LR")
+        lr = float(record["matrix_lr"])
+        directory = Path(record["checkpoint_dir"])
+        allowed_source = {name, RunSpec("xfer", optimizer, lr, seed, expert_count).name}
+        if not directory.is_absolute() or directory.name not in allowed_source or ".." in directory.parts:
+            raise ValueError(f"{name}: base pin directory must be an absolute actual main or selected xfer source path")
+        sha256 = record["model_sha256"]
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError(f"{name}: invalid model SHA-256")
+        if name in FINETUNE_BASE_CHECKPOINTS and (directory != FINETUNE_BASE_CHECKPOINTS_DIR / name or
+                                                 sha256 != FINETUNE_BASE_CHECKPOINTS[name][1]):
+            raise ValueError(f"{name}: manifest cannot replace a historical E8 base pin")
+        pins[name] = BasePin(directory, FINETUNE_BASE_STEP, optimizer, expert_count, seed, lr, sha256)
+    if not pins:
+        raise ValueError("empty base manifest")
+    return pins
+
+
+def load_base_manifest(path):
+    return _manifest_pins(json.loads(Path(path).read_text()))
+
+
+def resolve_base_pin(base_run, manifest=None):
+    """Resolve a validated explicit pin; never infer a new-E checkpoint from its name."""
+    expert_count, optimizer, seed = base_run_identity(base_run)
+    if manifest is not None:
+        if isinstance(manifest, (str, Path)):
+            pins = load_base_manifest(manifest)
+        elif isinstance(manifest, dict) and "version" in manifest:
+            pins = _manifest_pins(manifest)
+        else:
+            pins = manifest
+        if base_run in pins:
+            pin = pins[base_run]
+            if not isinstance(pin, BasePin) or (pin.n_experts, pin.optimizer, pin.seed) != (expert_count, optimizer, seed):
+                raise ValueError(f"{base_run}: invalid decoded base pin")
+            return pin
+    if base_run in FINETUNE_BASE_CHECKPOINTS:
+        return BasePin(FINETUNE_BASE_CHECKPOINTS_DIR / base_run, FINETUNE_BASE_STEP, optimizer,
+                       expert_count, seed, None, FINETUNE_BASE_CHECKPOINTS[base_run][1])
+    raise ValueError(f"{base_run}: new base run requires a pinned base manifest entry")
+
+
+def completed_base_manifest(selection, checkpoints_root, n_experts, seeds=(DEFAULT_SEED,)):
+    """Inspect actual completed full-budget bases and hash actual final model weights.
+
+    A transfer center may serve as the logical seed-42 main base only when its
+    exact LR is retained by the transfer check. Never promote a side trial.
+    """
+    entries = {}
+    root = Path(checkpoints_root).resolve()
+    for run in main_runs({o: selection[o]["full_lr"] for o in OPTIMIZERS}, seeds, n_experts):
+        choice = selection[run.optimizer]
+        if (choice.get("status") != "selected" or choice.get("full_lr_source") not in
+                ("transferred", "transfer-check vertex") or choice.get("n_experts") != n_experts):
+            raise ValueError(f"{run.name}: manifest requires final validated LR selection for this E")
+        source = run
+        if (n_experts != HEADLINE_EXPERTS and run.seed == choice.get("seed") and
+                choice["full_lr_source"] == "transferred" and
+                choice.get("transferred_lr") == run.lr):
+            source = RunSpec("xfer", run.optimizer, run.lr, run.seed, n_experts, retain_checkpoints=True)
+        directory = root / source.name
+        result = read_result(directory)
+        if result is None:
+            raise FileNotFoundError(f"{run.name}: no completed result at {directory}")
+        validate_pretrain_result(source, result)
+        if result["status"] != "completed":
+            raise ValueError(f"{run.name}: diverged pretraining cannot be used as a base")
+        model_file = directory / f"model_{FINETUNE_BASE_STEP:06d}.pt"
+        meta_file = directory / f"meta_{FINETUNE_BASE_STEP:06d}.json"
+        if not model_file.is_file() or not meta_file.is_file():
+            raise FileNotFoundError(f"{run.name}: missing final model weights or checkpoint metadata")
+        meta = json.loads(meta_file.read_text())
+        user = meta.get("user_config", {})
+        shape = meta.get("model_config", {})
+        if (meta.get("step") != FINETUNE_BASE_STEP or user.get("seed") != run.seed or
+                user.get("optimizer_name") != run.optimizer or user.get(f"{run.optimizer}_matrix_lr") != run.lr or
+                shape.get("n_experts") != n_experts or shape.get("ffn_type") != "moe" or
+                meta.get("train_tokens") != FULL_TOKENS or meta.get("total_batch_size") != TOTAL_BATCH_SIZE):
+            raise ValueError(f"{run.name}: final checkpoint metadata disagrees with selected base")
+        if n_experts != HEADLINE_EXPERTS:
+            routing_policy = {"disable_routing_loss": n_experts == 1,
+                              "balancer": "aux",
+                              "balance_coef": 0. if n_experts == 1 else .01,
+                              "z_coef": 0. if n_experts == 1 else .001}
+            if any(record.get(field) != value for record in (user, shape)
+                   for field, value in routing_policy.items()):
+                raise ValueError(f"{run.name}: base checkpoint routing-loss policy disagrees with the approved recipe")
+        digest = hashlib.sha256()
+        with model_file.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        entries[run.name] = {
+            "checkpoint_dir": str(directory), "step": FINETUNE_BASE_STEP, "optimizer": run.optimizer,
+            "n_experts": n_experts, "seed": run.seed, "matrix_lr": run.lr,
+            "model_sha256": digest.hexdigest(),
+        }
+    document = {"version": 1, "bases": entries}
+    _manifest_pins(document)
+    return document
 # Fine-tuning LR grid per fine-tuning optimizer: fractions of that optimizer's selected
 # 3B-token pretraining LR, spaced x2 (EXPERIMENT_SPEC.md §6: 5-point grid per cell).
 FINETUNE_LR_FRACTIONS = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
@@ -362,12 +585,12 @@ def finetune_lr_grid(selection, fractions=FINETUNE_LR_FRACTIONS):
 
 
 def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optimizer, lrs, time_limit, repo_dir,
-                        seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings(), extra_args=()):
+                        seeds=FINETUNE_SEEDS, scratch_base=None, slurm=SlurmSettings(), extra_args=(), base_manifest=None):
     """One process runs every (LR, seed) cell of one base model, dataset and fine-tuning optimizer."""
-    if not RUN_NAME_PATTERN.match(base_run) or base_run not in FINETUNE_BASE_CHECKPOINTS:
-        raise ValueError(f"fine-tuning base run must be a pinned main-run checkpoint: {base_run!r}")
-    args = ["--base-run", base_run, "--base-checkpoints-dir", str(FINETUNE_BASE_CHECKPOINTS_DIR),
-            "--base-step", str(FINETUNE_BASE_STEP),
+    pin = resolve_base_pin(base_run, base_manifest)
+    args = ["--base-run", base_run, "--base-checkpoints-dir", str(pin.checkpoint_dir.parent),
+            "--base-step", str(pin.step),
+            *(["--base-manifest", str(Path(base_manifest).resolve())] if base_manifest is not None else []),
             "--ft-data-dir", str(ft_data_dir), "--ft-name", ft_name, "--d0-file", str(d0_file),
             "--lrs", f"{optimizer}=" + ",".join(repr(lr) for lr in lrs), "--seeds", *map(str, seeds),
             *map(str, extra_args)]
@@ -376,7 +599,9 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
     root = shlex.quote(out_root) if out_root else '"$SCRATCH/finetune"'
     stage = Path(out_root).name if out_root else "finetune"
     sync_args = " ".join(shlex.quote(a) for a in ["--stage", stage, "--dataset", ft_name,
-                                                    "--base-run", base_run, "--ft-optimizer", optimizer])
+                                                    "--base-run", base_run, "--ft-optimizer", optimizer,
+                                                    *(["--base-manifest", str(Path(base_manifest).resolve())]
+                                                      if base_manifest is not None else [])])
     lines = slurm_header(job_name, time_limit, repo_dir, scratch_base, slurm) + [
         'PYTHON="${NANOCHAT_PYTHON:-.venv/bin/python}"',
         'export NANOCHAT_BASE_DIR="$SCRATCH"',

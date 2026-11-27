@@ -46,6 +46,8 @@ def make_base_experiment_name(args):
         if moe_layers != "all":
             parts.append("ml" + moe_layers.replace(":", "").replace(",", "."))
         parts.append(f"bal{balancer}")
+        if getattr(args, "disable_routing_loss", False):
+            parts.append("norouteloss")
 
     parts.append(args.optimizer_name)
     if args.optimizer_name == "muon":
@@ -140,6 +142,20 @@ def validate_checkpoint_seed(meta_data, seed):
             f"Checkpoint seed {checkpoint_seed} does not match requested --seed={seed}. "
             f"Resume with --seed={checkpoint_seed} to preserve the original experiment metadata."
         )
+
+
+def validate_checkpoint_routing_loss(meta_data, model_config):
+    """Never toggle the E=1 dense-control objective while resuming a run.
+
+    Checkpoints created before the flag use the original ``False`` policy.
+    A flagged checkpoint must also record both effective coefficients as zero.
+    """
+    saved = meta_data.get("model_config", {})
+    policy = saved.get("disable_routing_loss", False)
+    if type(policy) is not bool or policy != model_config.disable_routing_loss:
+        raise ValueError("Checkpoint disable_routing_loss policy differs from the current model; refusing to resume")
+    if policy and (saved.get("balance_coef") != 0.0 or saved.get("z_coef") != 0.0):
+        raise ValueError("Checkpoint with disable_routing_loss must record zero balance/z coefficients")
 
 
 def checkpoint_tokenizer_name(meta_data):

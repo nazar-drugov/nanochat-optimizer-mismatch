@@ -38,6 +38,7 @@ import copy
 import json
 import math
 import os
+import re
 import time
 from collections import deque
 from dataclasses import asdict
@@ -54,7 +55,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bo
 from nanochat.dataset import list_parquet_files
 from nanochat.eval_set import EvalSet, build_eval_set, per_doc_sums
 from nanochat.pretrain_sweep import (
-    FINETUNE_BASE_CHECKPOINTS, FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP, base_run_seed,
+    FINETUNE_BASE_CHECKPOINTS_DIR, FINETUNE_BASE_STEP, resolve_base_pin,
 )
 from nanochat.finetune_metrics import (
     expert_relative_change, flip_cause_counts, load_shares, maxvio, route_comparison, separation, top2_margin,
@@ -99,12 +100,14 @@ def evaluate_base(model0, eval_set, batch_size, device):
         losses.append(forward_losses(model0, x.to(device), y.to(device), capture=cap).cpu())
         for entry in cap:
             routes[entry["layer"]].append(entry["choices"].to(torch.uint8).cpu())
-            margins[entry["layer"]].append(top2_margin(entry["logits"]).cpu())
+            margin = top2_margin(entry["logits"])
+            if margin is not None:
+                margins[entry["layer"]].append(margin.cpu())
     loss = torch.cat(losses)
     sums, counts = per_doc_sums(loss, eval_set.doc_ids, eval_set.n_docs)
     return {"loss": loss, "doc_sums": sums, "doc_counts": counts,
             "routes": {l: torch.cat(r) for l, r in routes.items()},
-            "margin": {l: float(torch.cat(m).mean()) for l, m in margins.items()}}
+            "margin": {l: float(torch.cat(m).mean()) if m else None for l, m in margins.items()}}
 
 
 def router_state(model, layer):
@@ -131,7 +134,8 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
         r0 = {l: base["routes"][l][rows].to(device=device, dtype=torch.long) for l in layers}
         cap1 = []
         loss = forward_losses(model1, x, y, capture=cap1).cpu()
-        sums["normal"] += per_doc_sums(loss, ids, eval_set.n_docs)[0]
+        normal_sums = per_doc_sums(loss, ids, eval_set.n_docs)[0]
+        sums["normal"] += normal_sums
         r1 = {}
         for i, entry in enumerate(cap1):
             l = entry["layer"]
@@ -140,6 +144,12 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
             flipped = (entry["choices"] != r0[l]).cpu()
             doc_flips[:, i] += per_doc_sums(flipped.float(), ids, eval_set.n_docs)[0]
         if not full:
+            continue
+        if n_experts == 1:
+            # The only possible route is expert zero. Replay is the identity,
+            # and reverse routing is exactly the pretrained evaluation. Use
+            # the already measured losses so the structural zero is exact.
+            sums["replay"] += normal_sums
             continue
         sums["replay"] += per_doc_sums(forward_losses(model1, x, y, forced=r0).cpu(), ids, eval_set.n_docs)[0]
         sums["reverse"] += per_doc_sums(forward_losses(model0, x, y, forced=r1).cpu(), ids, eval_set.n_docs)[0]
@@ -152,6 +162,8 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
             counts = flip_cause_counts(e0["inputs"], e1["inputs"], w0, w1, r0[l], r1[l], b0, b1)
             for key, value in counts.items():
                 cause[l][key] += value
+    if full and n_experts == 1:
+        sums["reverse"] = base["doc_sums"].clone()
     routes1 = {l: torch.cat(r) for l, r in routes1.items()}
     scored = eval_set.doc_ids >= 0
     per_layer = {}
@@ -271,13 +283,31 @@ def run_cell(args, cell, ctx):
     lengths = sorted({ctx["main_steps"], *ctx["branch_steps"]})
     branches = [Branch(args, n, f"-T{n}" if len(lengths) > 1 else "") for n in lengths]
     run_dirs = {b.steps: ctx["out_dir"] / (name + b.suffix) for b in branches}
+    for b in branches:  # never overwrite or skip a finalized different cell
+        run_dir = run_dirs[b.steps]
+        if not (run_dir / "result.json").is_file():
+            continue
+        done = json.loads((run_dir / "result.json").read_text())
+        if (done.get("lr"), done.get("steps"), done.get("warmup_steps")) != (lr, b.steps, ctx["warmup"]):
+            raise RuntimeError(f"{run_dir}/result.json has lr {done.get('lr')!r}, steps "
+                               f"{done.get('steps')}, warmup {done.get('warmup_steps')}; this cell has "
+                               f"lr {lr!r}, steps {b.steps}, warmup {ctx['warmup']}")
+        if ctx["model"].config.n_experts != 8 and "logical_run" in ctx["base_identity"]:
+            raw = json.loads((run_dir / "config.json").read_text())
+            identity = ctx["base_identity"]
+            keys = ("dir", "step", "model_file", "model_sha256", "logical_run", "checkpoint_run", "n_experts")
+            fields = {"base_run": ctx["base_run"], "ft_optimizer": optimizer_name, "seed": seed,
+                      "lr": lr, "ft_steps": b.steps, "n_experts": identity["n_experts"], "ft_dataset": args.ft_name}
+            if (any(raw.get("base", {}).get(k) != identity[k] for k in keys)
+                or any(done.get(k) != v or raw.get("cell", {}).get(k) != v for k, v in fields.items())
+                or raw.get("data", {}).get("eval_sets") != ctx["eval_identity"]
+                or raw.get("data", {}).get("ft_train_files") != ctx["ft_train_files"]
+                or raw.get("warmup_steps") != ctx["warmup"]
+                or raw.get("decay_steps") != b.decay or done.get("decay_steps") != b.decay
+                or raw.get("args", {}).get("total_batch_size") != args.total_batch_size
+                or raw.get("args", {}).get("device_batch_size") != args.device_batch_size):
+                raise RuntimeError(f"{run_dir}: finalized cell provenance conflicts with the requested pin/data/schedule")
     if all((d / "result.json").exists() for d in run_dirs.values()):
-        for b in branches:  # never skip on a result of a different cell that shares the directory name
-            done = json.loads((run_dirs[b.steps] / "result.json").read_text())
-            if (done.get("lr"), done.get("steps"), done.get("warmup_steps")) != (lr, b.steps, ctx["warmup"]):
-                raise RuntimeError(f"{run_dirs[b.steps]}/result.json has lr {done.get('lr')!r}, steps "
-                                   f"{done.get('steps')}, warmup {done.get('warmup_steps')}; this cell has "
-                                   f"lr {lr!r}, steps {b.steps}, warmup {ctx['warmup']}")
         print0(f"Skipping {name}: result.json exists")
         return
     for run_dir in run_dirs.values():  # an interrupted cell restarts from scratch
@@ -441,14 +471,65 @@ def parse_lrs(values):
     return lrs
 
 
+def resolve_finetune_base(args, parser):
+    """Verify study pins before allocating compute; custom names remain usable in tests.
+
+    For new E values the logical main-run name may resolve to an actual
+    transfer-center checkpoint without copying or retraining its weights.
+    """
+    base_root = Path(args.base_checkpoints_dir or FINETUNE_BASE_CHECKPOINTS_DIR)
+    scientific_name = bool(re.fullmatch(r"e\d+-main-(adamw|muon)-s\d+", args.base_run))
+    pin = None
+    if args.base_manifest is not None or scientific_name or base_root.resolve() == FINETUNE_BASE_CHECKPOINTS_DIR.resolve():
+        try:
+            pin = resolve_base_pin(args.base_run, args.base_manifest)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.base_checkpoints_dir is not None and base_root.resolve() != pin.checkpoint_dir.parent.resolve():
+            parser.error("--base-checkpoints-dir conflicts with the verified base pin")
+        if args.base_step is not None and args.base_step != pin.step:
+            parser.error("--base-step conflicts with the verified base pin")
+        base_dir, base_step = pin.checkpoint_dir, pin.step
+    else:
+        # Existing non-study fixture names (e.g. tiny-base) have a deliberately
+        # explicit custom checkpoint directory and are not scientific base pins.
+        base_dir = base_root / args.base_run
+        base_step = args.base_step if args.base_step is not None else FINETUNE_BASE_STEP
+    args.base_checkpoints_dir = str(base_dir.parent)
+    args.base_step = base_step
+    model_path = base_dir / f"model_{base_step:06d}.pt"
+    meta_path = base_dir / f"meta_{base_step:06d}.json"
+    if not model_path.is_file() or not meta_path.is_file():
+        parser.error(f"missing base checkpoint or metadata: {model_path}, {meta_path}")
+    checkpoint_meta = json.loads(meta_path.read_text())
+    user_config = checkpoint_meta.get("user_config", {})
+    if checkpoint_meta.get("step") != base_step:
+        parser.error(f"checkpoint step mismatch in {meta_path}")
+    if pin is not None:
+        model_config = checkpoint_meta.get("model_config", {})
+        if (user_config.get("seed") != pin.seed or user_config.get("optimizer_name") != pin.optimizer or
+                model_config.get("n_experts") != pin.n_experts or model_config.get("ffn_type") != "moe"):
+            parser.error(f"unexpected base checkpoint metadata in {meta_path}")
+        if pin.matrix_lr is not None and user_config.get(f"{pin.optimizer}_matrix_lr") != pin.matrix_lr:
+            parser.error(f"base checkpoint matrix LR conflicts with verified pin in {meta_path}")
+        if pin.n_experts == 1 and (model_config.get("disable_routing_loss") is not True or
+                                  model_config.get("balance_coef") != 0 or model_config.get("z_coef") != 0 or
+                                  user_config.get("disable_routing_loss") is not True):
+            parser.error("E=1 control checkpoint must explicitly disable both routing losses")
+    model_sha256 = file_sha256(model_path)
+    if pin is not None and model_sha256 != pin.model_sha256:
+        parser.error(f"base checkpoint SHA-256 mismatch: {model_path}")
+    return base_dir, base_step, model_path, model_sha256, pin
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-run", required=True,
-                        help="seed-42 pretraining run with the default shared checkpoint directory")
-    parser.add_argument("--base-checkpoints-dir", default=str(FINETUNE_BASE_CHECKPOINTS_DIR),
-                        help=f"default: {FINETUNE_BASE_CHECKPOINTS_DIR}")
-    parser.add_argument("--base-step", type=int, default=FINETUNE_BASE_STEP,
-                        help=f"default: final checkpoint of the main runs, step {FINETUNE_BASE_STEP}")
+    parser.add_argument("--base-run", required=True, help="logical pinned pretraining base name")
+    parser.add_argument("--base-manifest", type=Path, help="verified base SHA pin manifest (required for non-E8)")
+    parser.add_argument("--base-checkpoints-dir", default=None,
+                        help="must agree with the pinned checkpoint parent; legacy default is the E8 shared root")
+    parser.add_argument("--base-step", type=int, default=None,
+                        help=f"must agree with the pin (legacy default: step {FINETUNE_BASE_STEP})")
     parser.add_argument("--ft-data-dir", required=True, help="train_*.parquet + val_*.parquet (scripts/make_finetune_data.py)")
     parser.add_argument("--ft-name", required=True, help="dataset name used in outputs, e.g. wikitext103")
     parser.add_argument("--d0-file", required=True, help="held-out pretraining-distribution parquet (D0)")
@@ -486,33 +567,17 @@ def main(argv=None):
         if tokens % args.total_batch_size:
             parser.error("--train-tokens and --branch-tokens must be multiples of --total-batch-size")
 
-    base_dir = Path(args.base_checkpoints_dir) / args.base_run
-    base_step = args.base_step
-    using_shared_checkpoints = Path(args.base_checkpoints_dir).resolve() == FINETUNE_BASE_CHECKPOINTS_DIR.resolve()
-    if using_shared_checkpoints and args.base_run not in FINETUNE_BASE_CHECKPOINTS:
-        parser.error(f"shared checkpoints are pinned to {tuple(FINETUNE_BASE_CHECKPOINTS)}")
-    model_path = base_dir / f"model_{base_step:06d}.pt"
-    meta_path = base_dir / f"meta_{base_step:06d}.json"
-    if not model_path.is_file() or not meta_path.is_file():
-        parser.error(f"missing base checkpoint or metadata: {model_path}, {meta_path}")
-    checkpoint_meta = json.loads(meta_path.read_text())
-    user_config = checkpoint_meta.get("user_config", {})
-    if checkpoint_meta.get("step") != base_step:
-        parser.error(f"checkpoint step mismatch in {meta_path}")
-    if using_shared_checkpoints:
-        expected_optimizer, expected_sha256 = FINETUNE_BASE_CHECKPOINTS[args.base_run]
-        if (base_step != FINETUNE_BASE_STEP or user_config.get("seed") != base_run_seed(args.base_run)
-                or user_config.get("optimizer_name") != expected_optimizer):
-            parser.error(f"unexpected base checkpoint metadata in {meta_path}")
-    model_sha256 = file_sha256(model_path)
-    if using_shared_checkpoints and model_sha256 != expected_sha256:
-        parser.error(f"base checkpoint SHA-256 mismatch: {model_path}")
+    base_dir, base_step, model_path, model_sha256, pin = resolve_finetune_base(args, parser)
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     _, _, _, _, device = compute_init(device_type, seed=0)
     model, tokenizer, base_meta = build_model(str(base_dir), base_step, device, phase="train")
     model0, _, _ = build_model(str(base_dir), base_step, device, phase="eval")
     if model.config.ffn_type != "moe":
         parser.error("fine-tuning measurements need an MoE base model (E=1 runs use ffn_type=moe with n_experts=1)")
+    if pin is not None and model.config.n_experts != pin.n_experts:
+        parser.error("loaded checkpoint expert count conflicts with verified pin")
+    if pin is not None and pin.n_experts == 1 and not model.config.disable_routing_loss:
+        parser.error("loaded E=1 control checkpoint has routing loss enabled")
     if args.balancer_mode == "frozen" and model.config.balancer == "aux":
         model.config.balance_coef = 0.0
     seq_len = base_meta["max_seq_len"]
@@ -572,7 +637,9 @@ def main(argv=None):
         "pretrain_optimizer": base_meta["user_config"].get("optimizer_name"),
         "base_identity": {"dir": str(base_dir), "step": base_step, "model_file": str(model_path),
                           "model_sha256": model_sha256, "val_bpb": base_meta.get("val_bpb"),
-                          "user_config": base_meta["user_config"], "git": git_state()},
+                          "user_config": base_meta["user_config"], "git": git_state(),
+                          **({"logical_run": args.base_run, "checkpoint_run": base_dir.name, "n_experts": pin.n_experts}
+                             if pin is not None and pin.n_experts != 8 else {})},
         "ft_train_files": {Path(f).name: file_sha256(f) for f in ft_files[:-1]},
         "eval_identity": eval_identity, "d0": d0, "d1": d1, "base_d0": base_d0, "base_d1": base_d1,
         "main_steps": args.train_tokens // args.total_batch_size,

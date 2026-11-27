@@ -48,6 +48,9 @@ class GPTConfig:
     balancer: str = "aux"
     balance_coef: float = 0.01
     z_coef: float = 0.001
+    # E=1 dense control: the one-expert MoE retains its router and diagnostics,
+    # but neither routing-only loss contributes to the optimization objective.
+    disable_routing_loss: bool = False
     bias_update_rate: float = 0.001
     # How tokens reach their expert (same routing and maths either way):
     # grouped: sort tokens by expert and run all experts in one torch._grouped_mm per
@@ -55,6 +58,24 @@ class GPTConfig:
     # loop:    boolean-mask gather per expert (data-dependent shapes; breaks torch.compile)
     # auto:    grouped for bf16 activations on CUDA, loop otherwise
     moe_dispatch: str = "auto"
+
+    def __post_init__(self):
+        self.balance_coef, self.z_coef = resolve_routing_loss(
+            self.ffn_type, self.n_experts, self.disable_routing_loss, self.balance_coef, self.z_coef,
+        )
+
+
+def resolve_routing_loss(ffn_type, n_experts, disable_routing_loss, balance_coef, z_coef):
+    """Resolve the explicitly declared E=1 dense-control objective.
+
+    Keep the policy and the effective coefficients in both CLI run records and
+    model configs/checkpoints. The raw routing diagnostics remain measurable.
+    """
+    if disable_routing_loss:
+        if ffn_type != "moe" or n_experts != 1:
+            raise ValueError("--disable-routing-loss is only for the E=1 MoE dense control")
+        return 0.0, 0.0
+    return balance_coef, z_coef
 
 
 FFN_TYPES = ("dense", "swiglu", "moe")
@@ -128,6 +149,7 @@ def make_gpt_config(
     balancer="aux",
     balance_coef=0.01,
     z_coef=0.001,
+    disable_routing_loss=False,
     bias_update_rate=0.001,
     moe_dispatch="auto",
 ):
@@ -144,6 +166,7 @@ def make_gpt_config(
         balancer=balancer,
         balance_coef=balance_coef,
         z_coef=z_coef,
+        disable_routing_loss=disable_routing_loss,
         bias_update_rate=bias_update_rate,
         moe_dispatch=moe_dispatch,
         sequence_len=max_seq_len,
@@ -887,9 +910,9 @@ class GPT(nn.Module):
                 z_loss = torch.stack([a["z"] for a in aux_losses_list]).sum()
                 balance_coef = self.config.balance_coef if self.config.balancer == "aux" else 0.0
                 loss = ce_loss
-                if balance_coef:
+                if balance_coef and not self.config.disable_routing_loss:
                     loss = loss + balance_coef * balance_loss
-                if self.config.z_coef:
+                if self.config.z_coef and not self.config.disable_routing_loss:
                     loss = loss + self.config.z_coef * z_loss
             else:
                 loss = ce_loss

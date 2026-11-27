@@ -32,7 +32,8 @@ def test_defaults_follow_the_agreed_settings():
     assert kwargs["max_grad_norm"] == 1.0 and kwargs["track_grad_norm"] is True
     assert kwargs["router_lr"] is None  # follows the matrix LR of the router's optimizer
     assert moe == dict(ffn_type="dense", n_experts=4, moe_layers="all", balancer="aux",
-                       balance_coef=0.01, z_coef=0.001, bias_update_rate=0.001, moe_dispatch="auto")
+                       balance_coef=0.01, z_coef=0.001, disable_routing_loss=False,
+                       bias_update_rate=0.001, moe_dispatch="auto")
 
 
 @pytest.mark.parametrize("argv, expected_lr", [

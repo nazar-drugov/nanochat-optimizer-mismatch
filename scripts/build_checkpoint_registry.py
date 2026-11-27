@@ -35,7 +35,9 @@ OPTIM_FILES = re.compile(r"optim_(\d+)_rank(\d+)\.pt$")
 EVAL_FILES = re.compile(r"ckpt_(\d+)\.npz$")
 BASE_EVAL_NAMES = ("base_arrays.npz", "base_metrics.json", "eval_set_D0.pt", "eval_set_D1.pt")
 SCIENTIFIC_FT_ROOTS = {"finetune_pilot", "finetune_main", "finetune_pilot_long",
-                       "finetune_pilot_long_wikitext103", "finetune_main_long"}
+                       "finetune_pilot_long_wikitext103", "finetune_main_long",
+                       "finetune_pilot_e1", "finetune_pilot_e4", "finetune_pilot_e16"}
+NEW_E_FT_ROOT = re.compile(r"finetune_pilot_e(1|4|16)$")
 RUN_FIELDS = (
     "run_key", "owner", "relative_id", "stage", "run_type", "validity", "status", "run_name",
     "availability", "run_dir", "pool_run_dir", "dataset", "base_run", "base_seed", "pretrain_optimizer",
@@ -171,6 +173,10 @@ def inventory(hgo_scratch, hgo_pool, nazar_finetune, nazar_legacy):
         for stage in ft_stages:
             scan(stage, stage.name, "finetune", "hgo", is_pool)
     scan(nazar_finetune, "finetune_pilot", "finetune", "ndrugov")
+    # The new explicitly named sparsity pilots may be run under either account.
+    # Keep the old standalone Nazar pilot/archive classification separate.
+    for stage in sorted(s for s in SCIENTIFIC_FT_ROOTS if NEW_E_FT_ROOT.fullmatch(s)):
+        scan(nazar_legacy / stage, stage, "finetune", "ndrugov")
     scan(nazar_legacy / "base_checkpoints", "base_checkpoints", "legacy_pretrain", "ndrugov")
     scan(nazar_legacy / "chatsft_checkpoints", "chatsft_checkpoints", "legacy_chatsft", "ndrugov")
     return sorted(locs.values(), key=lambda loc: loc.key), warnings
@@ -237,6 +243,11 @@ def classify(loc, row, config, note):
         return stage, "verification_only"
     if loc.run_type == "shared_base_eval":
         return stage, "shared_reference"
+    if match := NEW_E_FT_ROOT.fullmatch(stage):
+        if safe_int(row["n_experts"]) != int(match[1]):
+            note.append("sparsity does not match the explicit pilot root")
+            return stage, "needs_review"
+        return stage, "valid"
     base_seed = safe_int(row["base_seed"])
     length = safe_int(row["length_steps"])
     replay_archive = "replaybug" in stage or (loc.owner == "ndrugov" and base_seed == 42)

@@ -26,12 +26,12 @@ def write_json(path, value):
 
 
 def make_ft(root, *, stage, base_seed=42, length=60, suffix=True, completed=True,
-            model=None, recorded_model=None, sha=None):
-    base_name, dataset = f"e8-main-adamw-s{base_seed}", "wikitext103"
+            model=None, recorded_model=None, sha=None, n_experts=8):
+    base_name, dataset = f"e{n_experts}-main-adamw-s{base_seed}", "wikitext103"
     before = root / stage if stage else root
     directory = before / base_name / dataset / ("muon-lr0.00044-s1" + (f"-T{length}" if suffix else ""))
     cell = {"base_run": base_name, "pretrain_optimizer": "adamw", "ft_dataset": dataset,
-            "ft_optimizer": "muon", "lr": .000443, "seed": 1, "n_experts": 8, "ft_steps": length}
+            "ft_optimizer": "muon", "lr": .000443, "seed": 1, "n_experts": n_experts, "ft_steps": length}
     base = {"step": 11445, "user_config": {"seed": base_seed, "optimizer_name": "adamw"}}
     if model or recorded_model:
         base["model_file"] = str(model or recorded_model)
@@ -139,6 +139,19 @@ def test_archive_validity_and_nazar_standalone_no_length_suffix(tmp_path):
     assert rows[str(standalone)]["validity"] == "valid" and rows[str(standalone)]["length_steps"] == 720
     assert rows[str(smoke.parent)]["validity"] == "verification_only"
     assert rows[str(transfer.parent)]["stage"] == "pretrain_transfer" and rows[str(transfer.parent)]["validity"] == "valid"
+
+
+def test_new_sparsity_pilot_roots_are_separate_from_legacy_archive(tmp_path):
+    scratch, pool, nazar_ft, nazar_legacy = roots(tmp_path)
+    dense = make_ft(scratch, stage="finetune_pilot_e1", n_experts=1, length=240)
+    sparse = make_ft(nazar_legacy, stage="finetune_pilot_e16", n_experts=16, length=240)
+    wrong = make_ft(scratch, stage="finetune_pilot_e4", n_experts=8, length=60)
+    runs, _, warnings = r.build_registry(scratch, pool, nazar_ft, nazar_legacy)
+    assert not warnings
+    rows = {row["run_dir"]: row for row in runs}
+    assert rows[str(dense)]["validity"] == "valid"
+    assert rows[str(sparse)]["validity"] == "valid" and rows[str(sparse)]["owner"] == "ndrugov"
+    assert rows[str(wrong)]["validity"] == "needs_review"
 
 
 def test_pool_only_incomplete_and_aliases(tmp_path):
