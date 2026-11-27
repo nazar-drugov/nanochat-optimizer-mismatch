@@ -111,3 +111,8 @@ authors, not a single-agent project.
   in `LOG_CHANGES.md`, and the current status in `HANDOFF.md` as appropriate.
   Distinguish confirmed results from exploratory or invalid runs. Respect the
   authors' commitment in `docs/report.tex` to author their own paper prose.
+- Maintain the global cross-author checkpoint registry (`CHECKPOINTS.md` and
+  `results/checkpoint_registry/`). Refresh the inventory after each significant
+  run batch or path change; include both collaborators' actual checkpoint paths
+  and clearly distinguish model weights, evaluation arrays, and invalid or
+  verification-only runs. Never infer that a checkpoint exists from its name.

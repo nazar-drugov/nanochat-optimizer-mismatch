@@ -72,6 +72,9 @@ Cost: sweep 2.6 GPU-h, transfer check 8.3 GPU-h, base models 8.5 GPU-h (one B200
 
 ## 3. Where everything is (MIT ORCD; all readable by every cluster user)
 
+For the global per-run and per-checkpoint path inventory across both authors, consult
+`CHECKPOINTS.md` and `results/checkpoint_registry/`. Refresh it when experiments or paths change.
+
 - Scratch root (`$SCRATCH` in our jobs): `/orcd/scratch/orcd/014/hgo/public/nanochat-optimizer-mismatch/`
   - `base_checkpoints/<run>/` — model weights, `config.json`, `result.json` for every sweep, transfer
     and base run. From another account, point `scripts/finetune.py --base-checkpoints-dir` here.
