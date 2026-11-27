@@ -8,6 +8,8 @@ This is the canonical cross-author path map for the optimizer-mismatch study. It
 
 **Inventory snapshot: 2026-11-27, 02:28 EST.** 1,940 registry records (including 1,877 fine-tuning branch directories, 23 scientific pretraining runs, seven legacy verification runs and 33 shared base-evaluation references). The checkpoint table has 19,791 step records: 86 actual model-weight checkpoints, 19,668 fine-tuning evaluation snapshots, 33 shared base-evaluation references and four model-related-only routing steps. Seven incomplete archived branch directories are retained and marked. Both scientific long pilots and the StarCoderData-only long main grid are complete at the result-record level.
 
+**Pending new sparsities (2026-11-27, 15:26 EST):** see [launch report](reports/sparsity_launch_report.md) for the E=1/4/16 job ledger. New fine-tuning roots are `finetune_pilot_e1`, `finetune_pilot_e4`, `finetune_pilot_e16` under the relevant author's scratch project. Logical bases will be pinned to actual full-budget checkpoints by each workflow's `selection/base_manifest.json`, including any retained transfer center. No new checkpoint files were present at submission; the inventory CSV remains a snapshot of existing artifacts and is refreshed after actual milestones.
+
 | Owner / fine-tuning stage | Completed branches | Incomplete |
 |---|---:|---:|
 | Harry, clean original pilot | 468 | 0 |

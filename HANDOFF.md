@@ -30,8 +30,14 @@ the paper's minimum forgetting above threshold. The endpoint contrasts are posit
 directions and datasets; within-run signs depend on direction and horizon. See
 `reports/matched_learning_analysis.md` for the matched-learning results and sensitivity. Cross-E design
 `reports/sparsity_extension_plan.md`: Harry approved implementing E=1/4/16, seed 42, original three-horizon
-pilots with independent LR selections. Harry's account prioritizes E=1/4, then E=16 if Nazar has not
-claimed it. Implementation/review in progress; no jobs launched as of this edit.
+pilots with independent LR selections. On 2026-11-27 15:25 EST, all three architectures were
+submitted under `hgo` in precedence E=1/4, then unclaimed E=16 at nice 1000. The immutable
+checkout is `/home/hgo/nanochat-mismatch-sparsity-909d98b` (909d98b). GPU smoke IDs:
+30735417/19 (E1), 30735420/21 (E4), 30735426/28 (E16); CPU staged coordinators
+30735438/39/40 respectively. All were pending Priority at the initial verification;
+E1 AdamW smoke started at 15:27 EST (B200 node5601-c1, W&B ufg62dyj).
+See `reports/sparsity_launch_report.md` and `/home/hgo/jobs/sparsity-20261127/e<E>/state.json`.
+Coordinators advance after successful gates; do not submit duplicate sweeps. No new raw results yet.
 
 ## 1. Goal and where we are
 
@@ -54,7 +60,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Endpoint and within-run ℓ0 | **Agreed:** endpoint 1.50/0.25, within-run 1.00/0.12 (SC/WT) |
 | Forgetting contrast at ℓ0 | **Done**, paired seed SD and whole-support sensitivity; document bootstrap and routing share not yet run |
-| Other E (1, 4, 16) | Initial seed-42 three-horizon scope approved; E-aware pipeline and dense-control implementation being validated |
+| Other E (1, 4, 16) | Reviewed implementation deployed; GPU smoke jobs and automatic staged coordinators submitted; pending Priority at 15:26 EST |
 
 ## 2. Pretraining: design and results
 

@@ -10,7 +10,8 @@ newer; these are snapshots taken 2026-11-26 (each file's header names its source
 | `finetuning_mismatch_endpoints.md` | Local report | Learning–forgetting endpoint curves with seed SDs, raw results, and long-pilot status | Complete; StarCoderData all horizons replicated, WikiText long pilot only |
 | `finetune_validation_trajectories.md` | Local report | Eight D0/D1 raw validation NLL trajectory figures, baseline and endpoint tables, selected LRs and seed SDs | Complete; all five horizons per dataset |
 | `matched_learning_analysis.md` | Local report | Headline 2×2 minimum-forgetting F at endpoint and within-run learning thresholds, paired contrasts, seed SDs and sensitivity | Complete for E=8; document bootstrap and replay analysis remain open |
-| `sparsity_extension_plan.md` | Local report | E=1 dense control and E=4/16 extension design, LR tuning, implementation blockers, compute estimates, decisions | Proposal for review; not authorization to implement or launch |
+| `sparsity_extension_plan.md` | Local report | E=1 dense control and E=4/16 extension design, LR tuning, implementation blockers, compute estimates, decisions | Initial seed-42, three-horizon plan approved; see launch report |
+| `sparsity_launch_report.md` | Local report | Reviewed implementation, pinned cluster checkout, E=1/4/16 launch IDs, workflow ledgers and pending gates | Submitted 2026-11-27; awaiting Slurm scheduling |
 | `finetune_replay_bug_impact.md` | Local report | Fixed-LR paired before/after comparison of the replay bug relative to seed spread | Complete |
 | `starcoderdata_long_main_report.md` | Local report | Replicated StarCoderData long horizons, checks and endpoint interpretation | Complete |
 | `tracker.md` | https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo | Implementation tracker: stages, plan, implemented items, action items | Stale since 2026-11-24 (kept for its resolved decisions) |
