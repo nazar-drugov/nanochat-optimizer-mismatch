@@ -72,6 +72,15 @@ authors, not a single-agent project.
 
 ## Cluster work and two-author coordination
 
+- Whenever approved compute jobs are running or queued, start an hourly
+  check-in and keep it active until all jobs in the workflow have finished.
+  At each check, inspect scheduler state, workflow progression, saved results,
+  and W&B tracking; report meaningful progress and promptly diagnose failures.
+  Include queued, requeued, and automatically staged successor jobs, so an
+  empty GPU queue between stages does not end monitoring. Stop the timer only
+  after final completion/accounting and required result verification, or when
+  Harry explicitly asks to pause or stop it. Alert Harry immediately to an SSH
+  failure or a blocker requiring his input rather than waiting for the next hour.
 - Submit approved cluster jobs via SSH using the persistent ORCD SSH control
   socket documented in `HANDOFF.md`. If the tunnel is broken, send Harry an
   immediate push notification/attention message explaining the failure and the
