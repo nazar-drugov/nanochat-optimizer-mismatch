@@ -13,6 +13,7 @@ newer; these are snapshots taken 2026-11-26 (each file's header names its source
 | `sparsity_extension_plan.md` | Local report | E=1 dense control and E=4/16 extension design, LR tuning, implementation blockers, compute estimates, decisions | Initial seed-42, three-horizon plan approved; see launch report |
 | `sparsity_launch_report.md` | Local report | Reviewed implementation, pinned cluster checkout, E=1/4/16 launch IDs, workflow ledgers and pending gates | Submitted 2026-11-27; awaiting Slurm scheduling |
 | `sparsity_e1_pretraining_lr_sweep.md` | Local report | Dense E1 seed-42 0.5B independent LR selection and transfer jobs | Complete; 3B checks queued |
+| `sparsity_e4_pretraining_lr_sweep.md` | Local report | E4 seed-42 0.5B independent LR selection and transfer jobs | Complete; 3B checks queued |
 | `finetune_replay_bug_impact.md` | Local report | Fixed-LR paired before/after comparison of the replay bug relative to seed spread | Complete |
 | `starcoderdata_long_main_report.md` | Local report | Replicated StarCoderData long horizons, checks and endpoint interpretation | Complete |
 | `tracker.md` | https://claude.ai/artifact/4tbXf1M5nneqzSYW4NEJYo | Implementation tracker: stages, plan, implemented items, action items | Stale since 2026-11-24 (kept for its resolved decisions) |

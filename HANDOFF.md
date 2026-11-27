@@ -42,7 +42,11 @@ See `reports/sparsity_launch_report.md` and `/home/hgo/jobs/sparsity-20261127/e<
 Coordinators advance after successful gates; do not submit duplicate sweeps. At 17:14 EST,
 E1 0.5B sweep completed all ten trials (all W&B verified); interior local fits AdamW 1.645416e-3,
 Muon 3.143392e-3 (provisional transferred 3B rates 9.273228e-4 and 1.771551e-3). Six 3B checks queued;
-E4 sweep running 4/10 complete, E16 smoke queued. See `reports/sparsity_e1_pretraining_lr_sweep.md`.
+E4 sweep was 4/10, E16 smoke queued. At 18:14 EST E4's sweep completed 10/10, both minima
+interior: AdamW 1.145145e-3, Muon 1.560277e-3 (provisional 3B 6.453803e-4, 8.793402e-4).
+E4 six 3B jobs queued (30750304/05/06/07/08/10); E1 two transfer checks running, four queued;
+E16 smoke queued. All E1/E4 sweep W&B records verified. See `reports/sparsity_e1_pretraining_lr_sweep.md`
+and `reports/sparsity_e4_pretraining_lr_sweep.md`.
 
 ## 1. Goal and where we are
 
@@ -65,7 +69,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Endpoint and within-run ℓ0 | **Agreed:** endpoint 1.50/0.25, within-run 1.00/0.12 (SC/WT) |
 | Forgetting contrast at ℓ0 | **Done**, paired seed SD and whole-support sensitivity; document bootstrap and routing share not yet run |
-| Other E (1, 4, 16) | E1 0.5B sweep complete, 3B checks queued; E4 sweep running, E16 smoke queued; coordinators healthy |
+| Other E (1, 4, 16) | E1/E4 0.5B sweeps complete, 3B checks running/queued; E16 smoke queued; coordinators healthy |
 
 ## 2. Pretraining: design and results
 
