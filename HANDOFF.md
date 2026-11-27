@@ -182,6 +182,9 @@ Jobs 30622317/30622320/30622321/30622322 (`/home/hgo/jobs/ft-wt-long/`) were gen
 reviewed generator and diff-checked against `ft-long2/`, with no training code changes.
 Both AdamW-pretrained optimizer pairs have a low-edge ×¼ winner at 1,920 steps; ×⅛ edge extensions
 30631324/30631325 were submitted with lower priority (`ft-wt-long-x8/`, new W&B-logging generator).
+Muon-pretrained ×⅛ jobs 30646301/30646302 also finished; 240 branches verified in W&B. All 1,920-step
+LRs are interior, but all 3,200-step winners are still on the low edge. ×1/16 extension jobs
+30652107/09/13/15 submitted (`ft-wt-long-x16/`). Harry requested check-ins every 60 minutes.
 Output root `finetune_pilot_long_wikitext103/`, separate from the original pilot and StarCoderData.
 After completion: check fingerprints, short-branch reproduction at shared LRs, bracket the long
 LR winners, and report all lengths, with long seed-42-only results visibly distinguished.
