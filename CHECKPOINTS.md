@@ -6,14 +6,14 @@ This is the canonical cross-author path map for the optimizer-mismatch study. It
 - [Checkpoint registry](results/checkpoint_registry/checkpoints.csv): actual checkpoint step and file paths. Includes model weights, optimizer state, metadata, routing probes and evaluation snapshots as applicable.
 - [W&B project](https://wandb.ai/hgo-mit/nanochat): organized pretraining and fine-tuning histories. Tracking records are not model checkpoints.
 
-**Inventory snapshot: 2026-11-26, 21:54 EST.** 1,801 registry records (including 1,742 fine-tuning branch directories, 23 scientific pretraining runs, seven legacy verification runs and 29 shared base-evaluation references). The checkpoint table has 18,241 step records: 86 actual model-weight checkpoints, 18,122 fine-tuning evaluation snapshots, 29 shared base-evaluation references and four model-related-only routing steps. Nine incomplete branch directories are retained and marked. The scientific long WikiText pilot is still active at this snapshot.
+**Inventory snapshot: 2026-11-26, 22:35 EST.** 1,816 registry records (including 1,757 fine-tuning branch directories, 23 scientific pretraining runs, seven legacy verification runs and 29 shared base-evaluation references). The checkpoint table has 18,419 step records: 86 actual model-weight checkpoints, 18,300 fine-tuning evaluation snapshots, 29 shared base-evaluation references and four model-related-only routing steps. Seven incomplete archived branch directories are retained and marked. Both scientific long pilots are complete.
 
 | Owner / fine-tuning stage | Completed branches | Incomplete |
 |---|---:|---:|
 | Harry, clean original pilot | 468 | 0 |
 | Harry, clean main | 234 | 0 |
 | Harry, clean long StarCoderData | 240 | 0 |
-| Harry, clean long WikiText | 298 | 2 |
+| Harry, clean long WikiText | 315 | 0 |
 | Harry, replay-bug original archive | 126 | 0 |
 | Harry, replay-bug long archive | 1 | 4 |
 | Harry, incompatible contiguous archive | 54 | 3 |

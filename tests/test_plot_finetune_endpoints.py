@@ -104,3 +104,35 @@ def test_pilot_only_length_must_extend_main_lengths():
     runs += [r for pair in p.PAIRS for r in make_runs(steps=120, pair=pair, bases=(42,))]
     with pytest.raises(ValueError, match="must extend"):
         p.collect_points(p.group_runs(runs), "starcoderdata")
+
+
+def test_length_trends_include_each_metric_and_seed42_anchor(tmp_path, monkeypatch):
+    runs = []
+    for dataset in p.DATASETS:
+        for pair in p.PAIRS:
+            for steps in p.MAIN_LENGTHS[dataset]:
+                runs += make_runs(dataset, steps, pair)
+            for steps in (1920, 3200):
+                runs += make_runs(dataset, steps, pair, bases=(42,))
+    path = tmp_path / "endpoints.csv"
+    write_csv(path, runs)
+    seen = []
+    original = p._draw_length_series
+
+    def record(ax, series, metric, color, marker, **kwargs):
+        seen.append((series, metric, kwargs.get("pilot", False)))
+        return original(ax, series, metric, color, marker, **kwargs)
+
+    monkeypatch.setattr(p, "_draw_length_series", record)
+    target = p.plot_length_trends(path, tmp_path / "length-trends.png")
+    assert target.stat().st_size > 10_000
+    assert len(seen) == 32  # 2 datasets × 4 pairs × 2 metrics × 2 replication populations
+    for points, metric, pilot in seen:
+        assert metric in ("learning", "forgetting")
+        if pilot:
+            assert [t for t, _ in points] in ([960, 1920, 3200], [720, 1920, 3200])
+            assert points[0][1].n_bases == 1 and points[0][1].learning == 0
+            assert points[0][1].learning_sd == pytest.approx(.25)
+        else:
+            assert len(points) == 3 and all(p.n_bases == 3 for _, p in points)
+            assert points[0][1].learning_sd == pytest.approx(1)

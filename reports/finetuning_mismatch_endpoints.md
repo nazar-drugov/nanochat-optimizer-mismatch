@@ -1,16 +1,20 @@
 # E=8 optimizer mismatch: endpoint learning–forgetting curves
 
-**2026-11-26 · Interim experimental report** (long WikiText pilot submitted; not yet included).
+**2026-11-26 · Completed long-pilot report** (all 315 WikiText long-pilot branch results validated and LR winners bracketed).
 
 ## Question and scope
 
 The first question in `docs/report.tex` is whether switching optimizers between pretraining and fine-tuning increases forgetting at the same learning on an MoE. This report describes the endpoint evidence to date, before the prespecified matched-learning analysis and correlated/causal routing analysis. Positive learning is the drop in held-out fine-tuning loss (D1); positive forgetting is the rise in held-out pretraining loss (D0), both in nats per token.
 
-The main E=8 grid has three pretrained seeds (42, 43, 44) for each optimizer, each fine-tuned with seeds 1–3. Each optimizer pair/dataset/length uses the LR minimizing mean final D1 on the seed-42 pilot, then reused on the other pretrained bases. StarCoderData's long pilot has only pretrained seed 42, again three fine-tuning seeds, and its 960-step LR is also optimal at 1,920 and 3,200 steps. Results are from the clean, post-replay-fix pilots and the validated standalone WikiText main runs; contaminated results are excluded.
+The main E=8 grid has three pretrained seeds (42, 43, 44) for each optimizer, each fine-tuned with seeds 1–3. Each optimizer pair/dataset/length uses the LR minimizing mean final D1 on the seed-42 pilot, then reused on the other pretrained bases. The extended pilots for both corpora use pretrained seed 42 only, again three fine-tuning seeds. StarCoderData's 960-step LR is also optimal at 1,920 and 3,200 steps; WikiText long-horizon optimal LRs instead fall sharply (see below). Results are from the clean, post-replay-fix pilots and the validated standalone WikiText main runs; contaminated results are excluded.
 
 ## Endpoint learning–forgetting curves
 
 ![Learning–forgetting endpoint curves with seed-level standard deviation error bars](../results/e8/figures/finetune_endpoints.png)
+
+![Learning and forgetting separately against training length, with seed-level standard deviation error bars](../results/e8/figures/finetune_length_trends.png)
+
+The second figure separates the two coordinates against log training length, making the nonmonotonic WikiText endpoints visible when the trade-off points cluster.
 
 - Solid curves: means of the three pretraining-seed means; each of those means uses three fine-tuning seeds (9 runs per point). Horizontal/vertical bars are ±1 sample SD **across the three base means**; they are not confidence intervals.
 - Open markers and dashed curves: long pilot means for pretraining seed 42 only, ±1 sample SD across fine-tuning seeds 1–3. The dashed line starts at the seed-42 mean of the last fully replicated length, rather than the three-base mean. These intervals describe different sources of variability and are not comparable as estimates of population uncertainty.
@@ -23,6 +27,12 @@ The main E=8 grid has three pretrained seeds (42, 43, 44) for each optimizer, ea
 - **WikiText, AdamW-pretrained:** the 60-step points again have close learning (0.1622 vs 0.1639) and greater forgetting under a switch to Muon (0.1318 vs 0.0871). At 240 and 720 the mismatched arm has more learning and more forgetting, requiring a matched-learning comparison.
 - **WikiText, Muon-pretrained:** the 240- and 720-step mismatched endpoints have lower learning and higher forgetting than the matched endpoints. At 720 steps these are 0.3365/0.3155 versus 0.3915/0.3053. The 60-step endpoint alone does not settle the mismatch effect.
 - **The most convincing provisional pattern** is direction- and horizon-dependent extra forgetting: the evidence is consistent with a mismatch cost in both corpora, especially early AdamW → Muon and the intermediate/long Muon → AdamW endpoints. No statistical significance or causal router attribution is claimed here. The protocol calls for choosing ℓ0 solely from common learning support before computing mismatch contrasts, then reporting the entire supported range as a robustness check.
+
+### What the long WikiText extension establishes
+
+The original 720-step peak LR does not transfer to multi-epoch WikiText. All four 3,200-step runs at the original 720-step winners dramatically overfit or deteriorate in held-out learning. Selecting a separate LR at each longer horizon restores much of the learning and drastically reduces forgetting. The 1,920-step optimum is ¼× the 720-step LR for three pairs and ½× for Muon → AdamW; the 3,200-step optimum is ⅛× for three pairs and 1/16× for AdamW → Muon. In contrast, StarCoderData's 960-step winners stay optimal out to 3,200.
+
+At 1,920, both pretraining optimizers still show the provisional pattern of additional forgetting under mismatch: for the AdamW base, learning is almost identical (0.4006 vs 0.4012), with 0.3018 vs 0.3441 forgetting. For the Muon base the mismatch endpoint learns less (0.3763 vs 0.3843) and forgets more (0.3621 vs 0.2895). The 3,200-step mismatched endpoints instead have both slightly lower learning and lower forgetting than their matched counterparts. This crossing/turnback is **not** a conclusion that mismatch vanishes at a fixed learning target. Every arm has lower final held-out learning at 3,200 than at 1,920 after LR tuning, and the final selections differ; the saved trajectory and matched-learning analysis are essential here. The longer WikiText runs see ~4.28 effective epochs versus ~0.97 for StarCoderData; repetition and overfitting qualify cross-corpus interpretation. Longer lengths use a single pretrained initialization and do not establish between-base robustness.
 
 ## Raw endpoint data
 
@@ -90,15 +100,23 @@ Each cell lists (learning / forgetting) for fine-tuning seeds 1, 2, 3, respectiv
 | AdamW → AdamW | 60 | 42, 43, 44 | 0.000328 | 0.1622 ± 0.0006 | 0.0871 ± 0.0030 |
 | AdamW → AdamW | 240 | 42, 43, 44 | 0.000655 | 0.2715 ± 0.0007 | 0.2343 ± 0.0044 |
 | AdamW → AdamW | 720 | 42, 43, 44 | 0.000655 | 0.3889 ± 0.0013 | 0.3412 ± 0.0133 |
+| AdamW → AdamW | 1,920 | 42 | 0.000164 | 0.4006 ± 0.0021 | 0.3018 ± 0.0011 |
+| AdamW → AdamW | 3,200 | 42 | 8.19e-05 | 0.3901 ± 0.0017 | 0.3207 ± 0.0007 |
 | AdamW → Muon | 60 | 42, 43, 44 | 0.000887 | 0.1639 ± 0.0008 | 0.1318 ± 0.0030 |
 | AdamW → Muon | 240 | 42, 43, 44 | 0.000887 | 0.2816 ± 0.0007 | 0.2614 ± 0.0054 |
 | AdamW → Muon | 720 | 42, 43, 44 | 0.000887 | 0.4062 ± 0.0011 | 0.3738 ± 0.0127 |
+| AdamW → Muon | 1,920 | 42 | 0.000222 | 0.4012 ± 0.0032 | 0.3441 ± 0.0028 |
+| AdamW → Muon | 3,200 | 42 | 5.55e-05 | 0.3833 ± 0.0008 | 0.2789 ± 0.0003 |
 | Muon → AdamW | 60 | 42, 43, 44 | 0.000164 | 0.1350 ± 0.0008 | 0.0994 ± 0.0011 |
 | Muon → AdamW | 240 | 42, 43, 44 | 0.000328 | 0.2279 ± 0.0006 | 0.2237 ± 0.0017 |
 | Muon → AdamW | 720 | 42, 43, 44 | 0.000328 | 0.3365 ± 0.0011 | 0.3155 ± 0.0035 |
+| Muon → AdamW | 1,920 | 42 | 0.000164 | 0.3763 ± 0.0027 | 0.3621 ± 0.0041 |
+| Muon → AdamW | 3,200 | 42 | 4.1e-05 | 0.3672 ± 0.0014 | 0.2940 ± 0.0005 |
 | Muon → Muon | 60 | 42, 43, 44 | 0.000444 | 0.1558 ± 0.0020 | 0.1134 ± 0.0012 |
 | Muon → Muon | 240 | 42, 43, 44 | 0.000444 | 0.2720 ± 0.0007 | 0.2086 ± 0.0026 |
 | Muon → Muon | 720 | 42, 43, 44 | 0.000444 | 0.3915 ± 0.0005 | 0.3053 ± 0.0008 |
+| Muon → Muon | 1,920 | 42 | 0.000111 | 0.3843 ± 0.0014 | 0.2895 ± 0.0016 |
+| Muon → Muon | 3,200 | 42 | 5.55e-05 | 0.3732 ± 0.0019 | 0.3151 ± 0.0004 |
 
 <details>
 <summary>Raw learning / forgetting pairs for each seed</summary>
@@ -110,22 +128,39 @@ Each cell lists (learning / forgetting) for fine-tuning seeds 1, 2, 3, respectiv
 | AdamW → AdamW | 60 | 0.1627 / 0.0822<br>0.1598 / 0.0839<br>0.1625 / 0.0853 | 0.1641 / 0.0862<br>0.1608 / 0.0880<br>0.1638 / 0.0894 | 0.1638 / 0.0881<br>0.1594 / 0.0888<br>0.1632 / 0.0923 |
 | AdamW → AdamW | 240 | 0.2709 / 0.2283<br>0.2719 / 0.2308<br>0.2693 / 0.2294 | 0.2730 / 0.2355<br>0.2720 / 0.2367<br>0.2710 / 0.2339 | 0.2721 / 0.2354<br>0.2721 / 0.2400<br>0.2712 / 0.2385 |
 | AdamW → AdamW | 720 | 0.3882 / 0.3399<br>0.3872 / 0.3420<br>0.3877 / 0.3434 | 0.3886 / 0.3530<br>0.3883 / 0.3581<br>0.3892 / 0.3517 | 0.3905 / 0.3283<br>0.3900 / 0.3265<br>0.3901 / 0.3281 |
+| AdamW → AdamW | 1,920 | 0.4003 / 0.3016<br>0.3986 / 0.3030<br>0.4028 / 0.3009 | — | — |
+| AdamW → AdamW | 3,200 | 0.3920 / 0.3199<br>0.3888 / 0.3213<br>0.3896 / 0.3209 | — | — |
 | AdamW → Muon | 60 | 0.1646 / 0.1287<br>0.1612 / 0.1322<br>0.1632 / 0.1370 | 0.1666 / 0.1275<br>0.1617 / 0.1295<br>0.1654 / 0.1286 | 0.1658 / 0.1317<br>0.1617 / 0.1337<br>0.1647 / 0.1376 |
 | AdamW → Muon | 240 | 0.2814 / 0.2566<br>0.2813 / 0.2577<br>0.2797 / 0.2547 | 0.2832 / 0.2643<br>0.2825 / 0.2598<br>0.2808 / 0.2583 | 0.2825 / 0.2679<br>0.2817 / 0.2680<br>0.2811 / 0.2652 |
 | AdamW → Muon | 720 | 0.4057 / 0.3680<br>0.4042 / 0.3634<br>0.4054 / 0.3678 | 0.4059 / 0.3894<br>0.4060 / 0.3881<br>0.4065 / 0.3877 | 0.4073 / 0.3704<br>0.4069 / 0.3607<br>0.4077 / 0.3684 |
+| AdamW → Muon | 1,920 | 0.3986 / 0.3434<br>0.4002 / 0.3472<br>0.4048 / 0.3416 | — | — |
+| AdamW → Muon | 3,200 | 0.3841 / 0.2787<br>0.3825 / 0.2792<br>0.3832 / 0.2790 | — | — |
 | Muon → AdamW | 60 | 0.1358 / 0.0969<br>0.1325 / 0.0985<br>0.1355 / 0.1017 | 0.1371 / 0.1009<br>0.1333 / 0.1005<br>0.1376 / 0.1005 | 0.1363 / 0.0987<br>0.1321 / 0.0976<br>0.1352 / 0.0994 |
 | Muon → AdamW | 240 | 0.2281 / 0.2208<br>0.2270 / 0.2232<br>0.2274 / 0.2228 | 0.2297 / 0.2254<br>0.2282 / 0.2282<br>0.2281 / 0.2232 | 0.2279 / 0.2262<br>0.2275 / 0.2223<br>0.2276 / 0.2209 |
 | Muon → AdamW | 720 | 0.3365 / 0.3119<br>0.3361 / 0.3197<br>0.3370 / 0.3148 | 0.3355 / 0.3190<br>0.3349 / 0.3208<br>0.3357 / 0.3170 | 0.3374 / 0.3121<br>0.3376 / 0.3100<br>0.3379 / 0.3140 |
+| Muon → AdamW | 1,920 | 0.3753 / 0.3607<br>0.3743 / 0.3668<br>0.3794 / 0.3589 | — | — |
+| Muon → AdamW | 3,200 | 0.3688 / 0.2935<br>0.3660 / 0.2941<br>0.3668 / 0.2943 | — | — |
 | Muon → Muon | 60 | 0.1578 / 0.1118<br>0.1528 / 0.1133<br>0.1566 / 0.1139 | 0.1590 / 0.1120<br>0.1551 / 0.1126<br>0.1593 / 0.1128 | 0.1551 / 0.1143<br>0.1518 / 0.1150<br>0.1544 / 0.1150 |
 | Muon → Muon | 240 | 0.2724 / 0.2059<br>0.2715 / 0.2065<br>0.2707 / 0.2043 | 0.2736 / 0.2103<br>0.2730 / 0.2110<br>0.2719 / 0.2081 | 0.2717 / 0.2120<br>0.2719 / 0.2104<br>0.2712 / 0.2088 |
 | Muon → Muon | 720 | 0.3910 / 0.3012<br>0.3904 / 0.3082<br>0.3918 / 0.3036 | 0.3913 / 0.3048<br>0.3915 / 0.3052<br>0.3918 / 0.3066 | 0.3923 / 0.3064<br>0.3916 / 0.3055<br>0.3921 / 0.3059 |
+| Muon → Muon | 1,920 | 0.3832 / 0.2898<br>0.3840 / 0.2910<br>0.3859 / 0.2878 | — | — |
+| Muon → Muon | 3,200 | 0.3753 / 0.3153<br>0.3717 / 0.3155<br>0.3725 / 0.3147 | — | — |
 
 </details>
 
-## Long WikiText extension and next step
+## Long WikiText LR extension: completed
 
-Harry approved the seed-42 long pilot (1,920 and 3,200 steps with 60/240/720 shorter branches, three fine-tuning seeds per LR). Initial LR grid: ¼×, ½×, 1× the 720-step winner for each optimizer pair; apply the edge rule until bracketed. Jobs 30622317, 30622320, 30622321, 30622322 are submitted on hgo using the unchanged reviewed generator. The 3,200-step WikiText run processes about 4.28 effective epochs, versus about one for StarCoderData; this is intended but qualifies cross-corpus comparison. No long seed-43/44 run was authorized at this stage.
+All 315 branch results (105 LR/pair/length cells × three fine-tuning seeds) finished successfully in 13 B200 jobs (13.02 GPU-hours including evaluation/logging). Initial grid ×¼, ×½, ×1 the 720-step LR; extended down to ×⅛ and ×1/16 for all pairs and to ×1/32 for AdamW → Muon to bracket the 3,200-step optimum. Every 1,920/3,200-step winner is interior. The 144 shared-LR short-branch comparisons (48 each at 60/240/720) reproduce the original clean pilot: every data fingerprint, D0/D1 evaluation identity and base checkpoint hash matches, with maximum endpoint deviations 0.00134 learning and 0.00337 forgetting. Within the entire long grid, data fingerprints agree across optimizer pairs and LRs for every (length, FT seed). The independent `analyze_finetune` runs at 1,920 and 3,200 validate 63 results apiece and reproduce the chosen LRs. All 315 branch tracking records were verified present online in W&B.
 
-Once the extension is complete, verify the short branches, select each longer LR, and add its seed-42 endpoints to these curves and tables. The next scientific decision is the matched-learning target and main length; the routing correlation and replay analysis follow evidence for a baseline mismatch effect.
+| Pair | Original WT 720 LR | Selected 1,920 LR | Selected 3,200 LR | 3,200 L/F at original 720 LR | 3,200 L/F at selected LR |
+|---|---:|---:|---:|---:|---:|
+| AdamW → AdamW | 6.55e-4 | 1.64e-4 (¼×) | 8.19e-5 (⅛×) | 0.0916 / 1.2206 | 0.3901 / 0.3207 |
+| AdamW → Muon | 8.87e-4 | 2.22e-4 (¼×) | 5.55e-5 (1/16×) | −0.1246 / 1.6357 | 0.3833 / 0.2789 |
+| Muon → AdamW | 3.28e-4 | 1.64e-4 (½×) | 4.10e-5 (⅛×) | 0.1824 / 0.9630 | 0.3672 / 0.2940 |
+| Muon → Muon | 4.44e-4 | 1.11e-4 (¼×) | 5.55e-5 (⅛×) | −0.2433 / 1.6821 | 0.3732 / 0.3151 |
 
-**Reproduce graph:** `python -m scripts.plot_finetune_endpoints results/e8/finetune_endpoint_runs.csv --out results/e8/figures/finetune_endpoints.png`. Data sources were the six clean ORCD `analysis/<dataset>-<steps>-main/analysis.json` selection manifests and the selected long StarCoderData result files; exactly 36 main endpoints per dataset/length and 12 seed-42 endpoints per long length were recovered.
+The seed-42-only common learning support (maximum threshold every selected trajectory reaches, not merely its endpoint learning) is 0.374261 at 1,920 and 0.366772 at 3,200. For the six original fully replicated conditions, see HANDOFF.md. The user authorized only the seed-42 long extension; there is no long seed-43/44 result yet.
+
+The complete LR grid, not just winners: [long WikiText summary](../results/e8/finetune_pilot_long_wikitext103_summary.json). [W&B project](https://wandb.ai/hgo-mit/nanochat) has checkpoint histories organized under the long-WikiText fine-tuning group. The next scientific decision remains main length and ℓ0, chosen from learning support before computing the mismatch contrast; follow this with router correlation and causal replay analyses.
+
+**Reproduce graphs:** `python -m scripts.plot_finetune_endpoints results/e8/finetune_endpoint_runs.csv --out results/e8/figures/finetune_endpoints.png --length-trends-out results/e8/figures/finetune_length_trends.png`. Data sources: six clean ORCD `analysis/<dataset>-<steps>-main/analysis.json` selection manifests and selected long StarCoderData and WikiText result files; exactly 216 original main endpoints (36 per dataset/length) and 48 long pilot endpoints (12 per long dataset/length) are in the CSV.

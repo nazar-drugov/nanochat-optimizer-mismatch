@@ -10,10 +10,10 @@ supersede it.
 pilots (StarCoderData, WikiText-103) were rerun after a decay-branch bug (§5) and every LR selection is
 final and interior. The seed-43/44 main grids for both datasets are complete at the seed-42 LRs. A long
 StarCoderData pilot (to 3,200 steps) is complete. The analysis script handles the main grid and has been
-run without ℓ0 for every original dataset and length. **A long WikiText seed-42 pilot was approved
-and submitted 2026-11-26 (jobs 30622317/20/21/22); see §6.** Main length and ℓ0 for the formal mismatch
-analysis remain open. The previous hourly check-in loop was stopped; the active session is monitoring
-the WikiText extension.
+run without ℓ0 for every original dataset and length. **Both long seed-42 pilots (StarCoderData and
+WikiText) are complete, with interior LR selections at 1,920/3,200 steps.** All long WikiText jobs
+finished successfully 2026-11-26. Main length and ℓ0 for the formal mismatch analysis remain open.
+No study training jobs remain running; hourly pilot monitoring has ended.
 
 ## 1. Goal and where we are
 
@@ -31,7 +31,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Seed-42 pilots (StarCoderData 60/240/960, WikiText 60/240/720 steps) | **Done** (clean rerun 2026-11-26); all selections interior (§6) |
 | Seed-43/44 main grids (both datasets, all pilot lengths) | **Done** 2026-11-26 at the seed-42 LRs |
 | Long StarCoderData pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; the 960-step LRs stay optimal |
-| Long WikiText pilot (seed 42, to 3,200 steps) | Submitted 2026-11-26; multi-epoch pilot approved |
+| Long WikiText pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; multi-epoch pilot, all LRs bracketed |
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Main length and ℓ0 | **Waiting for the user** |
 | Forgetting contrast at ℓ0, bootstrap CIs, routing share | Not run (needs ℓ0) |
@@ -90,6 +90,8 @@ For the global per-run and per-checkpoint path inventory across both authors, co
     WikiText 240-step trunks with 60 branches), one trunk per distinct selected LR.
   - `finetune_pilot_long/` — long StarCoderData pilot, seed 42, 3,200-step trunks with 60/240/960/1,920
     branches at ×¼, ×½, ×1, ×2 the 960-step picks.
+  - `finetune_pilot_long_wikitext103/` — clean long WikiText pilot, seed 42, 3,200-step trunks with
+    60/240/720/1,920 branches; ×1, ×½, ×¼, ×⅛, ×1/16 the 720 picks (plus ×1/32 for AdamW → Muon).
   - `analysis/<dataset>-<T>-pilot/` and `analysis/<dataset>-<T>-main/` — `analyze_finetune` outputs without
     ℓ0; `analysis/staging_nazar_wt/` = symlinks to Nazar's seed-43/44 WikiText runs (see §6).
   - `finetune_pilot_v1_replaybug/`, `finetune_pilot_long_v1_replaybug/` — **invalid** (replay bug), kept for
@@ -176,7 +178,7 @@ At ×1 the 960-step pick, per doubling past 960 steps learning gains ~0.05–0.0
 ~0.11–0.19. The ×½ LR forgets much less for nearly the same learning (Muon → Muon at 3,200 steps:
 ×½ 1.812 / 0.946 vs ×1 1.815 / 1.455 learning / forgetting).
 
-### Long WikiText pilot (submitted 2026-11-26)
+### Long WikiText pilot (completed 2026-11-26)
 
 Harry approved a seed-42-only extension to 1,920/3,200 steps with shorter 60/240/720 branches and
 three fine-tuning seeds. Initial grid is ×1, ×½, ×¼ of each 720-step pick; the edge rule applies.
@@ -189,8 +191,22 @@ Muon-pretrained ×⅛ jobs 30646301/30646302 also finished; 240 branches verifie
 LRs are interior, but all 3,200-step winners are still on the low edge. ×1/16 extension jobs
 30652107/09/13/15 submitted (`ft-wt-long-x16/`). Harry requested check-ins every 60 minutes.
 Output root `finetune_pilot_long_wikitext103/`, separate from the original pilot and StarCoderData.
-After completion: check fingerprints, short-branch reproduction at shared LRs, bracket the long
-LR winners, and report all lengths, with long seed-42-only results visibly distinguished.
+Final additional AM ×1/32 job 30659709 completed; all 315 branch results complete and every long
+winner bracketed. Validated 144 short branch reproductions at shared LRs (48 each at 60, 240, 720),
+identical hashes/paired fingerprints; max |Δ learning| 0.00134, max |Δ forgetting| 0.00337.
+
+| Pretrain → fine-tune | WT 1,920 LR | WT 3,200 LR | Learning / forgetting at 1,920 | Learning / forgetting at 3,200 |
+|---|---:|---:|---:|---:|
+| AdamW → AdamW | 1.638e-4 | 8.192e-5 | 0.4006 / 0.3018 | 0.3901 / 0.3207 |
+| AdamW → Muon | 2.218e-4 | 5.546e-5 | 0.4012 / 0.3441 | 0.3833 / 0.2789 |
+| Muon → AdamW | 1.638e-4 | 4.096e-5 | 0.3763 / 0.3621 | 0.3672 / 0.2940 |
+| Muon → Muon | 1.109e-4 | 5.546e-5 | 0.3843 / 0.2895 | 0.3732 / 0.3151 |
+
+At selected LRs, every pair learns less at 3,200 than at 1,920. Unlike StarCoderData, the long
+WikiText runs need dramatically lower LRs. `results/e8/finetune_pilot_long_wikitext103_summary.json`
+holds all 105 cells; `reports/finetuning_mismatch_endpoints.md` includes final endpoint plots and
+raw seed-level data for both corpora and all lengths. Only base seed 42 was run long. No claims
+of a formal matched-learning effect yet.
 
 ### Analyses already run (no ℓ0)
 
@@ -199,6 +215,8 @@ LR winners, and report all lengths, with long seed-42-only results visibly disti
 analysis (`analysis/<ds>-<T>-main/`). All checks passed. **Common D1-learning support** (largest
 admissible ℓ0) over all six bases: StarCoderData 1.095 / 1.375 / 1.576 at 60 / 240 / 960 steps;
 WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
+Long WikiText seed-42-only support: 0.374261 / 0.366772 at 1,920 / 3,200 (preliminary analysis
+with `--ell0` omitted in `analysis/wikitext103-<T>-pilot-long/`; not common across six bases).
 
 ### Next steps
 
@@ -234,9 +252,10 @@ WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
    selection from a `finetune_pilot_long` pilot analysis at that length, `--min-lrs 4`). Diff one generated
    sbatch against `~/jobs/ft-long2/` before submitting; ~40 min per job. Subagent review first if any code
    changed (§10).
-4. **Update the pilot report** (https://claude.ai/artifact/2uN17JfULvGvtcTFzYUgKx, a Claude Doc): it is
-   current to 2026-11-26 06:30 and lacks the main-grid and long-pilot results. Re-export it to
-   `reports/finetune_pilot_report.md` afterwards.
+4. **Read the completed local endpoint report** `reports/finetuning_mismatch_endpoints.md` and
+   `reports/finetune_replay_bug_impact.md`. The older Claude pilot document and its exported snapshot
+   describe the earlier phase; the new local report contains the main grid and both completed long
+   pilots. Use the new report rather than treating the older snapshot as current.
 5. Later: other E (sweep plan with interleaved grids and joint fit, not implemented; the transfer check
    at other E is a proposal: reuse E = 8's measured 0.5B→3B shift and check only at E = 16).
 

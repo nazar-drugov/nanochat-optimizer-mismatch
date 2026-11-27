@@ -14,6 +14,7 @@ separately), not at the three-base mean. Both kinds of bars are one SD, not CIs.
 
   python -m scripts.plot_finetune_endpoints results/e8/finetune_endpoints.csv
   python -m scripts.plot_finetune_endpoints data.csv --out figures/endpoints.png
+  python -m scripts.plot_finetune_endpoints data.csv --length-trends-out figures/length_trends.png
 
 These are final, separately decayed endpoints at distinct selected LRs—not
 checkpoints of one training run or estimates of forgetting at matched learning.
@@ -31,6 +32,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.ticker import NullLocator
 from matplotlib.transforms import Bbox
 
 
@@ -304,13 +306,94 @@ def plot(input_csv, out_path, *, include_1920=True):
         plt.close(fig)
 
 
+def _draw_length_series(ax, points, metric, color, marker, *, pilot=False):
+    """The x-values are prescribed lengths, so error bars appear on y only."""
+    if not points:
+        return
+    steps, values = zip(*points)
+    ax.errorbar(steps, [getattr(p, metric) for p in values],
+                yerr=[getattr(p, metric + "_sd") for p in values],
+                color=color, marker=marker, markersize=6.5, markeredgewidth=1.3,
+                markerfacecolor="white" if pilot else color,
+                linestyle="--" if pilot else "-", linewidth=1.7,
+                elinewidth=1.1, capsize=2.6, zorder=4 if pilot else 3)
+
+
+def plot_length_trends(input_csv, out_path, *, include_1920=True):
+    """Complementary log-length views with the same seed statistics as plot()."""
+    groups = group_runs(read_runs(input_csv))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex="row")
+    has_pilot = False
+    metrics = (("learning", "Learning: decrease in D₁ loss"),
+               ("forgetting", "Forgetting: increase in D₀ loss"))
+    try:
+        for row, (dataset, title) in enumerate(DATASETS.items()):
+            lengths, points = collect_points(groups, dataset, include_1920=include_1920)
+            for (pre, ft), color, marker in zip(PAIRS, COLORS, MARKERS):
+                series = [(t, points[dataset, t, pre, ft]) for t in lengths]
+                main = [(t, p) for t, p in series if p.n_bases == 3]
+                pilot = [(t, p) for t, p in series if p.n_bases == 1]
+                if pilot:
+                    has_pilot = True
+                    last_main = max(t for t, _ in main if t < pilot[0][0])
+                    anchor = summarize(groups[dataset, last_main, pre, ft], base_seed_only=42)
+                    pilot = [(last_main, anchor), *pilot]
+                for col, (metric, _) in enumerate(metrics):
+                    _draw_length_series(axes[row, col], main, metric, color, marker)
+                    if pilot:
+                        _draw_length_series(axes[row, col], pilot, metric, color, marker, pilot=True)
+            for col, (metric, ylabel) in enumerate(metrics):
+                ax = axes[row, col]
+                ax.set_title(f"{title} — {metric}", loc="left", fontsize=12.5,
+                             fontweight="semibold", pad=9)
+                ax.set_xscale("log")
+                ax.set_xticks(lengths, labels=[f"{t:,}" for t in lengths])
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.set_xlabel("Optimizer steps (log scale)")
+                ax.set_ylabel(f"{ylabel} (nats/token)")
+                ax.grid(True, color="#e6e6e6", linewidth=.75)
+                ax.set_axisbelow(True)
+                ax.spines[["top", "right"]].set_visible(False)
+                ax.margins(x=.07, y=.12)
+        handles = [Line2D([], [], color=c, marker=m, lw=1.8, markersize=7,
+                          label=f"{NAMES[p]} → {NAMES[f]}")
+                   for (p, f), c, m in zip(PAIRS, COLORS, MARKERS)]
+        fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(.5, .91), ncol=4,
+                   frameon=False, fontsize=10, columnspacing=1.8)
+        fig.suptitle("E=8 MoE: learning and forgetting versus fine-tuning length", x=.5,
+                     y=.97, fontsize=16, fontweight="semibold")
+        fig.text(.5, .935, "Each endpoint uses the selected learning rate for its optimizer pair and length.",
+                 ha="center", fontsize=10, color="#525252")
+        styles = [Line2D([], [], color="#525252", marker="o", lw=1.5,
+                         label="Solid: mean ± SD across 3 base-seed means")]
+        if has_pilot:
+            styles.append(Line2D([], [], color="#525252", marker="o", markerfacecolor="white",
+                                 linestyle="--", lw=1.5,
+                                 label="Open/dashed: seed 42 only, mean ± SD across 3 FT seeds"))
+        fig.legend(handles=styles, loc="lower center", bbox_to_anchor=(.5, .035),
+                   ncol=len(styles), frameon=False, fontsize=9.5)
+        fig.text(.5, .027, "Each base mean averages 3 fine-tuning seeds. Error bars are sample SD, not confidence intervals.",
+                 ha="center", fontsize=9, color="#525252")
+        fig.tight_layout(rect=(.025, .095, .99, .865), w_pad=2.5, h_pad=2.6)
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=200, facecolor="white", bbox_inches="tight", pad_inches=.2)
+        return out
+    finally:
+        plt.close(fig)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input_csv", type=Path)
     parser.add_argument("--out", type=Path, default=Path("results/e8/figures/finetune_endpoints.png"))
+    parser.add_argument("--length-trends-out", type=Path,
+                        help="also plot learning/forgetting versus log training length (PNG)")
     parser.add_argument("--omit-1920", action="store_true", help="omit 1,920-step endpoints")
     args = parser.parse_args(argv)
     print(f"wrote {plot(args.input_csv, args.out, include_1920=not args.omit_1920)}")
+    if args.length_trends_out is not None:
+        print(f"wrote {plot_length_trends(args.input_csv, args.length_trends_out, include_1920=not args.omit_1920)}")
 
 
 if __name__ == "__main__":

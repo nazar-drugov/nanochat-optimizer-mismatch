@@ -286,6 +286,14 @@ if a transfer check fails.
   Seed-43/44 long training is not part of this extension. Report all tested lengths; show the
   seed-42 long results separately from the three-base main grid. The primary matched-learning
   threshold remains to be declared before a formal mismatch contrast is computed.
+  **Final (2026-11-26):** all 315 branches complete; at 1,920 the selected LRs are AA 1.638e-4,
+  AM 2.218e-4, MA 1.638e-4, MM 1.109e-4. At 3,200 they are AA 8.192e-5, AM 5.546e-5,
+  MA 4.096e-5, MM 5.546e-5, all interior after downward extensions through ×1/16 (and ×1/32 for AM).
+  The original 720-step LR causes held-out learning to deteriorate at 3,200 in every pair; even at
+  the individually selected LRs, final learning is lower at 3,200 than 1,920 for all four.
+  `results/e8/finetune_pilot_long_wikitext103_summary.json` and
+  `reports/finetuning_mismatch_endpoints.md` store the results. No ℓ0 or longer main-grid length
+  chosen yet.
 
 ## Before the first real run
 
