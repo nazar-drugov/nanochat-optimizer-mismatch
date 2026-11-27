@@ -28,8 +28,10 @@ StarCoderData and 0.132103 for WikiText. Harry selected endpoint targets 1.50/0.
 targets 1.00/0.12 respectively; `scripts/matched_learning.py` implements the two estimands using
 the paper's minimum forgetting above threshold. The endpoint contrasts are positive in both
 directions and datasets; within-run signs depend on direction and horizon. See
-`reports/matched_learning_analysis.md` for the matched-learning results and sensitivity. Separate cross-E design
-proposal: `reports/sparsity_extension_plan.md`; no additional experiments have been approved.
+`reports/matched_learning_analysis.md` for the matched-learning results and sensitivity. Cross-E design
+`reports/sparsity_extension_plan.md`: Harry approved implementing E=1/4/16, seed 42, original three-horizon
+pilots with independent LR selections. Harry's account prioritizes E=1/4, then E=16 if Nazar has not
+claimed it. Implementation/review in progress; no jobs launched as of this edit.
 
 ## 1. Goal and where we are
 

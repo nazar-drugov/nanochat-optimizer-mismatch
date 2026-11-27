@@ -181,6 +181,13 @@ so that η·λ matches AdamW); seed-noise runs for the sweep.
   a separate per-E/optimizer 3B transfer check analogous to E=8. Fine-tuning
   uses independent per-E/pretrain-opt/FT-opt/dataset/horizon LR selection as at E=8.
 
+- **Implementation and launch approved (2026-11-27):** implement all three E=1/4/16
+  branches, validate with unit tests and independent review, then prioritize E=1 and E=4
+  on Harry's (`hgo`) account. If E=16 remains unclaimed by Nazar, queue it on `hgo` after
+  E=1/4. Coordinate ownership through the shared branch; do not duplicate a claimed run.
+  Initial sweeps, per-E transfer checks and the final seed-42 bases precede the approved
+  three-horizon pilots. Longer horizons and pretraining seed replication remain out of scope.
+
 Initial five-point ×2 search grid: AdamW centre 2e-3·E^-0.25; Muon centre
 4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16. These are bracket
 starting guesses, not a constraint on the selected LR.
