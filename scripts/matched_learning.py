@@ -411,6 +411,49 @@ def plot_primary(primary, targets, out):
     return _save(fig, out)
 
 
+def plot_primary_forgetting(primary, targets, out):
+    """Headline F for all four pretraining/fine-tuning optimizer pairs."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.5))
+    pairs = [(pre, ft) for pre in PRE for ft in PRE]
+    styles = {pair: (DIRECTION_COLORS[pair[0]], "o" if pair[0] == pair[1] else "s",
+                     "-" if pair[0] == pair[1] else "--") for pair in pairs}
+    for col, c in enumerate(COHORTS):
+        cohort_rows = [r for r in primary if r["dataset"] == c.dataset and r["cohort"] == c.name]
+        ax = axes[0, col]; _axis_style(ax)
+        for i, (pre, ft) in enumerate(pairs):
+            row = next(r for r in cohort_rows if r["estimand"] == "endpoint" and r["pretrain_optimizer"] == pre)
+            field = "matched_forgetting" if pre == ft else "mismatched_forgetting"
+            color, marker, _ = styles[pre, ft]
+            if row["status"] == "supported":
+                ax.errorbar(i, row[field+"_mean"], yerr=row[field+"_sd"], color=color,
+                            marker=marker, capsize=4, markersize=7, linestyle="none")
+            else:
+                ax.text(i, .5, "unsupported", transform=ax.get_xaxis_transform(), ha="center")
+        ax.set_xticks(range(4), labels=[f"{NAMES[p]} →\n{NAMES[f]}" for p, f in pairs]); ax.set_xlim(-.5, 3.5)
+        ax.set_title(f"{c.title}\nEndpoint target = {targets['endpoint'][c.dataset]:g}", fontsize=11, fontweight="semibold")
+        ax = axes[1, col]; _axis_style(ax)
+        for pre, ft in pairs:
+            rows = sorted((r for r in cohort_rows if r["estimand"] == "within-run" and
+                           r["pretrain_optimizer"] == pre and r["status"] == "supported"), key=lambda r: r["horizon"])
+            field = "matched_forgetting" if pre == ft else "mismatched_forgetting"
+            color, marker, style = styles[pre, ft]
+            ax.errorbar([r["horizon"] for r in rows], [r[field+"_mean"] for r in rows],
+                        yerr=[r[field+"_sd"] for r in rows], color=color, marker=marker, linestyle=style, capsize=3)
+        ax.set_xscale("log"); ax.set_xticks(c.horizons, labels=[f"{t:,}" for t in c.horizons], rotation=25, ha="right")
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.set_title(f"Within-run target = {targets['within-run'][c.dataset]:g}", fontsize=11, fontweight="semibold")
+        ax.set_xlabel("Fine-tuning horizon (optimizer steps, log)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Minimum forgetting F (nats/token)")
+    handles = [Line2D([], [], color=styles[p, f][0], marker=styles[p, f][1], linestyle=styles[p, f][2],
+                      label=f"{NAMES[p]} → {NAMES[f]}") for p, f in pairs]
+    fig.suptitle("E=8 · forgetting at minimum required learning", y=.98, fontsize=15, fontweight="semibold")
+    fig.legend(handles=handles, loc="upper center", ncol=4, bbox_to_anchor=(.5,.925), frameon=False)
+    fig.text(.5,.025,"Mean ± sample SD across base means (pilot: FT seeds conditional on base 42); distinct targets for the two estimands.",ha="center",fontsize=10)
+    fig.tight_layout(rect=(0,.065,1,.86), w_pad=1.8, h_pad=2)
+    return _save(fig, out)
+
+
 def plot_endpoint_sensitivity(rows, targets, out):
     fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.7))
     for ax, c in zip(axes, COHORTS):
@@ -507,7 +550,8 @@ def main(argv=None):
         "within_run_definition":"checkpoint-ordered polyline at selected LR including genuine step zero",
         "minimum":"min F among all eligible vertices and adjacent crossings L=target",
         "sensitivity":"uniform grid incl. bounds and prespecified targets when supported; no bootstrap"},indent=2)+"\n")
-    for path in (plot_primary(primary,targets,args.figure_dir/"primary.png"),
+    for path in (plot_primary_forgetting(primary,targets,args.figure_dir/"primary_forgetting.png"),
+                 plot_primary(primary,targets,args.figure_dir/"primary.png"),
                  plot_endpoint_sensitivity(sensitivity,targets,args.figure_dir/"endpoint_sensitivity.png"),
                  plot_within_sensitivity(sensitivity,targets,args.figure_dir/"within_run_sensitivity.png"),
                  plot_overlap(overlaps,args.figure_dir/"overlap_sensitivity.png")):

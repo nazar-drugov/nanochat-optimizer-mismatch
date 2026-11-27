@@ -113,3 +113,24 @@ def test_sensitivity_overlap_only_shared_support():
     # The 60-step trajectory only overlaps at exactly its maximum/endpoint minimum.
     assert {r["target_learning"] for r in overlaps if r["horizon"]==60}=={.5}
     assert {r["target_learning"] for r in overlaps if r["horizon"]==240}.issuperset({.5,.6,.7})
+
+
+def test_primary_forgetting_plots_all_four_arms_in_optimizer_order(monkeypatch, tmp_path):
+    primary = []
+    for cohort in m.COHORTS:
+        for estimand, horizons in (("endpoint", [None]), ("within-run", cohort.horizons)):
+            for horizon in horizons:
+                for pre, matched, mismatched in (("adamw", 1., 2.), ("muon", 4., 3.)):
+                    primary.append(dict(dataset=cohort.dataset, cohort=cohort.name, estimand=estimand,
+                                        horizon=horizon, pretrain_optimizer=pre, status="supported",
+                                        matched_forgetting_mean=matched, mismatched_forgetting_mean=mismatched,
+                                        matched_forgetting_sd=.1, mismatched_forgetting_sd=.2))
+    targets = {e: {c.dataset: .5 for c in m.COHORTS} for e in ("endpoint", "within-run")}
+    monkeypatch.setattr(m, "_save", lambda fig, path: fig)
+    fig = m.plot_primary_forgetting(primary, targets, tmp_path/"unused.png")
+    try:
+        for ax in fig.axes:
+            assert len(ax.containers) == 4
+            assert [float(c.lines[0].get_ydata()[0]) for c in ax.containers] == [1., 2., 3., 4.]
+    finally:
+        m.plt.close(fig)

@@ -15,13 +15,47 @@ For every selected run (or endpoint curve), the objective is **minimize F subjec
 
 For each base seed and FT seed, the penalty is mismatched-arm minimal F minus matched-arm minimal F. Positive means mismatch forgets more. For the main cohorts we average the three paired FT seeds within each base; the overall mean and ±1 sample SD are across three base means (nine paired observations per direction, three base-level units). The WikiText seed-42-only cohort instead reports mean/SD of the three FT seed pairs conditional on that base. Its short and long curves are analyzed consistently as one-base curves, not spliced into the three-base curves. These are descriptive SDs, not confidence intervals, document bootstraps or significance tests. Shared training data and decay prefixes also mean horizon curves are not independent experiments.
 
-## Primary results
+## Primary results: the four optimizer pairs
+
+![Minimum forgetting F at the prescribed learning threshold for all four optimizer pairs](../results/e8/figures/matched_learning/primary_forgetting.png)
+
+The headline quantity in each cell below is **F(ℓ0), mean ± sample SD**, in nats/token, not a difference between arms. Rows correspond to datasets and cohorts (and, for within-run, individual training horizons); the four optimizer-pair columns form the 2×2 pretraining × fine-tuning design. The SD is across the three pretraining-seed means for the main cohorts, or across the three fine-tuning seeds conditional on base 42 for the pilot. Lower F is better.
+
+### Endpoint F(ℓ0)
+
+| Dataset/cohort | ℓ0 | AdamW → AdamW | AdamW → Muon | Muon → AdamW | Muon → Muon |
+|---|---:|---:|---:|---:|---:|
+| StarCoderData, 3 bases | 1.5 | 0.6270 ± 0.0414 | 0.7845 ± 0.0219 | 0.9492 ± 0.0683 | 0.6900 ± 0.0507 |
+| WikiText-103, 3 bases | 0.25 | 0.2053 ± 0.0034 | 0.2266 ± 0.0040 | 0.2423 ± 0.0017 | 0.1906 ± 0.0023 |
+| WikiText-103, base 42 only | 0.25 | 0.2018 ± 0.0016 | 0.2240 ± 0.0015 | 0.2415 ± 0.0022 | 0.1884 ± 0.0012 |
+
+### Within-run F(ℓ0)
+
+| Dataset/cohort | Horizon | ℓ0 | AdamW → AdamW | AdamW → Muon | Muon → AdamW | Muon → Muon |
+|---|---:|---:|---:|---:|---:|---:|
+| StarCoderData, 3 bases | 60 | 1 | 0.1838 ± 0.0206 | 0.5112 ± 0.0508 | 0.2879 ± 0.0133 | 0.5103 ± 0.0177 |
+| StarCoderData, 3 bases | 240 | 1 | 0.1838 ± 0.0206 | 0.2477 ± 0.0219 | 0.6459 ± 0.0218 | 0.2792 ± 0.0103 |
+| StarCoderData, 3 bases | 960 | 1 | 0.0828 ± 0.0067 | 0.1423 ± 0.0150 | 0.6459 ± 0.0218 | 0.2792 ± 0.0103 |
+| StarCoderData, 3 bases | 1,920 | 1 | 0.0834 ± 0.0068 | 0.1410 ± 0.0145 | 0.6680 ± 0.0382 | 0.2796 ± 0.0126 |
+| StarCoderData, 3 bases | 3,200 | 1 | 0.0834 ± 0.0068 | 0.1410 ± 0.0145 | 0.6680 ± 0.0382 | 0.2796 ± 0.0126 |
+| WikiText-103, 3 bases | 60 | 0.12 | 0.0682 ± 0.0025 | 0.0856 ± 0.0007 | 0.0994 ± 0.0011 | 0.0798 ± 0.0021 |
+| WikiText-103, 3 bases | 240 | 0.12 | 0.1331 ± 0.0047 | 0.0856 ± 0.0007 | 0.1920 ± 0.0010 | 0.0798 ± 0.0021 |
+| WikiText-103, 3 bases | 720 | 0.12 | 0.1329 ± 0.0046 | 0.0857 ± 0.0007 | 0.1919 ± 0.0007 | 0.0782 ± 0.0011 |
+| WikiText-103, base 42 only | 60 | 0.12 | 0.0653 ± 0.0006 | 0.0849 ± 0.0035 | 0.0990 ± 0.0025 | 0.0780 ± 0.0020 |
+| WikiText-103, base 42 only | 240 | 0.12 | 0.1281 ± 0.0016 | 0.0849 ± 0.0035 | 0.1918 ± 0.0022 | 0.0779 ± 0.0020 |
+| WikiText-103, base 42 only | 720 | 0.12 | 0.1281 ± 0.0016 | 0.0849 ± 0.0035 | 0.1918 ± 0.0022 | 0.0779 ± 0.0020 |
+| WikiText-103, base 42 only | 1,920 | 0.12 | 0.0419 ± 0.0006 | 0.0433 ± 0.0005 | 0.1079 ± 0.0007 | 0.0441 ± 0.0007 |
+| WikiText-103, base 42 only | 3,200 | 0.12 | 0.0366 ± 0.0005 | 0.0421 ± 0.0004 | 0.0571 ± 0.0012 | 0.0426 ± 0.0007 |
+
+## Secondary comparison: paired mismatch penalties
+
+The paired penalty is derived from the four F values above, subtracting the matched arm from the mismatched arm within the same base and fine-tuning seed. The SD of this difference is calculated from paired differences, not by combining marginal SDs.
 
 ![Matched-learning penalties at separately prespecified endpoint and within-run targets](../results/e8/figures/matched_learning/primary.png)
 
 **The fully replicated endpoint estimand shows positive mismatch penalties in both optimizer directions and both corpora at the approved thresholds, including on every pretrained-base mean. The within-run estimand is direction-, horizon- and threshold-dependent, with early sign reversals.** These conclusions coexist because the estimands minimize over different sets of candidates. Their primary thresholds differ as well, so the headline magnitudes cannot be compared as though learning were held at the same target.
 
-### Endpoint results
+### Endpoint penalties and attained learning
 
 | Dataset/cohort | Pretrained optimizer | Common L support | Matched F (mean) | Mismatched F (mean) | Paired penalty (mean ± SD) | Actual L, match / mismatch (mean) |
 |---|---|---:|---:|---:|---:|---:|
@@ -45,7 +79,7 @@ Individual pretraining-base mean endpoint penalties (each averaged over that bas
 
 The StarCoderData AdamW-pretrained switch to Muon selects an actual vertex above target in **9/9** paired cases: mean achieved learning 1.7385 rather than 1.50. The matched arm reaches exactly 1.50. For Muon-pretrained StarCoderData, three matched-arm selections also exceed 1.50 (mean 1.5059). Thus these are the approved **minimum-learning** penalties, not equality-at-1.50 differences. All WikiText endpoint selections attain the threshold itself.
 
-### Within-run results by fine-tuning horizon
+### Within-run penalties by fine-tuning horizon
 
 Each row minimizes along the separately tuned trajectory at that horizon. F pairs are means, while uncertainty on the penalty is the SD of **paired** differences (not propagation of unpaired arm SDs). Negative indicates less minimal forgetting under mismatch at the required learning. Exact per-arm means/SDs and selection provenance are in the supporting CSVs.
 
