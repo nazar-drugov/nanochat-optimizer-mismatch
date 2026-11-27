@@ -295,6 +295,17 @@ if a transfer check fails.
   `reports/finetuning_mismatch_endpoints.md` store the results. No ℓ0 or longer main-grid length
   chosen yet.
 
+- **StarCoderData long main grid (Harry, 2026-11-26):** confirm the scientific intent of estimating
+  whether the optimizer mismatch effect persists at 1,920 and 3,200 steps across pretrained
+  initializations, before the matched-learning and router analyses. Replicate the two long horizons
+  on base seeds 43/44 for both pretraining optimizers and both fine-tuning optimizers, three paired
+  fine-tuning seeds per cell; use the already selected seed-42 LRs (AdamW FT 6.5538167e-4; Muon FT
+  8.8738603e-4), with no new sweeps and **no WikiText extensions**. Run 3,200-step trunks with 60/240/960/1,920
+  decay branches in a dedicated root `finetune_main_long`; use the shorter branches only for
+  reproducibility checks, not as extra independent observations. Validate paired fingerprints,
+  base/evaluation identities, W&B, and complete six-base analysis with ℓ0 omitted. Update the report,
+  plots and checkpoint registry; the formal matched-learning threshold remains undecided.
+
 ## Before the first real run
 
 - Download data: `python -m nanochat.dataset --dataset fineweb-edu-100b -n 100` (3B training

@@ -13,7 +13,8 @@ StarCoderData pilot (to 3,200 steps) is complete. The analysis script handles th
 run without ℓ0 for every original dataset and length. **Both long seed-42 pilots (StarCoderData and
 WikiText) are complete, with interior LR selections at 1,920/3,200 steps.** All long WikiText jobs
 finished successfully 2026-11-26. Main length and ℓ0 for the formal mismatch analysis remain open.
-No study training jobs remain running; hourly pilot monitoring has ended.
+Harry approved the StarCoderData-only long main-grid extension; eight jobs 30673385/87/88/89/90/91/94/95
+are submitted (see §6); monitor hourly. No WikiText extension is authorized.
 
 ## 1. Goal and where we are
 
@@ -32,6 +33,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Seed-43/44 main grids (both datasets, all pilot lengths) | **Done** 2026-11-26 at the seed-42 LRs |
 | Long StarCoderData pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; the 960-step LRs stay optimal |
 | Long WikiText pilot (seed 42, to 3,200 steps) | **Done** 2026-11-26; multi-epoch pilot, all LRs bracketed |
+| Long StarCoderData main grid (seeds 43/44, both optimizers, 1,920/3,200) | Submitted 2026-11-26 |
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Main length and ℓ0 | **Waiting for the user** |
 | Forgetting contrast at ℓ0, bootstrap CIs, routing share | Not run (needs ℓ0) |
@@ -92,6 +94,8 @@ For the global per-run and per-checkpoint path inventory across both authors, co
     branches at ×¼, ×½, ×1, ×2 the 960-step picks.
   - `finetune_pilot_long_wikitext103/` — clean long WikiText pilot, seed 42, 3,200-step trunks with
     60/240/720/1,920 branches; ×1, ×½, ×¼, ×⅛, ×1/16 the 720 picks (plus ×1/32 for AdamW → Muon).
+  - `finetune_main_long/` — new StarCoderData main-grid extension on seeds 43/44 at selected seed-42
+    LRs; 1,920/3,200 plus repeat short branches (not additional independent measurements).
   - `analysis/<dataset>-<T>-pilot/` and `analysis/<dataset>-<T>-main/` — `analyze_finetune` outputs without
     ℓ0; `analysis/staging_nazar_wt/` = symlinks to Nazar's seed-43/44 WikiText runs (see §6).
   - `finetune_pilot_v1_replaybug/`, `finetune_pilot_long_v1_replaybug/` — **invalid** (replay bug), kept for
@@ -217,6 +221,15 @@ admissible ℓ0) over all six bases: StarCoderData 1.095 / 1.375 / 1.576 at 60 /
 WikiText 0.132 / 0.227 / 0.335 at 60 / 240 / 720.
 Long WikiText seed-42-only support: 0.374261 / 0.366772 at 1,920 / 3,200 (preliminary analysis
 with `--ell0` omitted in `analysis/wikitext103-<T>-pilot-long/`; not common across six bases).
+
+### Long StarCoderData main grid (submitted 2026-11-26)
+
+Harry confirmed the intent is to quantify long-horizon persistence of mismatch across pretrained
+initializations. Eight jobs 30673385/30673387/30673388/30673389/30673390/30673391/30673394/30673395
+(`ft-main-long/`) cover four base runs × two FT optimizers × three FT seeds. All sbatch arguments and
+W&B filters checked; training code unchanged. Separate output `finetune_main_long/` with short
+reproducibility branches; select only 1,920/3,200 when combining with seed-42 `finetune_pilot_long/`.
+No new LR sweeps or WikiText jobs. Update report/plots and registry once complete.
 
 ### Next steps
 
