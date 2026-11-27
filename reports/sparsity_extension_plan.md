@@ -118,7 +118,8 @@ Muon Moonlight Nesterov 0.95, 5 Newton–Schulz steps, 0.2√max(m,n) scale; bot
 weight decay 0.1, router decay zero, global norm clip 1.0. Embedding/unembedding
 AdamW unchanged even on Muon cells. The router follows the matrix optimizer when E≥4.
 
-Follow the **existing recorded cross-E 0.5B sweep plan**: seed 42, five points spaced
+Follow the **existing recorded 0.5B sweep grids**, with independent selection (agreed
+2026-11-27): seed 42, five points spaced
 ×2, centers AdamW 0.002·E^-0.25 and Muon 0.004·2^(-k/4) for k=0,1,2,3 at
 E=1,4,8,16. (Centers are starting guesses only, not nominal optima.)
 
@@ -129,15 +130,14 @@ E=1,4,8,16. (Centers are starting guesses only, not nominal optima.)
 | 16 | 0.001000 | 0.002378 |
 
 Factors 1/4, 1/2, 1, 2, 4; extend until the observed best point is interior, log invalid
-diverged trials explicitly. Reuse the **actual** E=8 sweep points, not fictitious points
-on a revised grid. Fit the recorded per-optimizer joint curve in log₂ LR:
-`val_bpb = a_E + b·(log₂ LR − m₀ − α·log₂ E)²`, one positive curvature b, a separate
-offset a_E, using finite points within 0.05 bpb of each cell's minimum. Report α,
-residuals, per-cell fit vs local quadratic vertex and bracket adequacy; do not accept a
-joint optimum unsupported by local data. Do not alter the already selected E=8 bases.
-If joint model fit is poor, use per-E interior vertices as an agreed fallback, not a
-forced shared relationship. Selection always uses the non-D0 pretraining validation
-set.
+diverged trials explicitly. For each architecture × optimizer, fit a local parabola
+in log₂ LR through its best grid point and the two adjacent points, as at E=8.
+The earlier proposed joint regression `val_bpb = a_E + b·(log₂ LR − m₀ − α·log₂ E)²`
+would have shared curvature and constrained the LR optima to a power law across E.
+Harry instead chose independent fits. A cross-E LR scaling fit is only an optional
+descriptive analysis after selection; it must not change the selected LRs. Do not
+alter the already selected E=8 bases. Selection always uses the non-D0 pretraining
+validation set.
 
 **3B transfer verification is essential:** the E=8 AdamW optimum shifted more than one
 octave from the borrowed T^-0.32 transfer; Muon transferred well. Never assume
@@ -239,7 +239,7 @@ Actual blockers in the existing paths (inspection, not executed changes):
 
 | Component | Required change / checks |
 |---|---|
-| [`nanochat/pretrain_sweep.py`](../nanochat/pretrain_sweep.py), [`scripts/pretrain_sweep.py`](../scripts/pretrain_sweep.py) | `RunSpec.n_experts` already exists and emits E in names/arguments, but sweep/main/transfer helpers, job/selection CLI and result pooling hard-code E=8 or key only by optimizer. Parameterize E (include E and seed in manifest/selection schemas), five-point grids and joint fit, transfer checks, explicit dense-control loss overrides, stage-specific script paths. Preserve existing E=8 semantics/tests; reject wrong E/LR/status/data/schedule and rounded-LR name collisions. |
+| [`nanochat/pretrain_sweep.py`](../nanochat/pretrain_sweep.py), [`scripts/pretrain_sweep.py`](../scripts/pretrain_sweep.py) | `RunSpec.n_experts` already exists and emits E in names/arguments, but sweep/main/transfer helpers, job/selection CLI and result pooling hard-code E=8 or key only by optimizer. Parameterize E (include E and seed in manifest/selection schemas), five-point grids and independent local fit, transfer checks, explicit dense-control loss overrides, stage-specific script paths. Preserve existing E=8 semantics/tests; reject wrong E/LR/status/data/schedule and rounded-LR name collisions. |
 | [`scripts/base_train.py`](../scripts/base_train.py), [`nanochat/gpt.py`](../nanochat/gpt.py) | Model/optimizer training already supports arbitrary E. Confirm actual resolved E=1 aux/z disabled and zero router gradient/WD, and E≥4 same args. CPU tests: parameter counts at each E; same-seed shared weights and optimizer groups; identical E=1 vs SwiGLU logits, gradients, several paired steps with AdamW and Muon and clipping; routing and zero-norm Muon robustness. Existing E=8 regressions remain required. |
 | [`scripts/finetune.py`](../scripts/finetune.py), [`nanochat/finetune_metrics.py`](../nanochat/finetune_metrics.py) | Implement single-expert margin/normalized-flip NA path; all-zero diagnostic/replay identity smoke test through a complete tiny E=1 training/evaluation branch, plus E=4/16 grouped and loop dispatch. Check per-document arrays, token-weighted losses, replay identities, NPZ shapes and no nonfinite defined metrics. Validate new E-specific checkpoints without disabling SHA pins. |
 | [`scripts/finetune_jobs.py`](../scripts/finetune_jobs.py) and `FINETUNE_BASE_CHECKPOINTS`, `base_run_seed`, `render_finetune_job` in pretrain_sweep | Currently shared base allowlist has only six E=8 SHA-256 entries and regex is `e8-main-...`; generated jobs pin same root. Extend via validated per-E immutable base manifest (actual path, final step 11,445, E, preopt, seed, full LR, SHA, source owner/provenance); keep existing E8 pins; reject transfer/invalid runs, mismatched selection files, mixed E and missing hashes. Add explicit FT trunk/branch/warmup validation (not inferred from maximum length; `finetune.py` computes warmup from --train-tokens). |
@@ -320,23 +320,21 @@ both account roots in CHECKPOINTS.md after milestones.
 
 ## 8. Decisions needed from Harry before implementation / compute
 
-1. **Claim and replication:** are we screening whether a sparsity trend exists at
-   one initialization first, or making a primary replicated scaling claim? Recommend
-   seed42 screen then seeds43/44 for all E if the claim is population-level.
+1. **Claim and replication (initial scope agreed):** seed42 screen first; decide
+   on seeds43/44 and population-level scaling inference afterward.
 2. **Dense control (agreed):** E=1 MoE with inert one-expert gate and aux/z disabled
    by an explicit flag. Literal dense SwiGLU is the equivalence test; default
    E=1 z-loss could be used only as a separately approved ablation.
-3. **Fine-tuning scope:** option A, B or C above; recommend stage A and extend SC
-   to common 5 horizons as needed for endpoint support and eventual B; keep
-   multi-epoch WikiText optional. Both datasets or prioritize one for initial screening?
+3. **Fine-tuning scope (agreed):** option A, three-horizon pilot first, extend later
+   depending on common support and the subsequent scientific aim.
 4. **Common target:** keep the already declared E8 targets where supported at all E,
    or select a new cross-E interior target from learning-only common support before
    observing new cross-E forgetting? If support is absent, prefer more lengths vs
    a lower threshold? Use common horizons and both estimands, with sensitivity curves.
-5. **LR tuning:** agree to the recorded joint 0.5B fit plus per-E 3B verification
-   (recommended), confirm edge/poor-fit fallback and any alternative 3B bracket
-   centering. Is equal token budget at fixed active parameters the defining comparison
-   (as paper says), or is validation-quality matching an additional separate control?
+5. **LR tuning (independent fit agreed):** use separate E/optimizer local 0.5B fits
+   and per-E 3B verification analogous to E=8. Confirm material deviations from the
+   existing E=8 transfer procedure if needed; equal token budget at fixed active
+   parameters remains the paper's design.
 6. **Mechanism stage:** analyze route replay at real observed matching checkpoints
    with overshoot or authorize extra targeted decay lengths only if interpolation is
    inadequate? Is E=4 decay-timescale control in scope now or deferred?

@@ -161,7 +161,7 @@ run ~12–14 min.
 run now, above); batch-size robustness; the weight-decay ablation (one Muon run with λ = 0.1·η_AdamW/η_Muon,
 so that η·λ matches AdamW); seed-noise runs for the sweep.
 
-### If other E are added: joint fit across E (decided 2026-11-24)
+### If other E are added: LR tuning and initial scope (revised 2026-11-27)
 
 - **E=1 dense-control routing-loss flag (agreed 2026-11-27):** retain the
   one-expert SwiGLU MoE path with identity gate, explicitly disable both router
@@ -171,12 +171,25 @@ so that η·λ matches AdamW); seed-noise runs for the sweep.
   diagnostics. This agrees the dense-control design, not the remaining cross-E
   training plan or job launch.
 
-Sweep every (optimizer, E) cell on 5 points spaced ×2 (AdamW centre 2e-3·E^-0.25; Muon centre
-4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16, so the four grids interleave), and choose
-LRs by one fit per optimizer: y = a_E + b·(log₂ LR − m₀ − α·log₂ E)², with one curvature b,
-using points within 0.05 bpb of each cell's minimum. α is reported (AdamW: compare with
-Ludziejewski's −0.25; Muon: no prior). Ludziejewski et al. themselves fit one LR formula in N and
-E (Eq. 8; fitted at E = 1 and 8, checked at E = 4 and 32) rather than tuning each E.
+- **Initial scope (agreed 2026-11-27):** E=1/4/16 pretraining seed 42 first;
+  three-horizon fine-tuning pilots (SC 60/240/960, WT 60/240/720) with the same
+  FT seeds 1–3 and D1-only selection; consider longer horizons and other
+  pretraining seeds after the pilot. Independent LR selection for each new
+  architecture and optimizer, analogous to E=8; do not use a cross-E regression
+  to determine selected training LRs. The 0.5B sweep uses an interior local
+  parabola through the best grid point and its two neighbors in log₂(LR), then
+  a separate per-E/optimizer 3B transfer check analogous to E=8. Fine-tuning
+  uses independent per-E/pretrain-opt/FT-opt/dataset/horizon LR selection as at E=8.
+
+Initial five-point ×2 search grid: AdamW centre 2e-3·E^-0.25; Muon centre
+4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16. These are bracket
+starting guesses, not a constraint on the selected LR.
+
+Historical proposal (2026-11-24; superseded for LR selection): fit one regression
+per optimizer over all (E, LR, validation-bpb) points near each cell's minimum,
+y = a_E + b·(log₂ LR − m₀ − α·log₂ E)², sharing curvature b and a power-law
+optimal-LR relationship. An optional descriptive cross-E LR scaling fit may be
+reported afterward, but it must not change the independent selections.
 
 Option B (decay branches off longer stable phases instead of transferring) is the fallback
 if a transfer check fails.
