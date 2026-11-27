@@ -35,7 +35,9 @@ submitted under `hgo` in precedence E=1/4, then unclaimed E=16 at nice 1000. The
 checkout is `/home/hgo/nanochat-mismatch-sparsity-909d98b` (909d98b). GPU smoke IDs:
 30735417/19 (E1), 30735420/21 (E4), 30735426/28 (E16); CPU staged coordinators
 30735438/39/40 respectively. All were pending Priority at the initial verification;
-E1 AdamW smoke started at 15:27 EST (B200 node5601-c1, W&B ufg62dyj).
+E1/4 smoke checks both optimizers completed 0:0 with verified online W&B, and all three
+CPU coordinators are running. At 15:34 EST, E1 scientific sweep 30735929/30 running;
+E4 scientific sweep 30736231/32 queued; E16 smoke still queued behind E1/4.
 See `reports/sparsity_launch_report.md` and `/home/hgo/jobs/sparsity-20261127/e<E>/state.json`.
 Coordinators advance after successful gates; do not submit duplicate sweeps. No new raw results yet.
 
@@ -60,7 +62,7 @@ pretrained with (AdamW vs Muon) forgets more at matched learning, and how much o
 | Analysis (`scripts/analyze_finetune.py`) | Main-grid support done and reviewed; run without ℓ0 for every dataset/length |
 | Endpoint and within-run ℓ0 | **Agreed:** endpoint 1.50/0.25, within-run 1.00/0.12 (SC/WT) |
 | Forgetting contrast at ℓ0 | **Done**, paired seed SD and whole-support sensitivity; document bootstrap and routing share not yet run |
-| Other E (1, 4, 16) | Reviewed implementation deployed; GPU smoke jobs and automatic staged coordinators submitted; pending Priority at 15:26 EST |
+| Other E (1, 4, 16) | Reviewed pipeline deployed; E1/4 smoke passed, E1 sweep running/E4 queued, E16 smoke queued; coordinators running |
 
 ## 2. Pretraining: design and results
 
