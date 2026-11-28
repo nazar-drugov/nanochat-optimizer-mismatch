@@ -65,6 +65,9 @@ were replaced on pin a7e06a7 (30777015 E1, 30777060 E4, 30777061 E16),
 resuming their same durable ledgers with no binary FT states, rich soft capture
 and a mandatory implementation canary before the approved LR pilot grids. See `reports/finetune_rich_router_capture.md`. E1 4× AdamW
 extension queued (30772904), E4 two transfer jobs running; E8 rerun not authorized now.
+See `reports/sparsity_pretraining_progress.md` for the 23:19 EST comparison
+of measured E1/4/8 validation losses, Muon E1 selected LR, and provisional
+AdamW transfer results. E16 smoke is still queued.
 
 ## 1. Goal and where we are
 

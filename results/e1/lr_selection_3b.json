@@ -1,0 +1,71 @@
+{
+  "adamw": {
+    "points": [
+      {
+        "lr": 0.0005,
+        "final_val_bpb": 1.05594383672856
+      },
+      {
+        "lr": 0.001,
+        "final_val_bpb": 1.0320328650414747
+      },
+      {
+        "lr": 0.002,
+        "final_val_bpb": 1.025406045105271
+      },
+      {
+        "lr": 0.004,
+        "final_val_bpb": 1.04911450217355
+      },
+      {
+        "lr": 0.008,
+        "final_val_bpb": 1.1419492050322992
+      }
+    ],
+    "best_grid_lr": 0.002,
+    "status": "transfer-check-edge",
+    "method": "parabola vertex in log2(LR) through the best point and its neighbours",
+    "sweep_lr": 0.0016454162464283923,
+    "transfer_factor": 0.5635794731521694,
+    "full_lr": 0.0009273228212781335,
+    "n_experts": 1,
+    "seed": 42,
+    "transferred_lr": 0.0009273228212781335,
+    "full_lr_source": null
+  },
+  "muon": {
+    "points": [
+      {
+        "lr": 0.001,
+        "final_val_bpb": 1.0192148670816152
+      },
+      {
+        "lr": 0.002,
+        "final_val_bpb": 1.009311902221991
+      },
+      {
+        "lr": 0.004,
+        "final_val_bpb": 1.0081539189220148
+      },
+      {
+        "lr": 0.008,
+        "final_val_bpb": 1.0145981224781206
+      },
+      {
+        "lr": 0.016,
+        "final_val_bpb": 1.0275476371991468
+      }
+    ],
+    "best_grid_lr": 0.004,
+    "status": "selected",
+    "method": "parabola vertex in log2(LR) through the best point and its neighbours",
+    "sweep_lr": 0.0031433924306177603,
+    "transfer_factor": 0.5635794731521694,
+    "full_lr": 0.0017715514499580744,
+    "n_experts": 1,
+    "seed": 42,
+    "transferred_lr": 0.0017715514499580744,
+    "full_lr_source": "transferred",
+    "octaves_from_transferred": 0.19082347131341185
+  }
+}
