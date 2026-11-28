@@ -106,6 +106,7 @@ class Coordinator:
         self.ft_root = self.scratch / f'finetune_pilot_e{self.e}'
         self.poll = args.poll_seconds
         self.nice = args.nice
+        self.hold_ft = getattr(args, 'hold_ft', False)
         self.work.mkdir(parents=True, exist_ok=True)
         self.selection = self.work / 'selection'; self.selection.mkdir(exist_ok=True)
         self.id = hashlib.sha256(str(self.work).encode()).hexdigest()[:10]
@@ -273,6 +274,12 @@ class Coordinator:
         self.wave('main',lambda d: self.pretrain_jobs(d,'main',selection=final_file),filter_scripts=lambda p: not (self.checkpoints/p.stem/'result.json').is_file())
         self.module('scripts.pretrain_sweep',['base-manifest','--experts',self.e,'--selection',final_file,'--checkpoints-root',self.checkpoints,'--out',self.selection])
         pin = self.selection/'base_manifest.json'
+        # The user may require a new retention policy before any fine-tuning
+        # starts. Continue approved pretraining and pin real bases, but hold
+        # the FT stage until the explicitly resumed coordinator is authorized.
+        if self.hold_ft:
+            self.phase('ft-hold',jobs={},base_manifest=str(pin),selection=str(final_file))
+            return
         bases = [f'e{self.e}-main-{o}-s42' for o in OPTS]
         selection = load(final_file)
         def ft_jobs(d, dataset_args, pair_args=()):
@@ -315,6 +322,7 @@ def main():
     parser.add_argument('--poll-seconds',type=int,default=60)
     parser.add_argument('--nice',type=int,default=0)
     parser.add_argument('--initial-submit-only',action='store_true',help='submit smoke jobs and return; the same work directory can be resumed by the CPU coordinator')
+    parser.add_argument('--hold-ft',action='store_true',help='finish approved pretraining, pin bases, then hold before any FT job is generated or submitted')
     args=parser.parse_args()
     if args.poll_seconds < 10 or args.nice < 0: parser.error('poll interval >=10s and nonnegative nice required')
     args.work_dir.mkdir(parents=True,exist_ok=True)

@@ -54,3 +54,23 @@ def test_wave_durable_ledger_and_recovered_submission(monkeypatch,tmp_path):
     monkeypatch.setattr(c,'recover_job',lambda name:'12345')
     c.wave('recovered', generate, filter_scripts=lambda p:True)
     assert len(submissions)==1
+
+
+def test_hold_ft_pins_bases_without_generating_finetune_jobs(monkeypatch,tmp_path):
+    cfg=SimpleNamespace(experts=1,work_dir=tmp_path/'work',scratch_base=tmp_path/'scratch',poll_seconds=10,nice=0,hold_ft=True)
+    c=w.Coordinator(cfg)
+    for opt in w.OPTS:
+        name=f'e1-smoke-{opt}-s42'; p=c.checkpoints/name/'result.json'; p.parent.mkdir(parents=True)
+        p.write_text(json.dumps(dict(status='completed',steps_trained=1,run=name,tokens_trained=262144,
+                                     final_val_bpb=3.,final_heldout_bpb=3.,final_train_loss=10.,
+                                     settings=dict(optimizer_name=opt,seed=42,n_experts=1,train_tokens=262144,
+                                                   total_batch_size=262144,disable_routing_loss=True,balance_coef=0.,z_coef=0.))))
+    calls=[]
+    def module(name,args,allowed=(0,)):
+        calls.append((name,args)); return 0
+    monkeypatch.setattr(c,'module',module)
+    monkeypatch.setattr(c,'wave',lambda *a,**kw:None)
+    c.run()
+    assert c.state['phase']=='ft-hold'
+    assert any('base-manifest' in args for _,args in calls)
+    assert not any(name=='scripts.finetune_jobs' for name,_ in calls)
