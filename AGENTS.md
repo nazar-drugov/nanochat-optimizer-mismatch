@@ -118,6 +118,14 @@ authors, not a single-agent project.
 
 ## Scientific reporting
 
+- Preserve inexpensive potentially useful experimental evidence by default,
+  even when it is not needed for the immediate analysis. In particular save
+  actual model weights and optimizer state at measured intermediate as well as
+  final training checkpoints, along with data/step/schedule provenance and
+  routing/evaluation arrays. Avoid duplicate storage of identical shared
+  branch prefixes. If retaining a potentially useful artifact has material
+  storage, compute, or privacy costs, quantify the trade-off and agree on a
+  retention policy rather than silently omitting the evidence.
 - After **every scientifically significant milestone**, create a human-readable
   milestone-specific Markdown report in `reports/`. Keep it concise and informative:
   scientific question, agreed setup, key results, interpretation, limitations,
