@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Skeleton launcher: the only way agents should submit Slurm jobs.
+"""Optional skeleton launcher; existing reviewed submission workflows are valid.
 
 Not tested against your cluster. Fill in the CONFIGURE section, then rename to
 scripts/launch.py.
@@ -9,12 +9,14 @@ scripts/launch.py.
 
 submit: check-run -> tunnel check -> remote checkout of the pushed commit ->
         run dir with read ACL for the other person -> sbatch -> record-run
-        -> dir-visibility request to the other person's agent.
+        -> optional authorized dir-visibility request to the other person's agent.
 audit:  lists your running/pending jobs that have no run record.
 """
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 
@@ -45,39 +47,52 @@ def remote(script):
 def submit(args):
     cfg = json.load(open(args.config))
     run_id = cfg["run_id"]
-    # 1. Decisions ratified on origin/main, clean tree, HEAD pushed.
-    print(sh(COLLAB + ["check-run", args.config]))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        sys.exit("Invalid run ID")
+    if any(value.startswith("<") for value in (REMOTE_REPO, RUN_ROOT, OTHER_CLUSTER_USER, OTHER_MEMBER)):
+        sys.exit("Optional launcher is not configured; use the existing approved workflow.")
+    # 1. Advisory decision review; this remote checkout needs a pushed clean commit.
+    print(sh(COLLAB + ["check-run", args.config, "--require-pushed"]))
     commit = sh(["git", "rev-parse", "HEAD"])
     # 2. Tunnel alive (fails fast instead of hanging on a password or 2FA prompt).
     if subprocess.run(["ssh", "-O", "check", SSH_HOST], capture_output=True).returncode != 0:
         sys.exit("ssh control connection to %s is down; reopen the tunnel first." % SSH_HOST)
     # 3. Remote checkout of exactly this commit, run dir, read-only ACL for the other person.
     run_dir = "%s/%s" % (RUN_ROOT, run_id)
+    q = shlex.quote
+    # Refuse stale checkouts rather than silently ignoring worktree/config errors.
     remote(
-        "set -e; cd %(repo)s && git fetch -q origin && "
-        "git worktree add -q --detach %(rd)s/code %(c)s 2>/dev/null || true; "
-        "mkdir -p %(rd)s/out; cp %(repo)s/%(cfg)s %(rd)s/config.json 2>/dev/null || true; "
-        "setfacl -m u:%(o)s:rX %(rd)s %(rd)s/out && setfacl -d -m u:%(o)s:rX %(rd)s %(rd)s/out"
-        % {"repo": REMOTE_REPO, "rd": run_dir, "c": commit, "cfg": args.config, "o": OTHER_CLUSTER_USER})
+        "set -e; cd {repo}; git fetch -q origin; mkdir -p {rd}; "
+        "git worktree add -q --detach {code} {commit}; "
+        "test \"$(git -C {code} rev-parse HEAD)\" = {commit}; "
+        "mkdir -p {out}; cp {cfg} {dest}; "
+        "setfacl -m {acl} {rd} {out}; setfacl -d -m {acl} {rd} {out}".format(
+            repo=q(REMOTE_REPO), rd=q(run_dir), code=q(run_dir + "/code"),
+            commit=q(commit), out=q(run_dir + "/out"),
+            cfg=q(run_dir + "/code/" + args.config), dest=q(run_dir + "/config.json"),
+            acl=q("u:%s:rX" % OTHER_CLUSTER_USER))
+    )
     # 4. Submit.
-    job_id = remote("cd %s/code && sbatch --parsable --job-name collab-%s --chdir %s/out %s %s/config.json"
-                    % (run_dir, run_id, run_dir, SBATCH_SCRIPT, run_dir)).split(";")[0]
+    job_id = remote("cd %s && sbatch --parsable --job-name %s --chdir %s %s %s"
+                    % (q(run_dir + "/code"), q("collab-" + run_id), q(run_dir + "/out"),
+                       q(SBATCH_SCRIPT), q(run_dir + "/config.json"))).split(";")[0]
     # 5. Record and ask the other side to confirm read access.
     rec = COLLAB + ["record-run", "--run-id", run_id, "--job-id", job_id, "--config", args.config,
                     "--run-dir", run_dir, "--commit", commit]
     if args.requested_by:
         rec += ["--requested-by", args.requested_by]
     print(sh(rec))
-    print(sh(COLLAB + ["send", "--to", OTHER_MEMBER, "--type", "request", "--topic", "dir-visibility",
-                       "--refs", run_id, "--subject", "Confirm read access to %s" % run_id,
-                       "--body", "Please check `test -r %s/config.json` from your account and ack." % run_dir]))
+    if args.request_visibility:
+        print(sh(COLLAB + ["send", "--to", OTHER_MEMBER, "--type", "request", "--topic", "dir-visibility",
+                           "--refs", run_id, "--subject", "Confirm read access to %s" % run_id,
+                           "--body", "Please check `test -r %s/config.json` from your account and ack." % run_dir]))
     print("Submitted %s as job %s" % (run_id, job_id))
 
 
 def audit(_args):
     """List your running/pending Slurm jobs that have no run record on the shared branch."""
     jobs = remote("squeue -u $USER -h -o '%i %j'").splitlines()
-    branch = os.environ.get("COLLAB_BRANCH", "main")
+    branch = os.environ.get("COLLAB_BRANCH") or sh(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).split("/", 1)[1]
     sh(["git", "fetch", "--quiet", "origin", branch])
     names = sh(["git", "ls-tree", "-r", "--name-only", "origin/" + branch, "--", "collab/runs"]).splitlines()
     recorded = set()
@@ -97,6 +112,7 @@ def main():
     s = sub.add_parser("submit")
     s.add_argument("config")
     s.add_argument("--requested-by")
+    s.add_argument("--request-visibility", action="store_true", help="send a visibility message only with user authorization")
     s.set_defaults(fn=submit)
     sub.add_parser("audit").set_defaults(fn=audit)
     a = ap.parse_args()

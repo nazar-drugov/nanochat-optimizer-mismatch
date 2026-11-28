@@ -8,7 +8,7 @@ choice: <one sentence>
 reference: <closest published setup, with arXiv ID>
 proposed_by: <name>
 supersedes: ""
-# Ratification is not recorded here. Each person runs
+# Ratification is optional and is not recorded here. If desired, a person runs
 # `collab.py ratify D-NNN`; editing this file afterwards voids earlier ratifications.
 ---
 

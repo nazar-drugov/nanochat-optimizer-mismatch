@@ -6,19 +6,18 @@ variable `COLLAB_MSG_ID` and in the prompt that started you.
 
 Do exactly this, then stop:
 
-1. Read sections 3 and 6 of `AGENTS.md` and your user's `~/.collab/delegation.md`.
+1. Read `AGENTS.md`, especially the Two-author collaboration framework, and
+   your user's optional `~/.collab/delegation.md`.
 2. Run `python collab/bin/collab.py show <id>`.
 3. Decide which case applies:
-   - **Information request answerable from the records** (decision records,
+   - **Authorized information request answerable from the records** (decision records,
      `collab/runs/` via `collab.py`, the charter, the glossary):
      `python collab/bin/collab.py reply <id> --close --body "<answer>"`.
    - **Action listed in the "Answer without asking" or "Do without asking"
      part of the delegation file**: do it, then reply with what you did.
      Also leave a one-line note for your user with
      `python collab/bin/collab.py pending-note <id> --body "Did: ..."`.
-   - **Anything else, or you are unsure**: do not act. Run
-     `python collab/bin/collab.py set-status <id> acked --note "waiting for <user>"`
-     and leave a note with `pending-note`: what is asked, what you would reply,
+   - **Anything else, or you are unsure**: do not act. Leave a local note with `pending-note`: what is asked, what you would reply,
      and what you need your user to decide.
 4. Print a two-line summary and exit.
 

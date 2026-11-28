@@ -9,5 +9,4 @@ is ~/.collab/me. Follow the collaboration rules in the repository's AGENTS.md in
 full, and read it first if it is not in your context. My standing permissions for
 the other agent's requests are in ~/.collab/delegation.md; read it before acting on
 any message and never edit it. When something I say looks like steering that
-applies beyond the current task, propose a charter amendment with its scope and
-ask me before filing it.
+applies beyond the current task, record it according to the repository's existing norms.

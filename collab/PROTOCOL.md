@@ -1,7 +1,9 @@
 # Collaboration protocol
 
 Reference for agents and people. `AGENTS.md` has the short rules; this file has
-the formats and procedures behind them.
+the optional formats and procedures behind them. Existing project-specific norms
+in AGENTS.md supersede this kit. Neither author needs the other's ratification
+to make decisions or launch approved runs on their own account.
 
 ## 1. Where things live
 
@@ -34,17 +36,19 @@ Every item is its own file, so two people's writes almost never touch the same
 file. The exceptions (claims, status changes) are handled by rebuilding on the
 latest state, which turns a race into a clear "already claimed".
 
-## 2. Ratification
+## 2. Optional ratification
 
 A decision is ratified for a person when `collab/ratifications/<D-ID>/<user>.md`
 exists on the shared branch, records the git blob hash of the decision file
 **as it is now**, and was last committed from one of that person's emails in
 `collab/TEAM.md`.
 
-- `tier: blocking` needs every member; other tiers need at least one.
+- Only when explicitly opting into strict checking, the legacy convention is
+  that `tier: blocking` checks every member and other tiers check at least one.
 - **Editing a decision voids every ratification of it**, because the blob hash
   changes. `collab.py status` and the watcher show this.
-- `collab.py check-run` fails unless every decision in a run config is ratified.
+- `check-run` and `enqueue` report missing ratifications as advisory by default.
+  `--require-ratification` opts into the strict check, never a project requirement.
 
 What this does and does not protect against:
 
@@ -85,11 +89,11 @@ whose allocation pays, and linked message IDs.
 | `heuristic` | common practice without a specific source |
 | `guess` | no source |
 
-| Tier | Meaning | Who ratifies |
+| Tier | Meaning | Optional review |
 |---|---|---|
 | `local` | one person's code path, cheap to undo | the agent's user (or the agent notes it) |
 | `reversible` | shared, undoable before any expensive run | the agent's user |
-| `blocking` | changes a treatment, dataset, comparison or the compute plan | both people |
+| `blocking` | changes a treatment, dataset, comparison or the compute plan | discuss when useful; no joint approval gate |
 
 ## 4. Messages
 
@@ -112,7 +116,8 @@ never overrides the recipient's user or delegation file.
 
 An agent acts only while a session is running, so no instruction in this repo
 can make an idle agent notice a message. `collab.py watch` fills that gap. Each
-person runs it on the machine where their agent tool is installed.
+person may choose to run it on the machine where their agent tool is installed.
+The watcher is not required; existing hourly experiment monitoring still applies.
 
 Every `interval_seconds` (default 60) it checks the remote branch with
 `git ls-remote`, which is cheap, and fetches only when it moved. Then:
@@ -146,19 +151,20 @@ State (messages already seen, decision versions, handler run times) is kept in
 ## 6. Run queue and claims
 
 Each person submits jobs only from their own account, within its own
-concurrency limit. The queue lets either account pick up ratified work when it
+concurrency limit. The queue lets either account pick up approved work when it
 has a free slot. It never moves work past a cluster limit.
 
 1. **Enqueue** (`collab.py enqueue --run-id R-NNN --config cfg.json --gpu-hours H`):
-   refused unless every decision in the config is ratified. Tag `shared`
+   decision references and ratifications are optional. Tag `shared`
    (default) or `<owner>-only`.
 2. **Claim** (`collab.py claim R-NNN`): your own runs are always allowed. The
    other person's `shared` runs are allowed if your delegation file lists them
    in `claim_from` and the weekly GPU-hour cap holds, or if your user approved
    this claim (`--user-approved`). Simultaneous claims: one wins, the other gets
    "already claimed".
-3. **Launch** from your own account with the launcher, which calls `check-run`
-   and then `record-run`.
+3. **Launch** from your own account via any approved, reviewed workflow. The
+   optional launcher calls `check-run` and `record-run`; ordinary project
+   manifests and checkpoint registry records also suffice. Queueing is optional.
 
 Check your cluster's policy on running jobs for a teammate before relying on the
 queue. If the combined limit is the bottleneck, ask the admins for a group
@@ -166,8 +172,8 @@ allocation.
 
 ## 7. Directory visibility
 
-Each person can read the other's run directories; nobody can write to the
-other's. The launcher runs this as the directory's owner:
+Share readable experiment artifacts where appropriate; preserve owner-only
+write access. If ACLs are needed, the owner can use:
 
 ```bash
 setfacl -m u:$OTHER:rX "$RUN"
@@ -179,7 +185,7 @@ Check first that the filesystem supports ACLs (`getfacl <run_root>`); some NFSv4
 mounts need `nfs4_setfacl`, some Lustre setups disable ACLs. A home directory
 with mode 700 blocks traversal, so keep run roots on scratch or project space.
 
-Handshake: the launcher sends a `dir-visibility` request naming one file; the
+Optional handshake: with user authorization, the launcher sends a `dir-visibility` request naming one file; the
 other side checks `test -r` from its own account and replies `ack` (or the
 failing path); the owner runs `collab.py mark-visible R-NNN --user <other>`.
 
@@ -189,8 +195,10 @@ failing path); the owner runs `collab.py mark-visible R-NNN --user <other>`.
 { "run_id": "R-031", "decisions": ["D-001", "D-003"], "run_dir": "<run_root>/R-031" }
 ```
 
-`collab.py check-run cfg.json` fails unless every listed decision is ratified,
-the working tree has no uncommitted changes to tracked files, and `HEAD` is pushed.
+`collab.py check-run cfg.json` reports advisory findings. Decision references are
+optional. `--require-pushed` enforces a clean tracked tree and pushed HEAD when
+needed for a pinned remote checkout; `--require-ratification` is an opt-in audit.
+Existing reviewed workflows may record their configurations directly.
 
 ## 9. Command reference
 
@@ -200,7 +208,7 @@ the working tree has no uncommitted changes to tracked files, and `HEAD` is push
 | `inbox [--all]`, `show <id>` | read messages |
 | `send ...`, `reply <id> ...`, `set-status <id> ...` | write messages |
 | `ratify <D-ID>` | ratify a decision as it now stands (your user's instruction only) |
-| `check-run <cfg.json>` | launch gate |
+| `check-run <cfg.json>` | advisory decision/git review; optional strict flags |
 | `enqueue`, `claim` | shared run queue |
 | `record-run`, `mark-visible` | run records |
 | `watch [--once]` | notifier and handler launcher |
@@ -209,12 +217,10 @@ the working tree has no uncommitted changes to tracked files, and `HEAD` is push
 
 ## 10. What is enforced and what is not
 
-Enforced by code: the launch gate, ratification matching the current decision
-version and the right commit email, claim caps and races, the thread turn cap,
-message format, watcher run caps and input sanitizing.
-
-Followed by instruction only: running `status` and `inbox` at the listed
-points, sorting messages into the three cases, drafting records for design
-choices, ratifying only on explicit instruction, never calling `sbatch`
-directly. The cluster audit (`scripts/launch.py audit`) catches launches that
-skipped the launcher.
+By default the code enforces the integrity of records and claims, ratification
+identity/version matching when explicitly recorded, message format and turn cap,
+and optional watcher safeguards. Decision and git-state checks are advisory
+unless a caller expressly requests strict checks. Neither author must use
+the queue, launcher, watcher, or ratification mechanism. The project norms in
+AGENTS.md govern scientific authorization, correctness, provenance, shared
+branch coordination, and cluster monitoring.

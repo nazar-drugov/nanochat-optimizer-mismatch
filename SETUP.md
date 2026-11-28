@@ -1,6 +1,7 @@
 # Setup
 
-Shared files go in the repository. Personal files go in each person's home
+All tools and personal setup below are optional; existing project workflows and
+AGENTS.md take precedence. Shared files go in the repository. Personal files go in each person's home
 directory and are never committed.
 
 ## 1. Repository (once, either person)
@@ -17,7 +18,7 @@ collab/templates/decision.md
 collab/prompts/handle_message.md prompt for watcher-started agent runs
 collab/decisions/                seed with your spec's open decisions
 collab/bin/collab.py
-scripts/launch_example.py        fill in CONFIGURE, rename to scripts/launch.py
+scripts/launch_example.py        optional: configure and rename if desired
 .githooks/pre-commit             optional: lint decision files
 .gitignore                       must contain .collab-local/
 ```
@@ -25,7 +26,7 @@ scripts/launch_example.py        fill in CONFIGURE, rename to scripts/launch.py
 Do not add `CLAUDE.md` or `CLAUDE.local.md` to the repo. Claude Code reads those
 instead of `AGENTS.md`, and Cursor reads both, so you would get two copies.
 
-## 2. Each person, once per machine
+## 2. Optional personal setup, once per machine
 
 ```bash
 mkdir -p ~/.collab
@@ -44,7 +45,7 @@ Personal instruction file:
 | Codex (Nazar) | append to `~/.codex/AGENTS.md` | `personal/codex-global-AGENTS.md` |
 | Cursor (Nazar) | User Rules (Customize > Rules) | `personal/cursor-user-rule.md` |
 
-## 3. The watcher
+## 3. Optional watcher
 
 Run it in the repo on the machine where your agent tool is installed, in a
 terminal or tmux window you leave open:
@@ -76,8 +77,8 @@ Replace `cluster` with your ssh alias. Test a handler by hand first:
 3. From one side: "Send Nazar a question asking whether he can read `<a path>`."
    It should show the draft before sending. On the other side, the watcher
    should notify within a minute, and a new session's `status` should list it.
-4. Ask an agent to launch a run whose config lists an unratified decision. The
-   launcher should refuse.
+4. Run `check-run` on a config with an unratified decision. It should print an
+   advisory and succeed by default; only an explicit strict audit should fail.
 5. Edit a ratified decision and push. The other person's watcher should report
    that their ratification is void.
 

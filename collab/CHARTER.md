@@ -1,24 +1,21 @@
 # Charter
 
-Change only with both people agreeing (say so in the commit message). Keep under 60 lines: every
-agent reads this file in every session.
+The established project norms in AGENTS.md take precedence. Scientific intent
+and protocol are recorded in docs/report.tex and PRETRAINING_PROTOCOL.md; use
+HANDOFF.md and reports/ for current evidence. This file is an optional concise
+summary, not a ratification gate.
 
 ## Goal
-- **G1** <research question, one or two sentences>
 
-## Values (methodological commitments)
-Each line: ID, the commitment, who stated it, status (shared | <name> only | disputed).
-- **V1** Default to the closest published setup; departures need a stated reason. (harry; shared?)
-- **V2** <...>
+- G1: Establish whether changing optimizers between pretraining and fine-tuning
+  increases forgetting at matched learning; quantify correlational and causal
+  routing effects, including replay and sparsity controls.
 
-## Constraints
-- **C1** Compute: each person uses only their own cluster account and budget. Shared runs go through the queue.
-- **C2** Deadline: <date>.
+## Values and constraints
 
-## Priority order when values conflict
-1. <e.g. correctness of the comparison>
-2. <e.g. deadline>
-3. <e.g. alignment with the reference setup>
-
-## Non-goals
-- <what the project will not try to do>
+- Preserve agreed scientific comparisons, correctness checks, and reproducible
+  experimental evidence.
+- Either collaborator can authorize and launch work on their own cluster account;
+  coordinate assignments and avoid duplicate runs. The optional queue is not
+  required.
+- Record material decisions and disagreements without implying joint approval.

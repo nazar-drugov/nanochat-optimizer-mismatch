@@ -513,22 +513,34 @@ def cmd_ratify(args):
 
 def cmd_check_run(args):
     root = repo_root()
-    fetch(root)
     cfg = json.loads(Path(args.config).read_text())
-    ids = cfg.get("decisions")
-    problems = ["config has no `decisions` list"] if not ids else check_decisions(root, ids)
+    ids = cfg.get("decisions") or []
+    problems = []
+    warnings = []
+    try:
+        fetch(root)
+        decision_notes = check_decisions(root, ids) if ids else ["config has no decision references (optional)"]
+    except CollabError as exc:
+        decision_notes = ["could not retrieve current decision state: " + str(exc)]
+        if args.require_pushed:
+            problems.append("could not verify remote git state")
+    (problems if args.require_ratification else warnings).extend(decision_notes)
     if not args.skip_git:
+        git_notes = []
         if git(["status", "--porcelain", "--untracked-files=no"], root).stdout.strip():
-            problems.append("working tree has uncommitted changes to tracked files")
+            git_notes.append("working tree has uncommitted changes to tracked files")
         head = git(["rev-parse", "HEAD"], root).stdout.strip()
         if git(["branch", "-r", "--contains", head], root, check=False).stdout.strip() == "":
-            problems.append("HEAD %s is not pushed" % head[:8])
+            git_notes.append("HEAD %s is not pushed" % head[:8])
+        (problems if args.require_pushed else warnings).extend(git_notes)
+    for warning in warnings:
+        print("  advisory: " + warning)
     if problems:
         print("check-run FAILED for %s:" % args.config)
         for p in problems:
             print("  - " + p)
         sys.exit(1)
-    print("check-run OK: %s (decisions %s)" % (args.config, ", ".join(ids)))
+    print("check-run OK: %s (decisions %s)" % (args.config, ", ".join(ids) or "none"))
 
 
 # ------------------------------------------------------------------- queue, runs
@@ -537,10 +549,12 @@ def cmd_enqueue(args):
     root = repo_root()
     fetch(root)
     cfg = json.loads(Path(args.config).read_text())
-    problems = check_decisions(root, cfg.get("decisions") or []) if cfg.get("decisions") \
-        else ["config has no `decisions` list"]
-    if problems:
-        raise CollabError("Only runs whose decisions are ratified can be queued:\n  " + "\n  ".join(problems))
+    ids = cfg.get("decisions") or []
+    notes = check_decisions(root, ids) if ids else ["config has no decision references (optional)"]
+    if args.require_ratification and notes:
+        raise CollabError("Requested ratification check failed:\n  " + "\n  ".join(notes))
+    for note in notes:
+        print("  advisory: " + note)
     user = me()
     path = "collab/queue/%s.md" % args.run_id
     commit = git(["rev-parse", "HEAD"], root).stdout.strip()
@@ -549,7 +563,7 @@ def cmd_enqueue(args):
         if read_file(root, path) is not None:
             raise CollabError("%s already exists." % path)
         meta = {"run_id": args.run_id, "owner": user, "tag": args.tag or "shared",
-                "config": args.config, "decisions": cfg["decisions"], "commit": commit,
+                "config": args.config, "decisions": ids, "commit": commit,
                 "gpu_hours": args.gpu_hours, "priority": args.priority, "status": "queued",
                 "claimed_by": "", "claimed_at": "", "enqueued": iso(now())}
         return {path: dump_md(meta, args.note or "")}
@@ -608,7 +622,7 @@ def cmd_claim(args):
         return {path: dump_md(meta, body)}
 
     commit_on_remote(root, build, "collab queue: %s claimed by %s" % (args.run_id, user))
-    print("Claimed %s. Launch it from your own account with the launcher." % args.run_id)
+    print("Claimed %s. Launch it from your own account using your approved workflow." % args.run_id)
 
 
 def cmd_record_run(args):
@@ -675,7 +689,7 @@ def status_lines(root, user):
         _, state = ratification_state(root, did, members, emails)
         if state.get(user) != "ok":
             need.append("  %s [%s] %s: %s" % (did, meta.get("tier", "?"), meta.get("title", ""), state.get(user)))
-    lines.append("Active decisions you have not ratified in their current form (%d):" % len(need))
+    lines.append("Active decisions without your optional current ratification (%d):" % len(need))
     lines += need or ["  (none)"]
 
     queue = [parse_md(t)[0] for t in read_files(root, "collab/queue").values()]
@@ -807,7 +821,7 @@ def cmd_watch(args):
                                                             env["COLLAB_MSG_SUBJECT"], mid)
                     else:
                         env.update(COLLAB_DECISION=safe_id(obj.get("id")))
-                        text = "Decision %s changed: %s (ratify again if you agree)" % (
+                        text = "Decision %s changed: %s (optional ratification can be refreshed if desired)" % (
                             env["COLLAB_DECISION"], safe_text(obj.get("title")))
                     env["COLLAB_TEXT"] = text
                     print("[%s] %s" % (iso(now()), text), flush=True)
@@ -895,7 +909,7 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("status", help="digest: inbox, decisions to ratify, queue")
+    s = sub.add_parser("status", help="digest: inbox, optional decision review, queue")
     s.add_argument("--no-sync", action="store_true")
     s.set_defaults(fn=cmd_status)
 
@@ -945,18 +959,22 @@ def main(argv=None):
     s.add_argument("--note")
     s.set_defaults(fn=cmd_ratify)
 
-    s = sub.add_parser("check-run", help="verify a run config's decisions are ratified")
-    s.add_argument("config", help="run config JSON with a `decisions` list")
-    s.add_argument("--skip-git", action="store_true", help="skip clean-tree and pushed-HEAD checks")
+    s = sub.add_parser("check-run", help="advisory review of run config and git state")
+    s.add_argument("config", help="run config JSON (decision references optional)")
+    git_checks = s.add_mutually_exclusive_group()
+    git_checks.add_argument("--skip-git", action="store_true", help="skip clean-tree and pushed-HEAD checks")
+    s.add_argument("--require-ratification", action="store_true", help="opt in to strict decision ratification checks")
+    git_checks.add_argument("--require-pushed", action="store_true", help="require a clean tracked tree and pushed HEAD for pinned deployment")
     s.set_defaults(fn=cmd_check_run)
 
-    s = sub.add_parser("enqueue", help="put a ratified run in the shared queue")
+    s = sub.add_parser("enqueue", help="optionally put a run in the shared queue")
     s.add_argument("--run-id", required=True)
     s.add_argument("--config", required=True)
     s.add_argument("--gpu-hours", required=True, type=float)
     s.add_argument("--tag", help="'shared' (default) or '<owner>-only'")
     s.add_argument("--priority", type=int, default=5)
     s.add_argument("--note")
+    s.add_argument("--require-ratification", action="store_true", help="opt in to strict decision ratification checks")
     s.set_defaults(fn=cmd_enqueue)
 
     s = sub.add_parser("claim", help="claim a queued run to launch on your own account")
@@ -965,7 +983,7 @@ def main(argv=None):
                    help="your user approved this claim in the current session")
     s.set_defaults(fn=cmd_claim)
 
-    s = sub.add_parser("record-run", help="record a launched job (called by the launcher)")
+    s = sub.add_parser("record-run", help="optionally record a launched job")
     s.add_argument("--run-id", required=True)
     s.add_argument("--job-id", required=True)
     s.add_argument("--config")

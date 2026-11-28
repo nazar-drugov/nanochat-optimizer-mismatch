@@ -11,4 +11,4 @@
 - My standing permissions for the other agent's requests are in
   `~/.collab/delegation.md`. Read it before acting on any message. Never edit it.
 - When something I say looks like steering that applies beyond the current task,
-  propose a charter amendment with its scope and ask me before filing it.
+  record it according to the repository's existing norms.

@@ -18,10 +18,11 @@ needs my approval in the current session.
 ## Do without asking, then tell me
 - Grant read-only ACLs to the other person on my run directories under my run root.
 - Claim shared runs from the people in `claim_from`, within the weekly cap above,
-  when I have a free job slot. Launch them only with the repository launcher.
+  when I have a free job slot (ordinary interactive sessions, not watcher runs).
+  Use an approved reviewed submission workflow.
 
 ## Always ask me first
-- Anything that changes a decision, the charter or the glossary.
+- Material scientific changes outside my already-authorized plans.
 - Any write access for the other person, anywhere.
 - Deleting, moving or overwriting any run output.
 - Cancelling or changing any job.
