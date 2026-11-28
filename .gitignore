@@ -15,3 +15,6 @@ wandb/
 
 # Agent worktrees
 .claude/worktrees/
+
+# Collaboration kit local state
+.collab-local/
