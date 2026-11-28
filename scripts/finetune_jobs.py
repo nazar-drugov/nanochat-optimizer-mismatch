@@ -52,12 +52,17 @@ def main(argv=None):
     parser.add_argument("--job-prefix", default="ft")
     parser.add_argument("--checkpoint-retention", choices=("none", "weights", "weights+final_optimizer", "full"),
                         default="full", help="retention for measured model/optimizer states (default: full)")
+    parser.add_argument("--soft-router-capture", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--soft-router-sample-size", type=int, default=8192)
+    parser.add_argument("--soft-router-sample-format", choices=("logits", "probabilities", "both"), default="logits")
     parser.add_argument("--pair-lr-fractions", nargs="+", default=[], metavar="PRE:FT=F1,F2",
                         help="LR fractions for one (pretraining, fine-tuning) optimizer pair")
     parser.add_argument("--pairs", nargs="+", default=None,
                         choices=[f"{p}:{f}" for p in OPTIMIZERS for f in OPTIMIZERS],
                         help="generate only these PRE:FT pairs (for edge extensions)")
     args = parser.parse_args(argv)
+    if not 0 <= args.soft_router_sample_size <= 8192:
+        parser.error("--soft-router-sample-size must be between 0 and 8192")
     selection = json.loads(Path(args.selection).read_text())
     experts = {base_run_experts(name) for name in args.base_runs}
     if len(experts) != 1 or len(set(args.base_runs)) != len(args.base_runs):
@@ -132,7 +137,10 @@ def main(argv=None):
             tokens = args.branch_tokens if E == 8 else branch_by_dataset[name]
             extra = (["--branch-tokens", *map(str, tokens)] if tokens else []) \
                 + (["--out-root", args.out_root] if args.out_root else [])
-            extra += ["--checkpoint-retention", args.checkpoint_retention]
+            extra += ["--checkpoint-retention", args.checkpoint_retention,
+                      "--soft-router-capture" if args.soft_router_capture else "--no-soft-router-capture",
+                      "--soft-router-sample-size", str(args.soft_router_sample_size),
+                      "--soft-router-sample-format", args.soft_router_sample_format]
             if E != 8:
                 extra += ["--train-tokens", "15728640", "--total-batch-size", "65536",
                           "--device-batch-size", "32", "--warmup-ratio", ".03", "--warmdown-ratio", ".2",

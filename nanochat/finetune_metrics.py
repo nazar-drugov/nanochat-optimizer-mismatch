@@ -62,26 +62,37 @@ def top2_margin(logits):
     return top2[..., 0] - top2[..., 1]
 
 
-def flip_cause_counts(h0, h1, w0, w1, r0, r1, b0=None, b1=None):
+def flip_cause_counts(h0, h1, w0, w1, r0, r1, b0=None, b1=None, scored_mask=None):
     """Classify one layer's flips (r1 != r0) by cause (spec §2, "Flip cause").
 
     h0, h1: router inputs of the base and fine-tuned models on the same tokens (N, d);
     w0, w1: their router weights (E, d); b0, b1: selection biases (or None).
     A = new inputs alone flip the token: select(W0 h1, b0) != r0.
     B = new router alone flips it:      select(W1 h0, b1) != r0.
+    Without a mask, return the historical all-position counts. If a mask
+    is supplied, reuse these same counterfactual comparisons for additional
+    `scored_*` counts restricted to scored target positions.
     """
     h0, h1 = h0.reshape(-1, h0.size(-1)).float(), h1.reshape(-1, h1.size(-1)).float()
     r0, r1 = r0.reshape(-1), r1.reshape(-1)
     a = select_experts(h1 @ w0.float().T, b0) != r0
     b = select_experts(h0 @ w1.float().T, b1) != r0
     flipped = r1 != r0
-    return {
-        "flips": int(flipped.sum()),
-        "input_driven": int((flipped & a & ~b).sum()),
-        "weight_driven": int((flipped & ~a & b).sum()),
-        "either": int((flipped & a & b).sum()),
-        "interaction": int((flipped & ~a & ~b).sum()),
+    classes = {
+        "flips": flipped,
+        "input_driven": flipped & a & ~b,
+        "weight_driven": flipped & ~a & b,
+        "either": flipped & a & b,
+        "interaction": flipped & ~a & ~b,
     }
+    result = {key: int(positions.sum()) for key, positions in classes.items()}
+    if scored_mask is not None:
+        if scored_mask.numel() != flipped.numel() or scored_mask.dtype != torch.bool:
+            raise ValueError("scored_mask must be a boolean mask of the same token positions")
+        scored = scored_mask.to(flipped.device).reshape(-1)
+        result.update({f"scored_{key}": int((positions & scored).sum())
+                       for key, positions in classes.items()})
+    return result
 
 
 def expert_relative_change(model, base_state, n_experts):

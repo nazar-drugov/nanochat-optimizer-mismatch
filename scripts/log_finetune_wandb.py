@@ -38,8 +38,11 @@ DEFAULT_ENTITY = "hgo-mit"
 DEFAULT_PROJECT = "nanochat"
 DEFAULT_LEDGER = Path.home() / ".cache" / "nanochat" / "finetune_wandb_ledger.json"
 OPTIMIZERS = {"adamw", "muon"}
+SOFT_SCALARS = tuple(f"soft_{dataset}_{metric}_mean" for dataset in ("d0", "d1") for metric in
+                     ("entropy_nats", "top2_margin", "chosen_gate", "max_probability",
+                      "js_base_current_nats", "tv_base_current", "raw_z_loss"))
 METRICS = ("tokens", "loss_d0", "loss_d1", "learning", "forgetting", "F_route",
-           "F_fixed", "reverse_order", "train_loss")
+           "F_fixed", "reverse_order", "train_loss", *SOFT_SCALARS)
 REQUIRED_METRICS = {"learning", "forgetting", "loss_d1"}
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
 _BASE = re.compile(r"e(\d+)-main-(adamw|muon)-s(\d+)\Z")
@@ -172,6 +175,13 @@ def make_cell(result, config, *, stage, source=None, invalid=False, base_manifes
     if done > steps or (completed and done != steps):
         raise RecordError("invalid completed-step count")
 
+    soft = result.get("soft_router")
+    if soft != config.get("soft_router"):
+        raise RecordError("config/result soft router schema mismatch")
+    if soft is not None:
+        if not isinstance(soft, dict) or soft.get("version") != 1 or type(soft.get("sample_size_requested")) is not int or not (
+            0 <= soft["sample_size_requested"] <= 8192) or soft.get("sample_format") not in ("logits", "probabilities", "both"):
+            raise RecordError("unrecognized soft router schema")
     points = []
     nonfinite = 0
     last = -1
@@ -187,9 +197,15 @@ def make_cell(result, config, *, stage, source=None, invalid=False, base_manifes
         last = step
         if not REQUIRED_METRICS.issubset(row):
             raise RecordError("missing aggregate curve measurements")
+        if soft is not None and not set(SOFT_SCALARS) <= set(row):
+            raise RecordError("missing soft router scalar metrics")
         point = {"step": step}
         for key in METRICS:
             if key in row:
+                if experts == 1 and key in ("soft_d0_top2_margin_mean", "soft_d1_top2_margin_mean"):
+                    if row[key] is not None:
+                        raise RecordError("top2 margin undefined for E1")
+                    continue
                 v = number(row[key], key, required=completed, allow_nonfinite=not completed)
                 if v is None:
                     nonfinite += 1
@@ -205,6 +221,9 @@ def make_cell(result, config, *, stage, source=None, invalid=False, base_manifes
             "pretrain_optimizer": pre, "pretrain_seed": pre_seed, "ft_optimizer": ft,
             "ft_seed": seed, "lr": lr, "ft_steps": steps, "n_experts": experts,
             "invalid": bool(invalid), "archive": bool(invalid), "result_status": status}
+    if soft is not None:
+        meta.update(soft_router_schema_version=soft["version"], soft_router_sample_size=soft["sample_size_requested"],
+                    soft_router_sample_format=soft["sample_format"])
     for key in ("warmup_steps", "decay_steps"):
         value = result.get(key, config.get(key))
         if value is not None:

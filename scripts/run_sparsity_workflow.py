@@ -71,6 +71,134 @@ def edge_args(extras, flag):
     return [flag, *[f'{o}={x!r}' for o in OPTS for x in sorted(extras[o])]] if any(extras.values()) else []
 
 
+def storage_requirements_gb(experts, trunks, capture, sample_size, sample_format, retention):
+    """Conservative uncompressed wave estimate; shared prefixes cost 18 states/trunk.
+
+    Raw D0/D1 routes, document arrays and metadata are mirrored to pool. Model
+    and optimizer evidence is scratch-only in the current renderer. Numbers
+    are decimal GB, derived from the fixed 512x2048 eval sets and E1/4/16
+    architecture; see reports/finetune_checkpoint_storage_plan.md.
+    """
+    states = 18 * trunks
+    per_state_mb = 24.0
+    if capture:
+        # upper bound for the larger doc-count corpus, not compressed size
+        per_state_mb += 4.0 + .25 * experts
+        per_state_mb += 2 * sample_size * 10 * experts * 4 / 1e6 * (2 if sample_format=='both' else 1)
+    evidence = states * per_state_mb / 1000
+    model = {1:.406,4:.849,16:2.618}[experts]
+    optim = {1:.812,4:1.697,16:5.237}[experts]  # AdamW upper bound for either optimizer
+    weights = states*model if retention!='none' else 0
+    optimizer = states*optim if retention=='full' else (3*trunks*optim if retention=='weights+final_optimizer' else 0)
+    return {'SCRATCH':evidence+weights+optimizer,'POOL':evidence}
+
+
+def quota_free_gb(report):
+    result = {}
+    for line in report.splitlines():
+        cells = [c.strip() for c in line.split('|')]
+        if len(cells)>=3 and cells[0] in ('SCRATCH','POOL'):
+            result[cells[0]] = float(cells[2])-float(cells[1])
+    if set(result)!= {'SCRATCH','POOL'}:
+        raise ValueError('cannot read both personal ORCD storage quotas')
+    return result
+
+
+def verify_soft_canary(root, experts, lr, sample_size, sample_format, retention):
+    """Verify actual GPU-produced evidence before releasing the rest of a grid.
+
+    The canary is one preapproved AdamW->AdamW SC trial (seed 1, fraction .25),
+    not a separate extra experiment. Validate every measured NPZ and shared
+    attempt prefix; report the observed physical compressed footprint.
+    """
+    import numpy as np
+    from nanochat.soft_routing import METRICS, SOFT_ROUTER_SCHEMA_VERSION, schema as evidence_schema
+    from scripts.finetune import checkpoint_steps
+    dataset = Path(root)/f'e{experts}-main-adamw-s42'/'starcoderdata'
+    reference = {}
+    with np.load(dataset/'base'/'base_arrays.npz',allow_pickle=False) as base:
+        for prefix in ('d0','d1'):
+            positions=base[f'{prefix}_soft_sample_positions']
+            sample_docs=base[f'{prefix}_soft_sample_doc_ids']
+            counts=base[f'{prefix}_soft_doc_counts']
+            expected=min(sample_size,int(counts.sum())) if not (experts==1 and sample_format=='probabilities') else 0
+            digest=hashlib.sha256(positions.astype('<i8').tobytes()).hexdigest()
+            if (len(positions)!=expected or len(sample_docs)!=expected or np.any(sample_docs<0) or
+                    np.any(sample_docs>=len(counts)) or (len(positions)>1 and not np.all(np.diff(positions)>0)) or
+                    digest!=base[f'{prefix}_soft_sample_positions_sha256'].item()):
+                raise RuntimeError(f'canary {prefix} has incomplete or unordered sample positions')
+            reference[prefix]=(digest,counts,expected,base[f'{prefix}_routes'].shape,base[f'{prefix}_soft_hist_edges'])
+    physical={}; attempt_steps={}
+    branches=(60,240,960)
+    for horizon in branches:
+        folder=dataset/f'adamw-lr{lr:.3g}-s1-T{horizon}'
+        result=load(folder/'result.json')
+        config=load(folder/'config.json')
+        cell={'base_run':f'e{experts}-main-adamw-s42','ft_dataset':'starcoderdata','ft_optimizer':'adamw',
+              'pretrain_optimizer':'adamw','seed':1,'lr':lr,'ft_steps':horizon,'n_experts':experts}
+        decay=round(.2*horizon); want_steps=checkpoint_steps(horizon,decay)
+        if (result.get('status')!='completed' or result.get('steps_completed')!=horizon or
+                result.get('lr')!=lr or result.get('checkpoint_retention')!=retention or
+                not result.get('attempt_id') or result.get('attempt_id')!=config.get('attempt_id') or
+                any(result.get(k)!=v or config.get('cell',{}).get(k)!=v for k,v in cell.items()) or
+                config.get('checkpoint_retention')!=retention or
+                config.get('warmup_steps')!=8 or config.get('decay_steps')!=decay or
+                [p['step'] for p in result.get('curve',[])]!=want_steps):
+            raise RuntimeError(f'{folder}: canary result incomplete or policy mismatch')
+        schema=result.get('soft_router') or {}
+        if schema!=evidence_schema(sample_size,sample_format) or config.get('soft_router')!=schema:
+            raise RuntimeError(f'{folder}: canary soft evidence schema mismatch')
+        if retention=='none' and (list(folder.glob('model_*.pt')) or list(folder.glob('optim_*.pt'))):
+            raise RuntimeError(f'{folder}: unexpected binary state in evaluation-only canary')
+        for point in result['curve']:
+            step=point['step']; path=folder/f'ckpt_{step:06d}.npz'; stat=path.stat()
+            inode=(stat.st_dev,stat.st_ino); physical[inode]=stat.st_size
+            if step<=horizon-decay:
+                previous=attempt_steps.setdefault((result['attempt_id'],step),inode)
+                if previous!=inode: raise RuntimeError('shared canary prefix is not hardlinked within one attempt')
+            with np.load(path,allow_pickle=False) as z:
+                if z['soft_router_schema_version'].item()!=SOFT_ROUTER_SCHEMA_VERSION:
+                    raise RuntimeError(f'{path}: wrong soft-router version')
+                L=len(z['layers'])
+                for prefix,(digest,counts,expected,route_shape,hist_edges) in reference.items():
+                    if (z[f'{prefix}_soft_sample_positions_sha256'].item()!=digest or
+                            not np.array_equal(z[f'{prefix}_soft_doc_counts'],counts)):
+                        raise RuntimeError(f'{path}: {prefix} sample/document mismatch')
+                    valid=z[f'{prefix}_soft_metric_valid']
+                    n=int(counts.sum()); wanted=np.where(valid,n,0)
+                    expected_valid=np.ones(len(METRICS),dtype=bool); expected_valid[1]=experts>1
+                    if (not np.array_equal(valid,expected_valid) or
+                            not np.array_equal(z[f'{prefix}_soft_layer_count'],np.broadcast_to(wanted,(L,len(METRICS)))) or
+                            not np.array_equal(z[f'{prefix}_soft_hist_edges'],hist_edges) or
+                            not np.array_equal(z[f'{prefix}_soft_hist_count'].sum(axis=-1),np.broadcast_to(wanted,(L,len(METRICS))))):
+                        raise RuntimeError(f'{path}: {prefix} soft count/validity mismatch')
+                    shapes={'soft_layer_sum':(L,len(METRICS)), 'soft_layer_sumsq':(L,len(METRICS)),
+                            'soft_doc_sum':(L,len(counts),len(METRICS)), 'soft_doc_sumsq':(L,len(counts),len(METRICS)),
+                            'soft_prob_sum':(L,experts), 'soft_doc_prob_sum':(L,len(counts),experts)}
+                    for suffix,shape in shapes.items():
+                        values=z[f'{prefix}_{suffix}']
+                        if values.shape!=shape or values.dtype!=np.float64 or not np.isfinite(values).all():
+                            raise RuntimeError(f'{path}: invalid {prefix}_{suffix}')
+                    if (not np.allclose(z[f'{prefix}_soft_doc_sum'].sum(axis=1),z[f'{prefix}_soft_layer_sum'],rtol=1e-9,atol=1e-9) or
+                            not np.allclose(z[f'{prefix}_soft_doc_sumsq'].sum(axis=1),z[f'{prefix}_soft_layer_sumsq'],rtol=1e-9,atol=1e-9) or
+                            not np.allclose(z[f'{prefix}_soft_doc_prob_sum'].sum(axis=1),z[f'{prefix}_soft_prob_sum'],rtol=1e-9,atol=1e-9) or
+                            not np.allclose(z[f'{prefix}_soft_prob_sum'].sum(axis=1),n,rtol=1e-5)):
+                        raise RuntimeError(f'{path}: {prefix} document/expert reductions inconsistent')
+                    routes=z[f'{prefix}_routes']
+                    if routes.dtype!=np.uint8 or routes.shape!=route_shape or routes.shape[0]!=L or routes.size<L*n or routes.max()>=experts:
+                        raise RuntimeError(f'{path}: invalid {prefix} hard routing array')
+                    if experts==1:
+                        total=z[f'{prefix}_soft_layer_sum']
+                        if not (np.allclose(total[:,[0,1,4,5]],0,atol=1e-7) and np.allclose(total[:,[2,3]],n)):
+                            raise RuntimeError(f'{path}: E=1 soft metrics not structural')
+                    for suffix,keep in (('logits',sample_format in ('logits','both')),
+                                        ('probs',sample_format in ('probabilities','both') and experts>1)):
+                        sample=z[f'{prefix}_soft_sample_{suffix}']
+                        if sample.dtype!=np.float32 or sample.shape!=(L,expected if keep else 0,experts) or not np.isfinite(sample).all():
+                            raise RuntimeError(f'{path}: invalid {prefix} {suffix} sample')
+    return {'unique_npz':len(physical),'npz_bytes':sum(physical.values())}
+
+
 class SmokeRun:
     """One real training step and two small evaluations, never an LR trial."""
     def __init__(self, experts, optimizer):
@@ -108,6 +236,9 @@ class Coordinator:
         self.nice = args.nice
         self.hold_ft = getattr(args, 'hold_ft', False)
         self.checkpoint_retention = getattr(args, 'checkpoint_retention', None)
+        self.soft_policy = {'capture':getattr(args,'soft_router_capture',False),
+                            'sample_size':getattr(args,'soft_router_sample_size',8192),
+                            'sample_format':getattr(args,'soft_router_sample_format','logits')}
         self.work.mkdir(parents=True, exist_ok=True)
         self.selection = self.work / 'selection'; self.selection.mkdir(exist_ok=True)
         self.id = hashlib.sha256(str(self.work).encode()).hexdigest()[:10]
@@ -220,6 +351,42 @@ class Coordinator:
         if optimizer: args += ['--optimizer',optimizer]
         self.module('scripts.pretrain_sweep', args)
 
+    def check_ft_storage(self, trunks, label=None):
+        report = Path.home()/'orcd'/'.quota'
+        need = storage_requirements_gb(self.e,trunks,**self.soft_policy,retention=self.checkpoint_retention)
+        ledger = self.work.parent/'ft-storage-reservations.json'
+        # Serialize reservations between the three E coordinators. The quota
+        # report may already include partial writes from ongoing waves, so
+        # holding their full uncompressed budgets is deliberately conservative.
+        with ledger.with_suffix('.lock').open('w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            with report.open() as snapshot:
+                free = quota_free_gb(snapshot.read())
+                report_time = os.fstat(snapshot.fileno()).st_mtime
+            reservations = load(ledger) if ledger.exists() else {}
+            # A completed wave's bytes may not yet appear in the periodically
+            # updated quota report. Keep its reservation until a newer report.
+            reservations = {k:r for k,r in reservations.items()
+                            if r.get('completed_at') is None or r['completed_at']>=report_time}
+            key = f'{self.work}:{label}'
+            others = {tier:sum(r['required'][tier] for k,r in reservations.items() if k!=key) for tier in need}
+            print(f'E={self.e} FT wave uncompressed GB estimate {need}; reported free GB {free}; other reservations {others}',flush=True)
+            for tier in need:
+                if free[tier] < need[tier]+others[tier]:
+                    raise RuntimeError(f'{tier} quota cannot fit proposed FT wave: need estimated {need[tier]:.1f} GB plus {others[tier]:.1f} GB reserved, reported free {free[tier]:.1f} GB')
+            if label is not None:
+                reservations[key]={'required':need,'completed_at':None}; store(ledger,reservations)
+
+    def release_ft_storage(self,label):
+        ledger=self.work.parent/'ft-storage-reservations.json'
+        with ledger.with_suffix('.lock').open('w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            reservations=load(ledger) if ledger.exists() else {}
+            key=f'{self.work}:{label}'
+            if key in reservations and reservations[key].get('completed_at') is None:
+                reservations[key]['completed_at']=time.time()
+            store(ledger,reservations)
+
     def submit_smoke(self, wait=True):
         def smoke_jobs(directory):
             for opt in OPTS:
@@ -288,16 +455,37 @@ class Coordinator:
             raise RuntimeError(f'fine-tuning retention policy conflicts with existing workflow ({recorded})')
         if recorded is None and (self.work/'ft-initial'/'jobs.json').exists():
             raise RuntimeError('existing fine-tuning wave has no recorded retention policy; review before resume')
-        self.phase('ft-prepare',jobs={},checkpoint_retention=self.checkpoint_retention)
+        saved_soft = self.state.get('soft_router_policy')
+        if saved_soft is not None and saved_soft!=self.soft_policy:
+            raise RuntimeError('fine-tuning soft-router evidence policy conflicts with existing workflow')
+        if saved_soft is None and (self.work/'ft-initial'/'jobs.json').exists():
+            raise RuntimeError('existing FT wave has no recorded soft-router policy; review before resume')
+        self.phase('ft-prepare',jobs={},checkpoint_retention=self.checkpoint_retention,soft_router_policy=self.soft_policy)
         bases = [f'e{self.e}-main-{o}-s42' for o in OPTS]
         selection = load(final_file)
-        def ft_jobs(d, dataset_args, pair_args=()):
+        def ft_jobs(d, dataset_args, pair_args=(), seeds=(1,2,3)):
+            soft_args = (['--soft-router-capture','--soft-router-sample-size',self.soft_policy['sample_size'],
+                          '--soft-router-sample-format',self.soft_policy['sample_format']] if self.soft_policy['capture'] else ['--no-soft-router-capture'])
             self.module('scripts.finetune_jobs',['--selection',final_file,'--base-manifest',pin,'--base-runs',*bases,
                 *dataset_args,'--d0-file',self.scratch/'heldout/fineweb-edu-100b/d0.parquet',
-                '--seeds',1,2,3,'--out-root',self.ft_root,'--out',d,'--repo-dir',self.repo,'--job-prefix','ftpilot',
-                '--checkpoint-retention',self.checkpoint_retention,*pair_args])
+                '--seeds',*seeds,'--out-root',self.ft_root,'--out',d,'--repo-dir',self.repo,'--job-prefix','ftpilot',
+                '--checkpoint-retention',self.checkpoint_retention,*soft_args,*pair_args])
         dataset_arg = lambda name: ['--dataset',f'{name}={self.scratch}/finetune_data/{name}']
-        self.wave('ft-initial',lambda d: ft_jobs(d,[v for name in HORIZONS for v in dataset_arg(name)]))
+        if self.soft_policy['capture']:
+            def canary_jobs(d):
+                self.check_ft_storage(1,'ft-canary')
+                ft_jobs(d,dataset_arg('starcoderdata'),['--pairs','adamw:adamw','--pair-lr-fractions','adamw:adamw=0.25'],seeds=(1,))
+            self.wave('ft-canary',canary_jobs)
+            canary=verify_soft_canary(self.ft_root,self.e,selection['adamw']['full_lr']*.25,
+                                     self.soft_policy['sample_size'],self.soft_policy['sample_format'],self.checkpoint_retention)
+            self.release_ft_storage('ft-canary')
+            self.phase('ft-canary-verified',jobs={},canary=canary)
+            print(f'E={self.e} GPU canary verified: {canary}',flush=True)
+        def initial_ft(d):
+            self.check_ft_storage(120,'ft-initial')
+            ft_jobs(d,[v for name in HORIZONS for v in dataset_arg(name)])
+        self.wave('ft-initial',initial_ft)
+        self.release_ft_storage('ft-initial')
         for round_ in range(1000):
             plan_path = self.work/f'ft-round-{round_:03d}.json'
             # Finish a persisted extension plan before trying to analyze results
@@ -316,10 +504,12 @@ class Coordinator:
                 store(plan_path,[[list(k),fs] for k,fs in sorted(extensions.items())])
             if not extensions: break
             def extension_jobs(d):
+                self.check_ft_storage(3*sum(len(fs) for fs in extensions.values()),f'ft-edge-{round_:03d}')
                 for (dataset,pre,ft),fs in sorted(extensions.items()):
                     pair = f'{pre}:{ft}'; fracs = ','.join(map(str,fs))
                     ft_jobs(d,dataset_arg(dataset),['--pairs',pair,'--pair-lr-fractions',f'{pair}={fracs}'])
             self.wave(f'ft-edge-{round_:03d}',extension_jobs)
+            self.release_ft_storage(f'ft-edge-{round_:03d}')
         else: raise RuntimeError('fine-tuning extension did not converge')
         self.phase('complete',jobs={},base_manifest=str(pin),selection=str(final_file),analysis=str(self.work/'analysis'))
 
@@ -335,8 +525,13 @@ def main():
     parser.add_argument('--hold-ft',action='store_true',help='finish approved pretraining, pin bases, then hold before any FT job is generated or submitted')
     parser.add_argument('--checkpoint-retention',choices=('none','weights','weights+final_optimizer','full'),
                         help='explicitly agreed retention policy; absent policy blocks FT')
+    parser.add_argument('--soft-router-capture',action=argparse.BooleanOptionalAction,default=True,
+                        help='capture compact all-token soft-router evidence (default on)')
+    parser.add_argument('--soft-router-sample-size',type=int,default=8192)
+    parser.add_argument('--soft-router-sample-format',choices=('logits','probabilities','both'),default='logits')
     args=parser.parse_args()
-    if args.poll_seconds < 10 or args.nice < 0: parser.error('poll interval >=10s and nonnegative nice required')
+    if args.poll_seconds < 10 or args.nice < 0 or not 0<=args.soft_router_sample_size<=8192:
+        parser.error('poll interval >=10s, nonnegative nice, and sample size 0–8192 required')
     args.work_dir.mkdir(parents=True,exist_ok=True)
     with (args.work_dir/'coordinator.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

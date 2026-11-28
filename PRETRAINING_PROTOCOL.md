@@ -196,6 +196,14 @@ so that η·λ matches AdamW); seed-noise runs for the sweep.
   hard routing IDs. Later selected-LR full-state reruns are deferred until
   storage is arranged and separately agreed; E8 reruns are not approved now.
   The full retention implementation remains available for the deferred work.
+  **Rich evidence confirmed:** exact all-scored-token per-layer/per-document
+  soft confidence and base-vs-current distribution drift summaries (and
+  histograms); deterministic fixed sample of up to 8,192 scored tokens per
+  validation set with raw fp32 logits at each measured checkpoint, recover
+  sampled soft probabilities by softmax. Preserve identical sample positions
+  across checkpoints; no raw all-token soft distributions persisted. Track
+  quota and check wave capacity before submission; no silent downsampling
+  or removal of artifacts.
 
 Initial five-point ×2 search grid: AdamW centre 2e-3·E^-0.25; Muon centre
 4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16. These are bracket

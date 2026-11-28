@@ -40,6 +40,7 @@ Example:
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -72,6 +73,8 @@ from nanochat.train_config import (
     write_run_record,
 )
 from nanochat.training_stats import update_batch_fingerprint
+from nanochat.soft_routing import (DEFAULT_SAMPLE_SIZE, SAMPLE_FORMATS, SOFT_ROUTER_SCHEMA_VERSION,
+                                  SoftRoutingCapture, schema as soft_router_schema)
 
 CONVENTIONS = {
     "forgetting": "mean over scored D0 tokens of L(theta_1, r_1) - L(theta_0, r_0), nats",
@@ -81,7 +84,9 @@ CONVENTIONS = {
     "forced_route_gate": "the current model's own softmax probability of the forced expert",
     "route": "expert actually used, argmax(softmax(z) + selection bias), eval mode, dropless",
     "flip_cause_bias_side": "weight side (the selection bias is part of the router state)",
+    "flip_cause_positions": "legacy cause_* includes all packed positions; cause_scored_* restricts to scored targets (doc_ids>=0)",
     "optimizer_state": "fresh in every cell",
+    "soft_router": "exact means on scored token positions; equal-weight means across MoE layers",
     "data_order": "seed k gives the same batch sequence in every cell (paired design)",
 }
 
@@ -96,14 +101,18 @@ def forward_losses(model, x, y, forced=None, capture=None):
 
 
 @torch.no_grad()
-def evaluate_base(model0, eval_set, batch_size, device):
+def evaluate_base(model0, eval_set, batch_size, device, soft_sample_size=None, soft_sample_format="logits"):
     """Base-model pass: per-token losses, routes, router margins and per-doc sums."""
     model0.eval()
     layers = model0.moe_layer_indices
     losses, routes, margins = [], {l: [] for l in layers}, {l: [] for l in layers}
-    for _, x, y in eval_set.batches(batch_size):
+    soft = (SoftRoutingCapture(eval_set, layers, model0.config.n_experts, soft_sample_size, soft_sample_format)
+            if soft_sample_size is not None else None)
+    for start, x, y in eval_set.batches(batch_size):
         cap = []
         losses.append(forward_losses(model0, x.to(device), y.to(device), capture=cap).cpu())
+        if soft is not None:
+            soft.add_batch(start, eval_set.doc_ids[start:start+x.shape[0]], cap)
         for entry in cap:
             routes[entry["layer"]].append(entry["choices"].to(torch.uint8).cpu())
             margin = top2_margin(entry["logits"])
@@ -113,7 +122,8 @@ def evaluate_base(model0, eval_set, batch_size, device):
     sums, counts = per_doc_sums(loss, eval_set.doc_ids, eval_set.n_docs)
     return {"loss": loss, "doc_sums": sums, "doc_counts": counts,
             "routes": {l: torch.cat(r) for l, r in routes.items()},
-            "margin": {l: float(torch.cat(m).mean()) if m else None for l, m in margins.items()}}
+            "margin": {l: float(torch.cat(m).mean()) if m else None for l, m in margins.items()},
+            "soft": soft.finish() if soft is not None else None}
 
 
 def router_state(model, layer):
@@ -132,7 +142,13 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
     sums = {k: torch.zeros(eval_set.n_docs, dtype=torch.float64) for k in ("normal", "replay", "reverse")}
     doc_flips = torch.zeros(eval_set.n_docs, len(layers), dtype=torch.float64)
     routes1 = {l: [] for l in layers}
-    cause = {l: {"flips": 0, "input_driven": 0, "weight_driven": 0, "either": 0, "interaction": 0} for l in layers}
+    base_soft = base.get("soft")
+    soft = (SoftRoutingCapture(eval_set, layers, n_experts, base_soft.sample_size, base_soft.sample_format, base=base_soft)
+            if base_soft is not None else None)
+    cause_fields = ("flips", "input_driven", "weight_driven", "either", "interaction")
+    if soft is not None:
+        cause_fields += tuple(f"scored_{key}" for key in cause_fields)
+    cause = {l: dict.fromkeys(cause_fields, 0) for l in layers}
     for start, x, y in eval_set.batches(batch_size):
         x, y = x.to(device), y.to(device)
         rows = slice(start, start + x.size(0))
@@ -140,6 +156,8 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
         r0 = {l: base["routes"][l][rows].to(device=device, dtype=torch.long) for l in layers}
         cap1 = []
         loss = forward_losses(model1, x, y, capture=cap1).cpu()
+        if soft is not None:
+            soft.add_batch(start, ids, cap1)
         normal_sums = per_doc_sums(loss, ids, eval_set.n_docs)[0]
         sums["normal"] += normal_sums
         r1 = {}
@@ -160,12 +178,14 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
         sums["replay"] += per_doc_sums(forward_losses(model1, x, y, forced=r0).cpu(), ids, eval_set.n_docs)[0]
         sums["reverse"] += per_doc_sums(forward_losses(model0, x, y, forced=r1).cpu(), ids, eval_set.n_docs)[0]
         cap0 = []
+        score_mask = (ids >= 0).to(device) if soft is not None else None
         forward_losses(model0, x, y, capture=cap0)
         for e0, e1 in zip(cap0, cap1):
             l = e0["layer"]
             w0, b0 = router_state(model0, l)
             w1, b1 = router_state(model1, l)
-            counts = flip_cause_counts(e0["inputs"], e1["inputs"], w0, w1, r0[l], r1[l], b0, b1)
+            counts = flip_cause_counts(e0["inputs"], e1["inputs"], w0, w1, r0[l], r1[l], b0, b1,
+                                       scored_mask=score_mask)
             for key, value in counts.items():
                 cause[l][key] += value
     if full and n_experts == 1:
@@ -176,9 +196,16 @@ def evaluate_checkpoint(model1, model0, eval_set, base, batch_size, device, full
     for i, l in enumerate(layers):
         stats = route_comparison(base["routes"][l][scored], routes1[l][scored], n_experts)
         if full:
+            if soft is not None:
+                actual_flips = int((base["routes"][l][scored] != routes1[l][scored]).sum())
+                if cause[l]["scored_flips"] != actual_flips:
+                    raise RuntimeError(f"scored flip cause count disagrees with hard route table for layer {l}")
             stats.update({f"cause_{k}": v for k, v in cause[l].items()})
+        if soft is not None:
+            stats.update(soft.layer_means(l))
         per_layer[l] = stats
-    return {"doc_sums": sums, "doc_flips": doc_flips, "routes": routes1, "per_layer": per_layer}
+    return {"doc_sums": sums, "doc_flips": doc_flips, "routes": routes1, "per_layer": per_layer,
+            "soft": soft.finish() if soft is not None else None}
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +306,62 @@ def train_steps(args, ctx, optimizer, loader, state, first, last, branch, on_che
             return False
         on_checkpoint(step, train_loss)
     return True
+
+
+def combined_soft_arrays(d0, d1, include_positions=False):
+    if d0.get("soft") is None and d1.get("soft") is None:
+        return {}
+    if d0.get("soft") is None or d1.get("soft") is None:
+        raise ValueError("soft router capture must cover both evaluation sets")
+    return {"soft_router_schema_version": np.asarray(SOFT_ROUTER_SCHEMA_VERSION),
+            **d0["soft"].arrays("d0", include_positions),
+            **d1["soft"].arrays("d1", include_positions)}
+
+
+def pin_soft_router_schema(base_dir, capture_schema, reference_identity):
+    """Protect the shared reference sample against concurrent incompatible jobs.
+
+    Existing historical runs have no rich schema. Do not silently reinterpret
+    their base arrays or overwrite a reference with a different sample policy.
+    """
+    path = base_dir / "soft_router_schema.json"
+    if not path.exists() and (base_dir / "base_arrays.npz").exists():
+        previous = json.loads((base_dir / "base_metrics.json").read_text()).get("soft_router")
+        if previous != capture_schema:
+            raise RuntimeError(f"{base_dir}: existing reference uses a different router evidence schema; use a new output root")
+    claim = {"schema": capture_schema, "reference": reference_identity}
+    tmp = base_dir / f".soft_router_schema.{uuid.uuid4().hex}.json"
+    write_json_atomic(tmp, claim)
+    try:
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+        if json.loads(path.read_text()) != claim:
+            raise RuntimeError(f"{base_dir}: existing router sample/schema differs; use a new output root")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def validate_soft_router_evidence(run_dir, result, config, ctx):
+    expected = ctx["soft_router"]
+    if config.get("soft_router") != expected or result.get("soft_router") != expected:
+        raise RuntimeError(f"{run_dir}: finalized branch used different soft router evidence; not overwriting")
+    if expected is None:
+        return
+    hashes = {prefix: base["soft"].positions_sha256
+              for prefix, base in (("d0", ctx["base_d0"]), ("d1", ctx["base_d1"]))}
+    fields = {f"{prefix}_{name}" for prefix in ("d0", "d1") for name in expected["arrays"]
+              if name not in ("soft_sample_positions", "soft_sample_doc_ids")}
+    fields.add("soft_router_schema_version")
+    for point in result["curve"]:
+        path = run_dir / f"ckpt_{point['step']:06d}.npz"
+        if not path.is_file():
+            raise RuntimeError(f"{run_dir}: missing router evidence {path.name}")
+        with np.load(path, allow_pickle=False) as arrays:
+            if (not fields.issubset(arrays.files) or arrays["soft_router_schema_version"].item() != expected["version"]
+                or any(arrays[f"{prefix}_soft_sample_positions_sha256"].item() != digest for prefix, digest in hashes.items())):
+                raise RuntimeError(f"{path}: incomplete or incompatible soft router evidence")
 
 
 CHECKPOINT_RETENTION = ("none", "weights", "weights+final_optimizer", "full")
@@ -442,6 +525,7 @@ def run_cell(args, cell, ctx):
                 or raw.get("args", {}).get("device_batch_size") != args.device_batch_size):
                 raise RuntimeError(f"{run_dir}: finalized cell provenance conflicts with the requested pin/data/schedule")
         validate_retained_states(run_dir, done, raw, args.checkpoint_retention)
+        validate_soft_router_evidence(run_dir, done, raw, ctx)
         b.done = True
     if all(b.done for b in branches):
         print0(f"Skipping {name}: all finalized branches have requested retention")
@@ -488,7 +572,8 @@ def run_cell(args, cell, ctx):
                                 "branch": {"lengths": lengths, "branch_point": b.branch_point,
                                            "trunk_steps": trunk.steps} if len(branches) > 1 else None,
                                 "conventions": CONVENTIONS, "balancer_mode": args.balancer_mode,
-                                "checkpoint_retention": args.checkpoint_retention, "attempt_id": attempt_id})
+                                "checkpoint_retention": args.checkpoint_retention, "attempt_id": attempt_id,
+                                "soft_router": ctx["soft_router"]})
     loader = ReplayLoader(tokenizing_distributed_data_loader_with_state_bos_bestfit(
         ctx["tokenizer"], args.device_batch_size, ctx["seq_len"], split="train", device=device,
         data_dir=args.ft_data_dir, shuffle_seed=seed))
@@ -532,6 +617,7 @@ def run_cell(args, cell, ctx):
             "warmup_steps": ctx["warmup"], "decay_steps": b.decay,
             "final_learning": final.get("learning"), "final_forgetting": final.get("forgetting"),
             "checkpoint_retention": args.checkpoint_retention, "attempt_id": attempt_id,
+            "soft_router": ctx["soft_router"],
             "curve": b.curve, "data_fingerprint": int(state["fingerprint"]), "wall_time_s": time.time() - t0,
             "cumulative_expert_counts": state["counts"].cpu().tolist(),
         })
@@ -588,6 +674,9 @@ def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
     entry = {"step": step, "tokens": tokens, "loss_d0": l1_d0, "loss_d1": l1_d1,
              "forgetting": l1_d0 - l0_d0, "learning": l0_d1 - l1_d1,
              "F_route": l1_d0 - replay, "F_fixed": replay - l0_d0, "reverse_order": reverse - l0_d0}
+    if d0.get("soft") is not None:
+        entry.update(d0["soft"].across_layer_means("d0"))
+        entry.update(d1["soft"].across_layer_means("d1"))
     rho = expert_relative_change(model, ctx["base_state"], model.config.n_experts)
     layers = model.moe_layer_indices
     for i, l in enumerate(layers):
@@ -595,7 +684,10 @@ def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
         d0["per_layer"][l]["ft_tokens_per_expert"] = cumulative_counts[i].cpu().tolist()
     rows = cell_rows(meta, step, tokens, "D0", {k: v for k, v in entry.items() if k not in ("step", "tokens")},
                      d0["per_layer"])
-    rows += cell_rows(meta, step, tokens, "D1", {"loss": l1_d1, "learning": entry["learning"]}, d1["per_layer"])
+    rows += cell_rows(meta, step, tokens, "D1",
+                      {"loss": l1_d1, "learning": entry["learning"],
+                       **(d1["soft"].across_layer_means("d1") if d1.get("soft") is not None else {})}, d1["per_layer"])
+    soft_arrays = combined_soft_arrays(d0, d1)
     replace_atomic(run_dir / f"ckpt_{step:06d}.npz", lambda f: np.savez_compressed(
         f,
         d0_doc_loss=d0["doc_sums"]["normal"].numpy(), d0_doc_loss_replay=d0["doc_sums"]["replay"].numpy(),
@@ -603,7 +695,7 @@ def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
         d1_doc_loss=d1["doc_sums"]["normal"].numpy(), d1_doc_flips=d1["doc_flips"].numpy(),
         d0_routes=torch.stack([d0["routes"][l] for l in layers]).numpy(),
         d1_routes=torch.stack([d1["routes"][l] for l in layers]).numpy(),
-        layers=np.array(layers)))
+        layers=np.array(layers), **soft_arrays))
     return rows, entry
 
 
@@ -699,6 +791,12 @@ def main(argv=None):
                         help="embedding and lm_head AdamW LRs = pretraining defaults x this, identical in every cell")
     parser.add_argument("--checkpoint-retention", choices=CHECKPOINT_RETENTION, default="full",
                         help="model/optimizer state saved at measured checkpoints (default: full)")
+    parser.add_argument("--soft-router-capture", action=argparse.BooleanOptionalAction, default=True,
+                        help="save exact scored-token soft router summaries; default enabled")
+    parser.add_argument("--soft-router-sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
+                        help="fixed scored token sample per evaluation set (0 disables raw sample)")
+    parser.add_argument("--soft-router-sample-format", choices=SAMPLE_FORMATS, default="logits",
+                        help="raw fp32 sample format; logits preserve absolute scale (default)")
     parser.add_argument("--checkpoint-spacing", choices=("log", "linear"), default="log",
                         help="log: 2, 4, 8, ... in the constant phase, its end, mid-decay, last step")
     parser.add_argument("--n-checkpoints", type=int, default=10, help="with --checkpoint-spacing linear")
@@ -709,6 +807,8 @@ def main(argv=None):
     parser.add_argument("--out-root", default=None, help="default: <base_dir>/finetune")
     parser.add_argument("--device-type", default="")
     args = parser.parse_args(argv)
+    if not 0 <= args.soft_router_sample_size <= DEFAULT_SAMPLE_SIZE:
+        parser.error(f"--soft-router-sample-size must be between 0 and {DEFAULT_SAMPLE_SIZE}")
     lrs = parse_lrs(args.lrs)
     for name, grid in lrs.items():  # cell directories are named by lr_tag (3 significant digits)
         if len({lr_tag(lr) for lr in grid}) != len(grid):
@@ -745,13 +845,25 @@ def main(argv=None):
     eval_identity = {s.name: {"file": s.source_file, "sha256": s.source_sha256, "rows": s.inputs.size(0),
                               "seq_len": seq_len, "scored_tokens": s.n_scored, "documents": s.n_docs,
                               "packing": s.packing} for s in (d0, d1)}
+    capture_schema = (soft_router_schema(args.soft_router_sample_size, args.soft_router_sample_format)
+                      if args.soft_router_capture else None)
+    # The sample coordinates are interpreted through these exact packed
+    # evaluation tensors, not just through a common token-count convention.
+    ref_identity = {"base_model_sha256": model_sha256, "base_step": base_step,
+                    "eval_sets": {s.name: {**{k:v for k,v in eval_identity[s.name].items() if k != "file"},
+                        **{f"{key}_sha256": hashlib.sha256(
+                            getattr(s, key).numpy().astype("<i8", copy=False).tobytes()).hexdigest()
+                           for key in ("inputs", "targets", "doc_ids")}}
+                        for s in (d0, d1)}}
+    pin_soft_router_schema(out_dir / "base", capture_schema, ref_identity)
     for s in (d0, d1):
         # atomic: concurrent jobs of the same base model and dataset write the same base files
         replace_atomic(out_dir / "base" / f"eval_set_{s.name}.pt", s.save)
 
     # Base model at step 0 (once per base model and dataset)
-    base_d0 = evaluate_base(model0, d0, args.eval_batch_size, device)
-    base_d1 = evaluate_base(model0, d1, args.eval_batch_size, device)
+    sample_size = args.soft_router_sample_size if args.soft_router_capture else None
+    base_d0 = evaluate_base(model0, d0, args.eval_batch_size, device, sample_size, args.soft_router_sample_format)
+    base_d1 = evaluate_base(model0, d1, args.eval_batch_size, device, sample_size, args.soft_router_sample_format)
     layers = model.moe_layer_indices
     E = model.config.n_experts
     half = d0.n_docs // 2
@@ -769,6 +881,12 @@ def main(argv=None):
             "separation_two_halves_d0": separation(load_shares(base_d0["routes"][l][first_half], E),
                                                    load_shares(base_d0["routes"][l][second_half], E)),
             "margin_d0": base_d0["margin"][l], "margin_d1": base_d1["margin"][l]}
+    if capture_schema is not None:
+        base_summary["soft_router"] = capture_schema
+        base_summary["soft_router_reference"] = ref_identity
+        for l in layers:
+            base_summary["layers"][l]["soft_d0"] = base_d0["soft"].layer_means(l)
+            base_summary["layers"][l]["soft_d1"] = base_d1["soft"].layer_means(l)
     if model.config.balancer == "bias":
         base_summary["expert_bias"] = model.expert_bias_state().cpu().tolist()
     write_json_atomic(out_dir / "base" / "base_metrics.json", base_summary)
@@ -776,7 +894,8 @@ def main(argv=None):
         f, d0_doc_loss=base_d0["doc_sums"].numpy(), d0_doc_tokens=base_d0["doc_counts"].numpy(),
         d1_doc_loss=base_d1["doc_sums"].numpy(), d1_doc_tokens=base_d1["doc_counts"].numpy(),
         d0_routes=torch.stack([base_d0["routes"][l] for l in layers]).numpy(),
-        d1_routes=torch.stack([base_d1["routes"][l] for l in layers]).numpy(), layers=np.array(layers)))
+        d1_routes=torch.stack([base_d1["routes"][l] for l in layers]).numpy(), layers=np.array(layers),
+        **combined_soft_arrays(base_d0, base_d1, include_positions=True)))
     print0(f"Base: D0 loss {base_summary['loss_d0']:.4f}, D1 loss {base_summary['loss_d1']:.4f}")
 
     ctx = {
@@ -792,7 +911,7 @@ def main(argv=None):
                           **({"logical_run": args.base_run, "checkpoint_run": base_dir.name, "n_experts": pin.n_experts}
                              if pin is not None and pin.n_experts != 8 else {})},
         "ft_train_files": {Path(f).name: file_sha256(f) for f in ft_files[:-1]},
-        "eval_identity": eval_identity, "d0": d0, "d1": d1, "base_d0": base_d0, "base_d1": base_d1,
+        "eval_identity": eval_identity, "soft_router": capture_schema, "d0": d0, "d1": d1, "base_d0": base_d0, "base_d1": base_d1,
         "main_steps": args.train_tokens // args.total_batch_size,
         "branch_steps": [t // args.total_batch_size for t in args.branch_tokens],
         # warmup is fixed in steps by the main length, so every branch length shares it

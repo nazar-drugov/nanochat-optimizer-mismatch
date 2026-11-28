@@ -124,6 +124,25 @@ def test_flip_cause_classes():
     assert flip_cause_counts(h0, h0, w0, w0, r0, r0)["flips"] == 0
 
 
+def test_flip_cause_scored_masks_all_classes_without_changing_legacy_counts():
+    # Old router picks by first input coordinate, current by second.
+    w0 = torch.tensor([[1., 0.], [0., 0.]])
+    w1 = torch.tensor([[0., 1.], [0., 0.]])
+    h0 = torch.tensor([[1.,1.], [1.,-1.], [1.,-1.], [1.,1.], [1.,1.]])
+    h1 = torch.tensor([[-1.,-1.], [1.,-1.], [-1.,-1.], [1.,-1.], [1.,1.]])
+    r0, r1 = select_experts(h0 @ w0.T), select_experts(h1 @ w1.T)
+    mask = torch.tensor([True, False, True, False, True])
+    legacy = flip_cause_counts(h0, h1, w0, w1, r0, r1)
+    scored = flip_cause_counts(h0, h1, w0, w1, r0, r1, scored_mask=mask)
+    assert legacy == {"flips":4, "input_driven":1, "weight_driven":1, "either":1, "interaction":1}
+    assert {k: scored[k] for k in legacy} == legacy
+    assert {k: scored[f"scored_{k}"] for k in legacy} == {
+        "flips":2, "input_driven":1, "weight_driven":0, "either":1, "interaction":0}
+    assert scored["scored_flips"] == int((r0[mask] != r1[mask]).sum())
+    with pytest.raises(ValueError, match="boolean mask"):
+        flip_cause_counts(h0, h1, w0, w1, r0, r1, scored_mask=mask.long())
+
+
 def test_expert_relative_change():
     config = GPTConfig(sequence_len=16, vocab_size=32, n_layer=2, n_head=2, n_kv_head=2, n_embd=16,
                        ffn_type="moe", n_experts=3)
@@ -210,14 +229,38 @@ def test_finetune_end_to_end(tiny_setup):
     assert {"flip_rate", "tv", "churn", "chance_flip_rate", "rho", "ft_tokens_per_expert", "cause_flips"} <= set(layer_row)
     assert layer_row["cause_flips"] == sum(layer_row[f"cause_{k}"] for k in
                                            ("input_driven", "weight_driven", "either", "interaction"))
+    for row in rows:
+        if row["eval_set"] == "D0" and row["layer"] >= 0:
+            assert row["cause_scored_flips"] == round(row["flip_rate"] * config["data"]["eval_sets"]["D0"]["scored_tokens"])
+            assert row["cause_scored_flips"] == sum(row[f"cause_scored_{k}"] for k in
+                ("input_driven", "weight_driven", "either", "interaction"))
+            assert row["cause_scored_flips"] <= row["cause_flips"]
     assert pq.read_table(run / "metrics.parquet").num_rows == len(rows)
     arrays = np.load(run / "ckpt_000008.npz")
     assert arrays["d0_routes"].dtype == np.uint8 and arrays["d0_routes"].shape[0] == 2
+    from nanochat.soft_routing import METRICS
+    with np.load(out/"base"/"base_arrays.npz") as base_arr:
+        for d in ("d0", "d1"):
+            assert arrays[f"{d}_soft_sample_logits"].dtype == np.float32
+            assert arrays[f"{d}_soft_sample_logits"].shape[0] == 2
+            assert arrays[f"{d}_soft_sample_probs"].size == 0
+            assert np.array_equal(arrays[f"{d}_soft_doc_counts"], base_arr[f"{d}_doc_tokens"])
+            assert arrays[f"{d}_soft_sample_positions_sha256"] == base_arr[f"{d}_soft_sample_positions_sha256"]
+            assert arrays[f"{d}_soft_layer_sum"].shape == (2, len(METRICS))
+            assert f"soft_{d}_entropy_nats_mean" in results["muon-lr0.003-s1"]["curve"][-1]
+    assert config["soft_router"]["sample_format"] == "logits"
+    assert {"soft_entropy_nats_mean", "soft_js_base_current_nats_mean", "soft_raw_z_loss_mean"} <= set(layer_row)
+    assert "soft_entropy_nats_mean" in pq.read_table(run/"metrics.parquet").schema.names
+    assert "cause_scored_flips" in pq.read_table(run/"metrics.parquet").schema.names
 
     # A resubmitted job skips finished cells
     before = (run / "result.json").stat().st_mtime_ns
     run_finetune(tiny_setup, "--lrs", "muon=3e-3", "--seeds", "1", "--checkpoint-spacing", "linear",
                  "--n-checkpoints", "2")
+    assert (run / "result.json").stat().st_mtime_ns == before
+    with pytest.raises(RuntimeError, match="router sample/schema differs"):
+        run_finetune(tiny_setup, "--lrs", "muon=3e-3", "--seeds", "1", "--checkpoint-spacing", "linear",
+                     "--n-checkpoints", "2", "--soft-router-sample-size", "0")
     assert (run / "result.json").stat().st_mtime_ns == before
 
 
@@ -230,11 +273,15 @@ def test_self_replay_identity_and_unchanged_model_has_no_forgetting(tiny_setup):
     device = torch.device("cpu")
     model, tok, _ = build_model(str(tiny_setup["root"] / "base_checkpoints" / "tiny-base"), 10, device, "eval")
     d0 = build_eval_set("D0", tiny_setup["d0"], get_tokenizer("gpt2"), 64, 512)
-    base = evaluate_base(model, d0, 4, device)
+    base = evaluate_base(model, d0, 4, device, soft_sample_size=16)
     same = evaluate_checkpoint(model, model, d0, base, 4, device, full=True)
     for key in ("normal", "replay", "reverse"):
         torch.testing.assert_close(same["doc_sums"][key], base["doc_sums"], rtol=1e-6, atol=1e-6)
     assert all(stats["flip_rate"] == 0 and stats["cause_flips"] == 0 for stats in same["per_layer"].values())
+    for stats in same["per_layer"].values():
+        assert stats["soft_js_base_current_nats_mean"] == 0.
+        assert stats["soft_tv_base_current_mean"] == 0.
+    np.testing.assert_array_equal(base["soft"].sample_logits, same["soft"].sample_logits)
 
 
 def test_starcoder_heldout_sample_is_seeded_and_shuffled():
@@ -338,7 +385,7 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
                        "--ft-data-dir", str(tiny_setup["ft"]), "--ft-name", "tiny", "--d0-file", str(tiny_setup["d0"]),
                        "--out-root", str(out), "--device-type", "cpu", "--eval-tokens", "512",
                        "--eval-batch-size", "4", "--train-tokens", str(tokens), "--total-batch-size", "128",
-                       "--device-batch-size", "2", "--checkpoint-retention", "none", *common])
+                       "--device-batch-size", "2", "--checkpoint-retention", "none", "--no-soft-router-capture", *common])
         single = json.loads((out / "tiny-base" / "tiny" / "muon-lr0.003-s1" / "result.json").read_text())
         branch_result = results[f"muon-lr0.003-s1-{branch}"]
         assert single["data_fingerprint"] == branch_result["data_fingerprint"]

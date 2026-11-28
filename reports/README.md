@@ -12,6 +12,7 @@ newer; these are snapshots taken 2026-11-26 (each file's header names its source
 | `matched_learning_analysis.md` | Local report | Headline 2×2 minimum-forgetting F at endpoint and within-run learning thresholds, paired contrasts, seed SDs and sensitivity | Complete for E=8; document bootstrap and replay analysis remain open |
 | `sparsity_extension_plan.md` | Local report | E=1 dense control and E=4/16 extension design, LR tuning, implementation blockers, compute estimates, decisions | Initial seed-42, three-horizon plan approved; see launch report |
 | `finetune_checkpoint_storage_plan.md` | Local report | Actual ORCD quota and measured checkpoint sizes, hard-link deduplication, retention scope and registry | Storage decision needed for full state retention |
+| `finetune_rich_router_capture.md` | Local report | Approved compact all-token router summaries, raw sampled logits, correct scored flip attribution, tests and GPU canary | Implemented and reviewed; FT deployment awaits transition approval |
 | `sparsity_launch_report.md` | Local report | Reviewed implementation, pinned cluster checkout, E=1/4/16 launch IDs, workflow ledgers and pending gates | Submitted 2026-11-27; awaiting Slurm scheduling |
 | `sparsity_e1_pretraining_lr_sweep.md` | Local report | Dense E1 seed-42 0.5B independent LR selection and transfer jobs | Complete; 3B checks queued |
 | `sparsity_e4_pretraining_lr_sweep.md` | Local report | E4 seed-42 0.5B independent LR selection and transfer jobs | Complete; 3B checks queued |

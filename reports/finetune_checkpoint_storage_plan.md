@@ -1,9 +1,12 @@
 # Fine-tuning checkpoint retention: storage estimate and inventory design
 
-**2026-11-27 · Planning evidence, not a retention-scope authorization.** Harry
-requests preserving actual weights and optimizer state at measured fine-tuning
-checkpoints in addition to the evaluation/routing records. This report quantifies
-the practical constraint on carrying out that instruction at the current scale.
+**2026-11-27 · Retention scope agreed for initial pilots; selected-state archive
+capacity still open.** Harry requests preserving actual weights and optimizer
+state at measured fine-tuning checkpoints in addition to evaluation/routing
+records when practical. The initial E1/4/16 pilots will instead retain richer
+router evidence without binary model/optimizer states, because full state
+retention exceeds the currently allocated storage. Selected-LR actual-state
+reruns will require a separate storage decision.
 No cluster storage allocation, migration, deletion, pruning, or training change
 was performed for this calculation.
 
@@ -185,13 +188,142 @@ backup for retained binary states. The pretraining persistence path already
 excludes model/optimizer tensors. Do not delete existing pool files or move
 old evidence as part of this change.
 
-## Decision required
+## Agreed initial-pilot router evidence: cost estimate
+
+The decision for the initial LR pilots is **no binary weight or optimizer
+snapshots**, more informative all-token router summaries and a fixed raw
+sample at every existing measured checkpoint, including step zero. This
+preserves evidence before selecting an LR without spending tens of terabytes.
+The separate proposed 60-step save cadence is deferred; do not silently
+change the log-spaced scientific measurement schedule.
+
+The actual held-out identities from clean E8 seed-42 configurations are:
+
+| Evaluation set | Packed tensor shape | Scored tokens | Scored documents |
+|---|---|---:|---:|
+| D0 FineWeb-Edu | 512 × 2048 | 1,047,614 | 1,474 |
+| StarCoderData D1 | 512 × 2048 | 1,047,642 | 1,446 |
+| WikiText-103 D1 | 512 × 2048 | 1,048,461 | 627 |
+
+Thus one checkpoint has 2,920 document records (SC) or 2,101 (WT) across the
+two evaluation populations. The fixed sample is at most 8,192 **scored**
+token positions per D0/D1, reused across checkpoints and aligned with the
+base evaluation. It is not an independent random sample at each checkpoint.
+
+The bounded raw FP32 sample uses one or both of logits and softmax
+probabilities for every sampled token, expert and layer on each set.
+Storing logits alone costs 2 sets × 8,192 × 10 layers × E × 4 bytes =
+655,360 E bytes per checkpoint; storing both doubles the sample term
+(except E1 softmax probabilities are structural ones and need no array).
+Logits retain information about additive shifts and z-loss that raw
+probabilities alone do not. Full raw route IDs (uint8) on all packed positions add
+20,971,520 bytes per checkpoint. This includes D1 routes, which the old FT
+NPZs omitted.
+
+The implemented exact all-scored-token statistics use
+per-document/layer FP64 sums and sums of squares for seven scalar diagnostics
+(entropy, top-two margin, chosen gate, maximum probability, JS, TV and raw z-loss)
+and one FP64 soft-expert probability sum per document/layer/expert. The
+per-document term is therefore 10 × (D0 documents + D1 documents) ×
+8 × (14 + E) bytes. Layer counts/totals, 32-bin histograms and edges, sample indices
+stored once in the base record, and metadata are small relative to the
+sample matrices; existing document loss/flip arrays also add about
+0.21–0.28 MB per state. Undefined E1 metrics remain explicitly null;
+trivial structural-zero/one arrays compress well and need not dominate
+actual storage. This estimate includes the known aggregate arrays and will
+be checked against the first real compressed checkpoint file.
+
+| E | Sample logits only (MB/state) | All-token summary, SC / WT (MB/state) | Total raw state (logits only), SC / WT (MB/state) | Initial grid, logits only (GB) | Initial grid, both raw matrices (GB) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.66 | 3.57 / 2.58 | 25.48 / 24.42 | 53.9 | 53.9 |
+| 4 | 2.62 | 4.27 / 3.09 | 28.15 / 26.89 | 59.4 | 65.1 |
+| 16 | 10.49 | 7.08 / 5.10 | 38.81 / 36.77 | 81.6 | 104.3 |
+| **Total** | | | | **195.0** | **223.3** |
+
+These are 1,080 unique states per corpus per E (2,160 per E), not 3,600
+logical branch links. The all-token summaries and sampled logits alone add
+about 58 GB total over full hard routes and existing
+document-level arrays. Each one-pair/corpus LR extension adds 54 unique
+states, at most about 1.4 GB E1, 1.6 GB E4, or 2.1 GB E16 with logits alone
+(about 2.7 GB E16 if both matrices are retained).
+Actual NPZs are compressed and can be far smaller: for example the
+historical E8 SC 60-step AdamW→AdamW seed-1 endpoint at the selected LR
+1.311e−3 is 4,221,841 bytes on scratch (only D0 route IDs). Raw FP32 data
+likely compress less than uint8 routes. The base snapshots and shared
+packed evaluation sets are additional (order 1 GB over this initial pilot).
+
+For an independent serialization check only (no model training or real data),
+we created temporary, shape-matched NPZ fixtures with uniformly random uint8
+routes, high-entropy seeded random float32/float64 soft arrays, and the E1
+structural all-zero route IDs. NumPy's compressed NPZ sizes were:
+
+| E | Compressed SC / WT state, logits-only (MB) | Initial grid extrapolation, logits-only (GB) | Both matrices (GB) |
+|---:|---:|---:|---:|
+| 1 | 4.23 / 3.24 | 8.1 | 8.1 |
+| 4 | 12.83 / 11.64 | 26.4 | 31.5 |
+| 16 | 28.57 / 26.64 | 59.6 | 79.9 |
+| **Total** | | **94.1** | **119.5** |
+
+The fixtures deliberately do not reproduce actual metric distributions and
+are not a storage upper bound or a cluster benchmark. They illustrate that
+the compression assumptions can plausibly reduce total pilot storage to
+roughly half the raw sizing; real arrays must be checked during rollout.
+Local compression of these fixtures took about 0.1–3 seconds per unique
+state, not including any router computation or cluster I/O.
+
+**Capacity assessment:** the personal pool has 976 GB free in the last
+quota report, enough even for the conservative 224 GB evaluation mirror.
+Scratch has only 610 GB of reported free space; unlike pool, it also
+retains pretraining binary states. A conservative remaining pretraining
+budget from the last report could be approximately 20 GB (E1 extra
+transfer/final), 80 GB (E4 transfer/final), and up to 319 GB (E16 smoke,
+0.5B sweep, 3B checks and two displaced-vertex final models), before
+additional LR edges. Some E1/4 work after the quota timestamp is already
+complete, so this is a planning upper estimate, not a new usage reading.
+The uncompressed combined worst case could exceed scratch by tens of
+GB; actual compressed arrays and reuse of checked transfer-center bases
+should lower requirements. With the synthetic logits-only compressed
+estimate, the combined 420 GB remaining pretraining allowance + 94 GB
+pilot arrays would leave about 96 GB headroom before extra LR trials and
+other overhead; this is only a planning scenario. Do not declare the entire pipeline guaranteed
+to fit a stale quota. Measure compressed NPZ bytes after a representative
+cell, refresh quota at each workflow phase and before E16 FT and large LR
+extensions, and settle extra space if needed. No silent evidence deletion.
+
+Pure writes of 195–223 GB take about 3.3–18.6 aggregate minutes at illustrative
+1–0.2 GB/s sustained; mirroring duplicates the writes. The 58 GB increment
+for logits and exact soft summaries would take approximately 1–4.8 minutes of pure writes. Actual computation
+of all-token diagnostics, device transfers, compression and I/O
+contention may dominate; these are not measured ORCD performance results.
+Caching base soft log-probabilities for both full scored sets in FP32 takes
+at most ~1.34 GB of CPU RAM at E16 (omitted in E1). The implementation batches
+the exact calculations against this transient CPU cache instead of persisting
+full million-token soft tensors at every checkpoint.
+At E16 two sets × 1.05M positions × 10 layers × 16 experts is ~335 million
+probability values per measured state; timing needs validation on the
+actual device and cannot be inferred from disk bytes alone. For E≥4, the
+current batched reduction copies the base log-probabilities to the device
+and the current probabilities plus seven scalar values back to CPU for
+FP64 reductions. At E16 that is on the order of 3.3 GB of transient
+device/host transfer per measured state (not stored), or ~7 TB over the
+initial grid. Short batches avoid a persistent GPU tensor of that size,
+but CPU reduction/compression and synchronization warrant timing checks
+on the first real jobs. E1 uses an explicit structural shortcut.
+
+The added evidence is stored in the existing `ckpt_*.npz` and
+`base_arrays.npz` files, so the established NPZ inventory and scratch/pool
+mirror recognize it without a new binary-state schema. Preserve branch/
+base provenance and sample indices; do not upload raw router arrays to W&B
+merely for tracking.
+
+## Later actual-state retention remains a storage decision
 
 The storage constraint is material. Full retention for all initial short
-grid checkpoints in E1/4/16 needs over 21 TB (plus extensions and headroom).
-Even selected-only retention needs a multi-TB allocation and repeated
-training if those model states were not captured in the existing pilot.
-A larger project storage allocation or an explicitly agreed smaller scope
-is necessary. Until Harry settles scope and placement, do not silently
-drop checkpoint state, enable an infeasible full-write policy, or launch
-new training merely to recreate missing artifacts.
+grid checkpoints in E1/4/16 needs over 21 TB (plus extensions and headroom),
+so the agreed initial LR pilots record richer evaluation evidence without
+binary state. Selected-LR actual-state reruns remain the scientific plan
+for deeper follow-up. They require a verified multi-TB allocation and a
+separate agreed cadence before launch, because state cannot be recovered
+from the original evaluation-only runs. Do not silently substitute
+lossy/partial retention, delete historical evidence or launch reruns before
+storage is settled.

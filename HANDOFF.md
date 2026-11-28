@@ -56,8 +56,11 @@ but do not launch FT until a feasible retention policy is agreed. Actual persona
 ~610 GB scratch + 976 GB pool, versus ~21.5 TB full measured-state (or ~19 TB every 60 steps)
 across initial pilots. See `reports/finetune_checkpoint_storage_plan.md`. Harry chose to
 continue initial pilots without binary FT states and capture richer router data instead;
-selected-LR full-state reruns await storage and a separate plan. Rich router capture is under
-implementation/review; coordinators still hold FT until the new code is ready. E1 4× AdamW
+selected-LR full-state reruns await storage and a separate plan. Rich router capture has been
+implemented and reviewed, whole repository suite 408 passed/13 skipped, with a one-cell GPU canary
+gate before each full grid. Coordinators hold FT until the tested revision is deployed. Harry clarified that
+existing project norms supersede the optional collaboration kit; no additional
+ratification or launcher requirement applies. See `reports/finetune_rich_router_capture.md`. E1 4× AdamW
 extension queued (30772904), E4 two transfer jobs running; E8 rerun not authorized now.
 
 ## 1. Goal and where we are

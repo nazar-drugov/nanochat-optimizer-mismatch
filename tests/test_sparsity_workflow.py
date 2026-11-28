@@ -82,3 +82,87 @@ def test_hold_ft_pins_bases_without_generating_finetune_jobs(monkeypatch,tmp_pat
     c.state['checkpoint_retention']='weights'
     with pytest.raises(RuntimeError,match='conflicts with existing'):
         c.run()
+
+
+def test_soft_router_storage_estimate_and_actual_quota_guard(monkeypatch,tmp_path):
+    text='SCRATCH | 414.1 | 1024.0 | 40.44\nPOOL | 48.0 | 1024.0 | 4.69\n'
+    assert w.quota_free_gb(text)==pytest.approx({'SCRATCH':609.9,'POOL':976.})
+    with pytest.raises(ValueError,match='both'):
+        w.quota_free_gb('SCRATCH | 400 | 1024')
+    req=w.storage_requirements_gb(16,120,True,8192,'logits','none')
+    assert req['SCRATCH']==req['POOL'] and 81<req['SCRATCH']<100
+    full=w.storage_requirements_gb(16,120,True,8192,'logits','full')
+    assert full['SCRATCH']>14000 and full['POOL']==req['POOL']
+    cfg=SimpleNamespace(experts=16,work_dir=tmp_path/'work',scratch_base=tmp_path/'scratch',poll_seconds=10,nice=0,
+                        checkpoint_retention='none',soft_router_capture=True,soft_router_sample_size=8192,soft_router_sample_format='logits')
+    c=w.Coordinator(cfg)
+    quota=tmp_path/'orcd'/'.quota'; quota.parent.mkdir(); quota.write_text(text)
+    monkeypatch.setattr(w.Path,'home',lambda:tmp_path)
+    c.check_ft_storage(120)
+    quota.write_text('SCRATCH | 900 | 1024\nPOOL | 48 | 1024\n')
+    c.check_ft_storage(120,'ft-initial')
+    other=w.Coordinator(SimpleNamespace(experts=4,work_dir=tmp_path/'other',scratch_base=tmp_path/'scratch',
+                                         poll_seconds=10,nice=0,checkpoint_retention='none',soft_router_capture=True,
+                                         soft_router_sample_size=8192,soft_router_sample_format='logits'))
+    with pytest.raises(RuntimeError,match='reserved'):
+        other.check_ft_storage(120,'ft-initial')
+    c.release_ft_storage('ft-initial')
+    # Completed bytes may still be absent from the old report, so retain the
+    # reservation until that report has actually been refreshed.
+    with pytest.raises(RuntimeError,match='reserved'):
+        other.check_ft_storage(120,'ft-initial')
+    import os,time
+    os.utime(quota,(time.time()+1,time.time()+1))
+    other.check_ft_storage(120,'ft-initial')
+    other.release_ft_storage('ft-initial')
+    quota.write_text('SCRATCH | 1000 | 1024\nPOOL | 48 | 1024\n')
+    with pytest.raises(RuntimeError,match='SCRATCH quota'):
+        c.check_ft_storage(120)
+
+
+def test_gpu_canary_evidence_gate_accepts_valid_hardlinked_arrays_rejects_corruption(tmp_path):
+    import hashlib, os
+    import numpy as np
+    from nanochat.soft_routing import schema, METRICS, SOFT_ROUTER_SCHEMA_VERSION
+    from scripts.finetune import checkpoint_steps
+    root=tmp_path/'ft'; dataset=root/'e1-main-adamw-s42'/'starcoderdata'; base=dataset/'base';base.mkdir(parents=True)
+    pos=np.arange(4,dtype=np.int64); digest=hashlib.sha256(pos.astype('<i8').tobytes()).hexdigest()
+    counts=np.array([4,4]); L=2; M=len(METRICS); valid=np.ones(M,dtype=bool);valid[1]=False
+    base_arrays={}; arrays={'soft_router_schema_version':np.array(SOFT_ROUTER_SCHEMA_VERSION),'layers':np.arange(L)}
+    for prefix in ('d0','d1'):
+        edges=np.tile(np.linspace(0,1,33),(M,1));routes=np.zeros((L,2,4),dtype=np.uint8)
+        base_arrays.update({f'{prefix}_soft_sample_positions':pos,f'{prefix}_soft_sample_doc_ids':np.zeros(4,dtype=np.int64),
+                            f'{prefix}_soft_doc_counts':counts,f'{prefix}_soft_sample_positions_sha256':np.array(digest),
+                            f'{prefix}_routes':routes,f'{prefix}_soft_hist_edges':edges})
+        hist=np.zeros((L,M,32),dtype=np.int64);hist[:,:,0]=np.where(valid,8,0)
+        doc_sum=np.zeros((L,2,M));doc_sum[:,:,[2,3]]=4.
+        vals={'soft_sample_positions_sha256':np.array(digest),'soft_doc_counts':counts,'soft_metric_valid':valid,
+              'soft_layer_count':np.broadcast_to(np.where(valid,8,0),(L,M)), 'soft_hist_count':hist,'soft_hist_edges':edges,
+              'soft_doc_sum':doc_sum, 'soft_doc_sumsq':doc_sum,
+              'soft_layer_sum':doc_sum.sum(axis=1), 'soft_layer_sumsq':doc_sum.sum(axis=1),
+              'soft_prob_sum':np.full((L,1),8.),'soft_doc_prob_sum':np.full((L,2,1),4.),
+              'soft_sample_logits':np.zeros((L,4,1),dtype=np.float32),'soft_sample_probs':np.empty((L,0,1),dtype=np.float32),'routes':routes}
+        arrays.update({f'{prefix}_{k}':v for k,v in vals.items()})
+    np.savez_compressed(base/'base_arrays.npz',**base_arrays)
+    shared={}
+    for horizon in (60,240,960):
+        run=dataset/f'adamw-lr0.001-s1-T{horizon}';run.mkdir()
+        cell=dict(base_run='e1-main-adamw-s42',pretrain_optimizer='adamw',ft_dataset='starcoderdata',
+                  ft_optimizer='adamw',lr=.001,seed=1,ft_steps=horizon,n_experts=1)
+        decay=round(.2*horizon);steps=checkpoint_steps(horizon,decay)
+        (run/'result.json').write_text(json.dumps(dict(status='completed',steps_completed=horizon,**cell,
+             checkpoint_retention='none',attempt_id='same',curve=[{'step':step} for step in steps],soft_router=schema(4,'logits'))))
+        (run/'config.json').write_text(json.dumps(dict(cell=cell,checkpoint_retention='none',attempt_id='same',
+             warmup_steps=8,decay_steps=decay,soft_router=schema(4,'logits'))))
+        for step in steps:
+            path=run/f'ckpt_{step:06d}.npz'
+            if step<=horizon-decay and step in shared: os.link(shared[step],path)
+            else:
+                np.savez_compressed(path,**arrays)
+                if step<=horizon-decay: shared[step]=path
+    result=w.verify_soft_canary(root,1,.001,4,'logits','none')
+    assert result['unique_npz']==18 and result['npz_bytes']>0
+    wrong={**arrays,'d0_soft_sample_logits':np.zeros((L,3,1),dtype=np.float32)}
+    np.savez_compressed(dataset/'adamw-lr0.001-s1-T960'/'ckpt_000960.npz',**wrong)
+    with pytest.raises(RuntimeError,match='logits sample'):
+        w.verify_soft_canary(root,1,.001,4,'logits','none')

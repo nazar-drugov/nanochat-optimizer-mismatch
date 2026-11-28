@@ -57,6 +57,7 @@ def test_job_generator_manifest_and_dataset_lengths(tmp_path, E):
         assert str(manifest) in body and "--base-manifest" in body
         assert "--seeds 1 2 3" in body
         assert "--checkpoint-retention full" in body
+        assert "--soft-router-capture --soft-router-sample-size 8192 --soft-router-sample-format logits" in body
         assert "--branch-tokens 3932160 " + ("62914560" if "starcoderdata" in job.name else "47185920") in body
     out2 = tmp_path/"edge"
     j.main(args + ["--out", str(out2), "--pairs", "adamw:muon", "--pair-lr-fractions", "adamw:muon=2", "--checkpoint-retention", "weights"])
@@ -89,12 +90,15 @@ def test_e1_replay_is_exact_and_margin_undefined():
     ids = torch.tensor([[0]*8, [1]*8])
     eval_set = EvalSet("D0", inputs, targets, ids, 2, "/d0", "identity", packing="bestfit",
                        doc_rows=torch.tensor([0, 1]))
-    base = f.evaluate_base(model0, eval_set, 1, torch.device("cpu"))
+    base = f.evaluate_base(model0, eval_set, 1, torch.device("cpu"), soft_sample_size=3)
     result = f.evaluate_checkpoint(model1, model0, eval_set, base, 1, torch.device("cpu"), full=True)
     assert all(v is None for v in base["margin"].values())
     assert torch.equal(result["doc_sums"]["normal"], result["doc_sums"]["replay"])
     assert torch.equal(result["doc_sums"]["reverse"], base["doc_sums"])
     assert all(v["flip_rate"] == 0 and v["flip_rate_normalized"] is None for v in result["per_layer"].values())
+    assert all(v["cause_scored_flips"] == 0 and v["cause_flips"] == 0 for v in result["per_layer"].values())
+    assert all(v["soft_top2_margin_mean"] is None and v["soft_js_base_current_nats_mean"] == 0.
+               and v["soft_tv_base_current_mean"] == 0. for v in result["per_layer"].values())
 
 
 def synthetic_grid(tmp, pins, E=1, dataset="starcoderdata", horizon=60):
@@ -169,6 +173,17 @@ def test_wandb_new_e_requires_pin_and_no_paths(tmp_path):
     assert cell.group.startswith("optimizer-mismatch-e1/")
     assert cell.metadata["base_model_sha256"] == config["base"]["model_sha256"]
     assert str(tmp_path) not in json.dumps(cell.metadata)
+    from nanochat.soft_routing import METRICS, schema
+    config["soft_router"] = result["soft_router"] = schema(8192)
+    for row in result["curve"]:
+        for d in ("d0", "d1"):
+            for metric in METRICS:
+                row[f"soft_{d}_{metric}_mean"] = (None if metric=="top2_margin" else
+                    1. if metric in ("chosen_gate","max_probability") else 0.)
+    rich = w.make_cell(result, config, stage="finetune_pilot_e1", base_manifest=pins)
+    assert "soft_d0_top2_margin_mean" not in rich.points[0]
+    assert rich.points[0]["soft_d1_chosen_gate_mean"] == 1.
+    assert rich.summary["nonfinite_measurement_count"] == 0
     result["curve"][0]["F_route"] = .1
     with pytest.raises(w.RecordError, match="structural zero"):
         w.make_cell(result, config, stage="finetune_pilot_e1", base_manifest=pins)

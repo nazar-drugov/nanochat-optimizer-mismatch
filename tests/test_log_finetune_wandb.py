@@ -256,3 +256,30 @@ def test_cli_continues_independent_cells_on_failure(tmp_path, capsys):
     out, err = capsys.readouterr()
     assert "uploaded=1" in out and "failed=1" in out and "FAILED" in err
     assert len(wb.inits) == 1
+
+
+def test_soft_router_scalars_whitelisted_without_raw_arrays():
+    from nanochat.soft_routing import METRICS, schema
+    result, config = records()
+    result["soft_router"] = config["soft_router"] = schema(8192, "logits")
+    for row in result["curve"]:
+        for d in ("d0", "d1"):
+            for metric in METRICS:
+                row[f"soft_{d}_{metric}_mean"] = .5
+        row["soft_sample_logits"] = [[1234.]]
+    cell = b.make_cell(result, config, stage="ft_pilot")
+    assert cell.metadata["soft_router_sample_format"] == "logits"
+    assert cell.metadata["soft_router_sample_size"] == 8192
+    assert len(b.SOFT_SCALARS) == 2*len(METRICS)
+    assert set(b.SOFT_SCALARS) <= set(cell.points[0])
+    assert "soft_sample_logits" not in cell.points[0]
+    del result["curve"][0]["soft_d0_entropy_nats_mean"]
+    with pytest.raises(b.RecordError, match="missing soft router"):
+        b.make_cell(result, config, stage="ft_pilot")
+
+
+def test_legacy_digest_unchanged_when_soft_evidence_absent():
+    result, config = records()
+    old = b.make_cell(result, config, stage="ft_pilot")
+    result["soft_router"] = config["soft_router"] = None
+    assert b.make_cell(result, config, stage="ft_pilot").source_digest == old.source_digest
