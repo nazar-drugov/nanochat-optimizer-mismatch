@@ -56,10 +56,12 @@ def test_job_generator_manifest_and_dataset_lengths(tmp_path, E):
         body = job.read_text()
         assert str(manifest) in body and "--base-manifest" in body
         assert "--seeds 1 2 3" in body
+        assert "--checkpoint-retention full" in body
         assert "--branch-tokens 3932160 " + ("62914560" if "starcoderdata" in job.name else "47185920") in body
     out2 = tmp_path/"edge"
-    j.main(args + ["--out", str(out2), "--pairs", "adamw:muon", "--pair-lr-fractions", "adamw:muon=2"])
+    j.main(args + ["--out", str(out2), "--pairs", "adamw:muon", "--pair-lr-fractions", "adamw:muon=2", "--checkpoint-retention", "weights"])
     assert len(list(out2.glob("*.sbatch"))) == 2
+    assert all("--checkpoint-retention weights" in p.read_text() for p in out2.glob("*.sbatch"))
     wrong = json.loads(selected.read_text()); wrong["adamw"]["full_lr"] *= 2; dump(selected, wrong)
     with pytest.raises(SystemExit):
         j.main(args)

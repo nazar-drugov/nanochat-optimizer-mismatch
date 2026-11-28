@@ -2,6 +2,7 @@
 
 import csv
 import json
+import os
 from pathlib import Path
 
 from scripts import build_checkpoint_registry as r
@@ -115,6 +116,85 @@ def test_finetune_base_reference_and_pool_checkpoint_paths(tmp_path):
     shared = next(x for x in checks if x["checkpoint_kind"] == "shared_base_eval")
     assert shared["step"] == 0 and shared["base_eval_arrays_path"] == str(base_arrays)
     assert json.loads(shared["base_eval_set_paths"]) == [str(eval_set)]
+
+
+def test_finetune_retained_weights_optimizer_and_shared_prefix(tmp_path, monkeypatch):
+    scratch, pool, nazar_ft, nazar_legacy = roots(tmp_path)
+    short = make_ft(scratch, stage="finetune_pilot_e1", n_experts=1, length=60)
+    longer = make_ft(scratch, stage="finetune_pilot_e1", n_experts=1, length=240)
+    for cell in (short, longer):
+        config = json.loads((cell / "config.json").read_text())
+        config["attempt_id"] = "a" * 32
+        write_json(cell / "config.json", config)
+    first_model = touch(short / "model_000002.pt")
+    first_optim = touch(short / "optim_000002_rank0.pt")
+    os.link(first_model, longer / first_model.name)
+    os.link(first_optim, longer / first_optim.name)
+    meta = touch(short / "meta_000002.json")
+    touch(longer / "meta_000002.json")
+    # A model-only measurement and an optimizer-only partial save are reported
+    # without claiming the other artifacts exist.
+    partial = touch(short / "model_000004.pt")
+    touch(longer / "optim_000008_rank0.pt")
+    mirror = pool / short.relative_to(scratch)
+    write_json(mirror / "config.json", json.loads((short / "config.json").read_text()))
+    touch(mirror / "ckpt_000002.npz")
+    touch(mirror / meta.name)
+    old_read = Path.read_text
+    def guard(path, *args, **kwargs):
+        if path.name.startswith("meta_"):
+            raise AssertionError("must not read checkpoint metadata")
+        return old_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", guard)
+    _, checkpoints, warnings = r.build_registry(scratch, pool, nazar_ft, nazar_legacy)
+    assert not warnings
+    steps = {(x["run_dir"], x["step"]): x for x in checkpoints}
+    a = steps[str(short), 2]
+    b = steps[str(longer), 2]
+    assert a["checkpoint_kind"] == b["checkpoint_kind"] == "finetune_model_weights_and_eval"
+    assert a["has_model_weights"] == b["has_model_weights"] == "yes"
+    assert a["has_optimizer_state"] == b["has_optimizer_state"] == "yes"
+    assert a["model_path"] == str(first_model) and b["model_path"] == str(longer / first_model.name)
+    assert json.loads(a["optimizer_paths"]) == [str(first_optim)]
+    assert os.stat(a["model_path"]).st_ino == os.stat(b["model_path"]).st_ino
+    assert a["pool_attempt_consistency"] == "same_attempt"
+    assert a["pool_meta_path"] == str(mirror / meta.name) and not a["pool_model_path"]
+    assert steps[str(short), 4]["model_path"] == str(partial)
+    assert steps[str(short), 4]["checkpoint_kind"] == "finetune_model_weights"
+    assert steps[str(short), 4]["has_optimizer_state"] == "no"
+    assert steps[str(longer), 8]["checkpoint_kind"] == "finetune_related_only"
+    assert steps[str(longer), 8]["has_optimizer_state"] == "yes"
+
+
+def test_interrupted_archive_and_stale_pool_attempt_do_not_merge(tmp_path):
+    scratch, pool, nazar_ft, nazar_legacy = roots(tmp_path)
+    active = make_ft(scratch, stage="finetune_pilot_e4", n_experts=4, length=240, completed=False)
+    active_config = json.loads((active / "config.json").read_text())
+    write_json(active / "config.json", {**active_config, "attempt_id": "a" * 32})
+    mirror = pool / active.relative_to(scratch)
+    write_json(mirror / "config.json", {**active_config, "attempt_id": "b" * 32})
+    old_weight = touch(mirror / "model_000002.pt")
+    old_eval = touch(mirror / "ckpt_000240.npz")
+    archive = active.parents[2] / ".interrupted" / active.parent.parent.name / active.parent.name / (active.name + "." + "c" * 32)
+    # No finalized config or evaluation array is necessary to discover an
+    # interrupted branch that only managed to write a model.
+    archive_weight = touch(archive / "model_000002.pt")
+    runs, checkpoints, warnings = r.build_registry(scratch, pool, nazar_ft, nazar_legacy)
+    assert not warnings
+    by_dir = {x["run_dir"]: x for x in runs}
+    stale = by_dir[str(active)]
+    assert stale["pool_attempt_consistency"] == "different_attempt"
+    assert stale["attempt_id"] == "a" * 32 and stale["pool_attempt_id"] == "b" * 32
+    archived = by_dir[str(archive)]
+    assert archived["validity"] == "interrupted_archive" and archived["status"] == "incomplete"
+    assert archived["base_seed"] == 42 and archived["length_steps"] == 240
+    steps = {(x["run_dir"], x["step"]): x for x in checkpoints}
+    assert steps[str(active), 2]["pool_model_path"] == str(old_weight)
+    assert steps[str(active), 2]["has_model_weights"] == "no" and not steps[str(active), 2]["model_path"]
+    assert steps[str(active), 240]["pool_eval_npz_path"] == str(old_eval)
+    assert steps[str(active), 240]["checkpoint_kind"] == "stale_pool_artifacts"
+    assert not steps[str(active), 240]["eval_npz_path"]
+    assert steps[str(archive), 2]["model_path"] == str(archive_weight)
 
 
 def test_archive_validity_and_nazar_standalone_no_length_suffix(tmp_path):

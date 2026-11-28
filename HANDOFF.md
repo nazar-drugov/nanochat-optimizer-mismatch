@@ -48,6 +48,15 @@ E4 six 3B jobs queued (30750304/05/06/07/08/10); E1 two transfer checks running,
 E16 smoke queued. All E1/E4 sweep W&B records verified. See `reports/sparsity_e1_pretraining_lr_sweep.md`
 and `reports/sparsity_e4_pretraining_lr_sweep.md`.
 
+At 22:14 EST E1's initial six 3B transfer checks completed (AdamW best 2× edge, Muon interior).
+Harry requested actual intermediate FT model/optimizer states; the original CPU controllers were
+deliberately cancelled (no GPU jobs cancelled) and resumed on pin 2921362 with `--hold-ft`:
+30772131 (E1), 30772137 (E4), 30772138 (E16). These finish approved pretraining and pin bases,
+but do not launch FT until a feasible retention policy is agreed. Actual personal storage free
+~610 GB scratch + 976 GB pool, versus ~21.5 TB full measured-state (or ~19 TB every 60 steps)
+across initial pilots. See `reports/finetune_checkpoint_storage_plan.md`. Retention implementation
+is reviewed; further storage/selection/cadence decisions await Harry. E8 rerun is not authorized now.
+
 ## 1. Goal and where we are
 
 Measure whether fine-tuning a top-1 MoE language model with a different optimizer than it was

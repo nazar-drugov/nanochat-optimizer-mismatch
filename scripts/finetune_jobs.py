@@ -50,6 +50,8 @@ def main(argv=None):
                         help="further fine-tuning lengths run as decay branches (scripts/finetune.py)")
     parser.add_argument("--out-root", default=None, help="finetune --out-root (default: $SCRATCH/finetune)")
     parser.add_argument("--job-prefix", default="ft")
+    parser.add_argument("--checkpoint-retention", choices=("none", "weights", "weights+final_optimizer", "full"),
+                        default="full", help="retention for measured model/optimizer states (default: full)")
     parser.add_argument("--pair-lr-fractions", nargs="+", default=[], metavar="PRE:FT=F1,F2",
                         help="LR fractions for one (pretraining, fine-tuning) optimizer pair")
     parser.add_argument("--pairs", nargs="+", default=None,
@@ -130,6 +132,7 @@ def main(argv=None):
             tokens = args.branch_tokens if E == 8 else branch_by_dataset[name]
             extra = (["--branch-tokens", *map(str, tokens)] if tokens else []) \
                 + (["--out-root", args.out_root] if args.out_root else [])
+            extra += ["--checkpoint-retention", args.checkpoint_retention]
             if E != 8:
                 extra += ["--train-tokens", "15728640", "--total-batch-size", "65536",
                           "--device-batch-size", "32", "--warmup-ratio", ".03", "--warmdown-ratio", ".2",

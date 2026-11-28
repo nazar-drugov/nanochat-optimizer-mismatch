@@ -107,6 +107,7 @@ class Coordinator:
         self.poll = args.poll_seconds
         self.nice = args.nice
         self.hold_ft = getattr(args, 'hold_ft', False)
+        self.checkpoint_retention = getattr(args, 'checkpoint_retention', None)
         self.work.mkdir(parents=True, exist_ok=True)
         self.selection = self.work / 'selection'; self.selection.mkdir(exist_ok=True)
         self.id = hashlib.sha256(str(self.work).encode()).hexdigest()[:10]
@@ -280,12 +281,21 @@ class Coordinator:
         if self.hold_ft:
             self.phase('ft-hold',jobs={},base_manifest=str(pin),selection=str(final_file))
             return
+        if self.checkpoint_retention is None:
+            raise RuntimeError('fine-tuning retention policy must be explicitly agreed and supplied')
+        recorded = self.state.get('checkpoint_retention')
+        if recorded is not None and recorded != self.checkpoint_retention:
+            raise RuntimeError(f'fine-tuning retention policy conflicts with existing workflow ({recorded})')
+        if recorded is None and (self.work/'ft-initial'/'jobs.json').exists():
+            raise RuntimeError('existing fine-tuning wave has no recorded retention policy; review before resume')
+        self.phase('ft-prepare',jobs={},checkpoint_retention=self.checkpoint_retention)
         bases = [f'e{self.e}-main-{o}-s42' for o in OPTS]
         selection = load(final_file)
         def ft_jobs(d, dataset_args, pair_args=()):
             self.module('scripts.finetune_jobs',['--selection',final_file,'--base-manifest',pin,'--base-runs',*bases,
                 *dataset_args,'--d0-file',self.scratch/'heldout/fineweb-edu-100b/d0.parquet',
-                '--seeds',1,2,3,'--out-root',self.ft_root,'--out',d,'--repo-dir',self.repo,'--job-prefix','ftpilot',*pair_args])
+                '--seeds',1,2,3,'--out-root',self.ft_root,'--out',d,'--repo-dir',self.repo,'--job-prefix','ftpilot',
+                '--checkpoint-retention',self.checkpoint_retention,*pair_args])
         dataset_arg = lambda name: ['--dataset',f'{name}={self.scratch}/finetune_data/{name}']
         self.wave('ft-initial',lambda d: ft_jobs(d,[v for name in HORIZONS for v in dataset_arg(name)]))
         for round_ in range(1000):
@@ -323,6 +333,8 @@ def main():
     parser.add_argument('--nice',type=int,default=0)
     parser.add_argument('--initial-submit-only',action='store_true',help='submit smoke jobs and return; the same work directory can be resumed by the CPU coordinator')
     parser.add_argument('--hold-ft',action='store_true',help='finish approved pretraining, pin bases, then hold before any FT job is generated or submitted')
+    parser.add_argument('--checkpoint-retention',choices=('none','weights','weights+final_optimizer','full'),
+                        help='explicitly agreed retention policy; absent policy blocks FT')
     args=parser.parse_args()
     if args.poll_seconds < 10 or args.nice < 0: parser.error('poll interval >=10s and nonnegative nice required')
     args.work_dir.mkdir(parents=True,exist_ok=True)

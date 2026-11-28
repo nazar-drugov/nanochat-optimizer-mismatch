@@ -7,6 +7,7 @@ python -m pytest tests/test_finetune.py -v
 
 import json
 import math
+import os
 import random
 
 import numpy as np
@@ -176,7 +177,7 @@ def run_finetune(setup, *extra):
                    "--ft-data-dir", str(setup["ft"]), "--ft-name", "tiny", "--d0-file", str(setup["d0"]),
                    "--out-root", str(setup["root"] / "out"), "--device-type", "cpu",
                    "--eval-tokens", "512", "--eval-batch-size", "4", "--train-tokens", "1024",
-                   "--total-batch-size", "128", "--device-batch-size", "2", *extra])
+                   "--total-batch-size", "128", "--device-batch-size", "2", "--checkpoint-retention", "none", *extra])
     return setup["root"] / "out" / "tiny-base" / "tiny"
 
 
@@ -282,13 +283,51 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
     """A length run as a decay branch of a longer trunk gives the same data, curve and final
     measurements as a separate run of that length (same seed, same warmup steps)."""
     common = ("--lrs", "muon=3e-3", "--seeds", "1")
-    branched = run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048")  # 4, 8 (main), 16 steps
+    branched = run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048", "--checkpoint-retention", "full")  # 4, 8 (main), 16 steps
     results = {p.parent.name: json.loads(p.read_text()) for p in branched.glob("muon-lr0.003-s1-T*/result.json")}
     assert sorted(results) == ["muon-lr0.003-s1-T16", "muon-lr0.003-s1-T4", "muon-lr0.003-s1-T8"]
     assert all(r["status"] == "completed" and r["warmup_steps"] == 1 for r in results.values())
     assert [c["step"] for c in results["muon-lr0.003-s1-T16"]["curve"]] == [2, 4, 8, 13, 14, 16]
     assert [c["step"] for c in results["muon-lr0.003-s1-T4"]["curve"]] == [2, 3, 4]
     assert results["muon-lr0.003-s1-T4"]["curve"][0] == results["muon-lr0.003-s1-T16"]["curve"][0]  # shared step 2
+    # Actual state files are hard-linked only for the identical shared prefix,
+    # never for two schedules that have already diverged.
+    from nanochat.checkpoint_manager import load_checkpoint, build_model
+    dirs = {n: branched / f"muon-lr0.003-s1-T{n}" for n in (4, 8, 16)}
+    for n, d in dirs.items():
+        r = results[d.name]
+        assert r["checkpoint_retention"] == "full"
+        for p in r["curve"]:
+            step = p["step"]
+            for name in (f"model_{step:06d}.pt", f"optim_{step:06d}_rank0.pt", f"meta_{step:06d}.json"):
+                assert (d / name).stat().st_size > 0
+            provenance = json.loads((d / f"meta_{step:06d}.json").read_text())
+            assert provenance["cell"]["ft_steps"] == n and provenance["step"] == step
+            assert provenance["tokens"] == step*128 and not provenance["exact_resume_supported"]
+            assert provenance["optimizer_saved"] is True and provenance["data_fingerprint"] is not None
+            with np.load(d / f"ckpt_{step:06d}.npz") as arrays:
+                assert arrays["d1_routes"].dtype == np.uint8 and arrays["d1_routes"].shape[0] == 2
+    for name in ("model_000002.pt", "optim_000002_rank0.pt", "ckpt_000002.npz"):
+        assert all(os.path.samefile(dirs[4]/name, dirs[n]/name) for n in (8, 16))
+    for name in ("model_000004.pt", "optim_000004_rank0.pt", "ckpt_000004.npz"):
+        assert not os.path.samefile(dirs[4]/name, dirs[16]/name)
+    assert not os.path.samefile(dirs[4]/"meta_000002.json", dirs[16]/"meta_000002.json")
+    m4, o4, meta4 = load_checkpoint(dirs[4], 4, torch.device("cpu"), load_optimizer=True)
+    m8, _, _ = load_checkpoint(dirs[8], 8, torch.device("cpu"), load_optimizer=True)
+    m16, o16, _ = load_checkpoint(dirs[16], 8, torch.device("cpu"), load_optimizer=True)
+    assert not os.path.samefile(dirs[8]/"model_000008.pt", dirs[16]/"model_000008.pt")
+    assert any(not torch.equal(m8[k], m16[k]) for k in m8)
+    restored, tok, _ = build_model(dirs[4], 4, torch.device("cpu"), "eval")
+    assert all(torch.equal(restored.state_dict()[k], v) for k, v in m4.items())
+    restored_optimizer = restored.setup_optimizer(optimizer_name="muon")
+    restored_optimizer.load_state_dict(o4)
+    assert restored_optimizer.state_dict()["param_groups"] == o4["param_groups"]
+    assert o4["state"] and o16["state"]
+    from scripts.finetune import evaluate_base
+    d0 = build_eval_set("D0", tiny_setup["d0"], tok, 64, 512)
+    replay = evaluate_base(restored, d0, 4, torch.device("cpu"))
+    with np.load(dirs[4] / "ckpt_000004.npz") as arr:
+        np.testing.assert_allclose(replay["doc_sums"].numpy(), arr["d0_doc_loss"], rtol=1e-6, atol=1e-6)
     rows = [json.loads(line) for line in (branched / "muon-lr0.003-s1-T4" / "metrics.jsonl").read_text().splitlines()]
     assert {r["run"] for r in rows} == {"muon-lr0.003-s1-T4"} and {r["ft_steps"] for r in rows} == {4}
     for tokens, branch in ((512, "T4"), (1024, "T8"), (2048, "T16")):  # T16 is the trunk
@@ -299,7 +338,7 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
                        "--ft-data-dir", str(tiny_setup["ft"]), "--ft-name", "tiny", "--d0-file", str(tiny_setup["d0"]),
                        "--out-root", str(out), "--device-type", "cpu", "--eval-tokens", "512",
                        "--eval-batch-size", "4", "--train-tokens", str(tokens), "--total-batch-size", "128",
-                       "--device-batch-size", "2", *common])
+                       "--device-batch-size", "2", "--checkpoint-retention", "none", *common])
         single = json.loads((out / "tiny-base" / "tiny" / "muon-lr0.003-s1" / "result.json").read_text())
         branch_result = results[f"muon-lr0.003-s1-{branch}"]
         assert single["data_fingerprint"] == branch_result["data_fingerprint"]
@@ -308,6 +347,40 @@ def test_decay_branches_equal_separate_runs(tiny_setup):
             for key in ("learning", "forgetting", "F_route", "train_loss"):
                 assert a[key] == pytest.approx(b[key], rel=1e-5, abs=1e-7), (branch, a["step"], key)
         assert single["cumulative_expert_counts"] == branch_result["cumulative_expert_counts"]
+    # Resubmission keeps all completed siblings. Simulate a preemption after
+    # measured states were persisted but before a result marker was published.
+    original_attempt = results[dirs[4].name]["attempt_id"]
+    assert all(r["attempt_id"] == original_attempt for r in results.values())
+    prev_mtime = (dirs[4]/"result.json").stat().st_mtime_ns
+    (dirs[8]/"result.json").rename(dirs[8]/"result.unpublished.json")
+    run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048", "--checkpoint-retention", "full")
+    assert (dirs[4]/"result.json").stat().st_mtime_ns == prev_mtime
+    new = json.loads((dirs[8]/"result.json").read_text())
+    assert new["attempt_id"] != original_attempt
+    assert new["curve"] == results[dirs[8].name]["curve"]
+    archived = list((tiny_setup["root"]/"out"/".interrupted"/"tiny-base"/"tiny").glob(dirs[8].name+".*"))
+    assert len(archived)==1 and (archived[0]/"result.unpublished.json").is_file()
+    assert os.path.samefile(archived[0]/"model_000002.pt", dirs[4]/"model_000002.pt")
+    assert not os.path.samefile(dirs[8]/"model_000002.pt", dirs[4]/"model_000002.pt")
+    assert json.loads((dirs[8]/"meta_000002.json").read_text())["shared_state_horizons"] == [8]
+    # Missing state or conflicting retention is diagnosed without overwriting.
+    missing = dirs[4]/"optim_000004_rank0.pt"
+    tmp = dirs[4]/"optim.unavailable.pt"
+    missing.rename(tmp)
+    with pytest.raises(RuntimeError, match="missing or incomplete retained checkpoint artifact"):
+        run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048", "--checkpoint-retention", "full")
+    tmp.rename(missing)
+    with pytest.raises(RuntimeError, match="checkpoint retention is"):
+        run_finetune(tiny_setup, *common, "--branch-tokens", "512", "2048", "--checkpoint-retention", "weights")
+    assert (dirs[4]/"result.json").stat().st_mtime_ns == prev_mtime
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("none", (False, False, False, False)), ("weights", (True, False, True, False)),
+    ("weights+final_optimizer", (True, False, True, True)), ("full", (True, True, True, True))])
+def test_retention_policy(policy, expected):
+    from scripts.finetune import retention_files
+    assert (*retention_files(policy, 2, 4), *retention_files(policy, 4, 4)) == expected
 
 
 def test_wikitext_d1_takes_all_official_articles_and_tops_up_from_training():
@@ -434,3 +507,28 @@ def test_cells_with_colliding_directory_names_are_rejected(tiny_setup):
     with pytest.raises(RuntimeError, match="result.json has lr"):  # another job's cell, same directory name
         run_finetune(tiny_setup, "--lrs", "adamw=1.0004e-3", "--seeds", "4", "--train-tokens", "256")
     assert json.loads((out / "adamw-lr0.001-s4" / "result.json").read_text())["lr"] == 1e-3
+
+
+@pytest.mark.parametrize("policy,seed,intermediate_optim,final_optim", [
+    ("none", 7, False, False),
+    ("weights", 8, False, False),
+    ("weights+final_optimizer", 9, False, True),
+])
+def test_checkpoint_modes_save_exact_requested_artifacts(tiny_setup, policy, seed, intermediate_optim, final_optim):
+    out = run_finetune(tiny_setup, "--lrs", "adamw=3e-3", "--seeds", str(seed), "--train-tokens", "512",
+                       "--checkpoint-retention", policy)
+    path = out / f"adamw-lr0.003-s{seed}"
+    result = json.loads((path/"result.json").read_text())
+    assert result["checkpoint_retention"] == policy and result["status"] == "completed"
+    for p in result["curve"]:
+        step = p["step"]
+        keep_weights = policy != "none"
+        keep_optim = final_optim if step==4 else intermediate_optim
+        assert (path/f"model_{step:06d}.pt").exists() == keep_weights
+        assert (path/f"optim_{step:06d}_rank0.pt").exists() == keep_optim
+        assert (path/f"meta_{step:06d}.json").exists() == keep_weights
+        assert (path/f"ckpt_{step:06d}.npz").exists()
+        if keep_weights:
+            meta = json.loads((path/f"meta_{step:06d}.json").read_text())
+            assert meta["optimizer_saved"] == keep_optim
+            assert "model" in meta["artifacts"] and ("optim" in meta["artifacts"]) == keep_optim

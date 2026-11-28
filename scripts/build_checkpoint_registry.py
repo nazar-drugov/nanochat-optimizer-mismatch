@@ -9,7 +9,9 @@ Nazar's older base/SFT runs are verification-only. Symlink directory aliases
 are not traversed. Files are enumerated by name; no weights, checkpoint meta,
 routing arrays, or evaluation arrays are loaded or hashed. Only small run-level
 config/result JSON records are read. A shared base evaluation is a reference
-record, not an extra experimental run or a saved fine-tuned model.
+record, not an extra experimental run or a saved fine-tuned model. Fine-tuning
+branches can contain actual model and optimizer files as well as evaluation
+NPZs; interrupted attempts are retained as distinct archival records.
 """
 
 import argparse
@@ -30,6 +32,7 @@ NAZAR_LEGACY = Path("/orcd/scratch/orcd/010/ndrugov/nanochat-optimizer-mismatch"
 MAX_RUN_JSON_BYTES = 16 * 1024 * 1024
 PRETRAIN_NAME = re.compile(r"e(\d+)-(sweep|main|xfer)-(adamw|muon)(?:-lr([^/]+))?-s(\d+)$")
 FT_NAME = re.compile(r"(adamw|muon)-lr(.+?)-s(\d+)(?:-T(\d+))?$")
+INTERRUPTED_FT_NAME = re.compile(r"(.+)\.[0-9a-f]{32}$")
 MODEL_FILES = re.compile(r"(model|meta|routing)_(\d+)\.(pt|json)$")
 OPTIM_FILES = re.compile(r"optim_(\d+)_rank(\d+)\.pt$")
 EVAL_FILES = re.compile(r"ckpt_(\d+)\.npz$")
@@ -44,11 +47,13 @@ RUN_FIELDS = (
     "ft_optimizer", "ft_seed", "lr", "length_steps", "steps_completed", "n_experts",
     "config_path", "result_path", "pool_config_path", "pool_result_path", "resume_config_paths",
     "pool_resume_config_paths", "base_checkpoint_step", "base_model_path", "base_model_recorded_path",
-    "base_model_sha256", "base_model_path_source", "shared_base_eval_dir", "pool_shared_base_eval_dir", "note",
+    "base_model_sha256", "base_model_path_source", "shared_base_eval_dir", "pool_shared_base_eval_dir",
+    "attempt_id", "pool_attempt_id", "pool_attempt_consistency", "note",
 )
 CHECKPOINT_FIELDS = (
     "run_key", "owner", "relative_id", "stage", "run_type", "validity", "status", "run_name", "step",
-    "checkpoint_kind", "has_model_weights", "availability", "run_dir", "pool_run_dir", "model_path",
+    "checkpoint_kind", "has_model_weights", "has_optimizer_state", "availability", "run_dir", "pool_run_dir",
+    "attempt_id", "pool_attempt_id", "pool_attempt_consistency", "model_path",
     "optimizer_paths", "meta_path", "routing_probe_path", "eval_npz_path", "base_eval_dir",
     "base_eval_arrays_path", "base_eval_metrics_path", "base_eval_set_paths", "pool_model_path",
     "pool_optimizer_paths", "pool_meta_path", "pool_routing_probe_path", "pool_eval_npz_path",
@@ -104,7 +109,8 @@ def recognize(path, kind):
     if any(n in ("config.json", "result.json") or n.startswith("config_resume_") for n in names):
         return True
     if kind == "finetune":
-        return any(EVAL_FILES.fullmatch(n) or n in ("metrics.parquet", "metrics.jsonl") for n in names)
+        return any(EVAL_FILES.fullmatch(n) or MODEL_FILES.fullmatch(n) or OPTIM_FILES.fullmatch(n)
+                   or n in ("metrics.parquet", "metrics.jsonl") for n in names)
     return any(MODEL_FILES.fullmatch(n) or OPTIM_FILES.fullmatch(n) for n in names)
 
 
@@ -112,6 +118,8 @@ def discover(container, stage, kind):
     """Yield (root relative ID, actual path, run type), never following directory symlinks."""
     if kind == "finetune":
         for base in child_dirs(container):
+            if base.name == ".interrupted":
+                continue
             for dataset in child_dirs(base):
                 for cell in child_dirs(dataset):
                     typ = "shared_base_eval" if cell.name == "base" else "finetune"
@@ -119,6 +127,14 @@ def discover(container, stage, kind):
                         continue
                     if recognize(cell, typ):
                         yield str(Path(stage) / base.name / dataset.name / cell.name), cell, typ
+        # Retained interrupted attempts are not active LR-grid branches. Their
+        # randomized suffix disambiguates successive attempts at the same cell.
+        for base in child_dirs(container / ".interrupted"):
+            for dataset in child_dirs(base):
+                for cell in child_dirs(dataset):
+                    match = INTERRUPTED_FT_NAME.fullmatch(cell.name)
+                    if match and FT_NAME.fullmatch(match[1]) and recognize(cell, "finetune"):
+                        yield str(Path(stage) / ".interrupted" / base.name / dataset.name / cell.name), cell, "finetune"
     else:
         for directory in child_dirs(container):
             if recognize(directory, kind):
@@ -237,6 +253,9 @@ def classify(loc, row, config, note):
             note.append("superseded AdamW base; retained as valid transfer check, not a fine-tuning base")
         return stage, "valid"
     stage = loc.root_stage
+    if loc.run_type == "finetune" and len(Path(loc.relative_id).parts) == 5 and Path(loc.relative_id).parts[1] == ".interrupted":
+        note.append("retained partial fine-tuning attempt; excluded from scientific LR-grid analysis")
+        return stage, "interrupted_archive"
     if "contiguous" in stage:
         return stage, "invalid_contiguous_eval"
     if "smoke" in stage or "verify" in stage:
@@ -295,6 +314,24 @@ def build_run(loc, hgo_scratch):
                pool_config_path=config_pool, pool_result_path=result_pool,
                resume_config_paths=path_list(sorted(primary.glob("config_resume_*.json")) if primary else []),
                pool_resume_config_paths=path_list(sorted(pool.glob("config_resume_*.json")) if pool else []))
+    if loc.run_type == "finetune":
+        # A new retention-aware branch records an explicit attempt identifier.
+        # An older pool mirror from a superseded/partial attempt is still
+        # discoverable but must not supply artifacts for the current attempt.
+        pool_config_record = (run_record(config_pool, note, "pool config.json") if primary and pool else
+                              config if pool else {})
+        attempt = first(config.get("attempt_id"))
+        pool_attempt = first(pool_config_record.get("attempt_id"))
+        row.update(attempt_id=attempt, pool_attempt_id=pool_attempt)
+        if primary and pool:
+            if attempt and pool_attempt:
+                row["pool_attempt_consistency"] = "same_attempt" if attempt == pool_attempt else "different_attempt"
+            elif attempt or pool_attempt:
+                row["pool_attempt_consistency"] = "unverified_attempt"
+            else:
+                row["pool_attempt_consistency"] = "legacy_unrecorded"
+            if row["pool_attempt_consistency"] in ("different_attempt", "unverified_attempt"):
+                note.append("pool artifacts may be from a different attempt; not merged into current checkpoint paths")
     if loc.run_type == "shared_base_eval":
         row["status"] = "reference_only"
     elif loc.run_type.startswith("legacy"):
@@ -305,7 +342,12 @@ def build_run(loc, hgo_scratch):
         row["status"] = first(result.get("status"), "unknown_result" if result_path else "incomplete")
 
     if loc.run_type in ("finetune", "shared_base_eval"):
-        _, base_name, dataset, cell_name = Path(loc.relative_id).parts
+        parts = Path(loc.relative_id).parts
+        if len(parts) == 5 and parts[1] == ".interrupted":
+            _, _, base_name, dataset, archive_name = parts
+            cell_name = INTERRUPTED_FT_NAME.fullmatch(archive_name)[1]
+        else:
+            _, base_name, dataset, cell_name = parts
         base = nested(config, "base")
         cell = nested(config, "cell")
         args = nested(config, "args")
@@ -395,9 +437,8 @@ def checkpoint_artifacts(directory, kind):
         return results
     optimizers = {}
     for p in run_files(directory):
-        if kind == "finetune":
-            if match := EVAL_FILES.fullmatch(p.name):
-                results.setdefault(int(match[1]), {})["eval_npz_path"] = str(p)
+        if kind == "finetune" and (match := EVAL_FILES.fullmatch(p.name)):
+            results.setdefault(int(match[1]), {})["eval_npz_path"] = str(p)
         elif match := MODEL_FILES.fullmatch(p.name):
             field = {"model": "model_path", "meta": "meta_path", "routing": "routing_probe_path"}[match[1]]
             if match[3] == ("json" if match[1] == "meta" else "pt"):
@@ -414,17 +455,26 @@ def build_checkpoints(loc, run):
     rows = []
     for step in sorted(set(primary) | set(pool)):
         main, mirror = primary.get(step, {}), pool.get(step, {})
+        matching_mirror = {} if run["pool_attempt_consistency"] in ("different_attempt", "unverified_attempt") else mirror
         row = dict.fromkeys(CHECKPOINT_FIELDS, "")
         row.update({key: run[key] for key in RUN_FIELDS if key in CHECKPOINT_FIELDS})
         row.update(step=step, availability=availability(bool(main), bool(mirror)))
-        row.update({key: first(main.get(key), mirror.get(key)) for key in set(main) | set(mirror)})
+        row.update({key: first(main.get(key), matching_mirror.get(key)) for key in set(main) | set(matching_mirror)})
         row.update({"pool_" + key: value for key, value in mirror.items()})
-        has_weights = bool(main.get("model_path") or mirror.get("model_path"))
+        has_weights = bool(main.get("model_path") or matching_mirror.get("model_path"))
+        has_optimizer = bool(main.get("optimizer_paths") or matching_mirror.get("optimizer_paths"))
+        has_eval = bool(main.get("eval_npz_path") or matching_mirror.get("eval_npz_path"))
         row["has_model_weights"] = "yes" if has_weights else "no"
+        row["has_optimizer_state"] = "yes" if has_optimizer else "no"
         row["checkpoint_kind"] = ("shared_base_eval" if loc.run_type == "shared_base_eval" else
-                                  "finetune_eval_arrays" if loc.run_type == "finetune" else
+                                  ("finetune_model_weights_and_eval" if has_weights and has_eval else
+                                   "finetune_model_weights" if has_weights else
+                                   "finetune_eval_arrays" if has_eval else
+                                   "finetune_related_only") if loc.run_type == "finetune" else
                                   "model_weights" if has_weights else "model_related_only")
         if loc.run_type == "finetune":
+            if not main and mirror and not matching_mirror:
+                row["checkpoint_kind"] = "stale_pool_artifacts"
             row["base_eval_dir"] = run["shared_base_eval_dir"]
             row["pool_base_eval_dir"] = run["pool_shared_base_eval_dir"]
         rows.append(row)

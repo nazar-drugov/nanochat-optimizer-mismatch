@@ -74,3 +74,11 @@ def test_hold_ft_pins_bases_without_generating_finetune_jobs(monkeypatch,tmp_pat
     assert c.state['phase']=='ft-hold'
     assert any('base-manifest' in args for _,args in calls)
     assert not any(name=='scripts.finetune_jobs' for name,_ in calls)
+    c.hold_ft=False
+    with pytest.raises(RuntimeError,match='retention policy'):
+        c.run()
+    assert not any(name=='scripts.finetune_jobs' for name,_ in calls)
+    c.checkpoint_retention='full'
+    c.state['checkpoint_retention']='weights'
+    with pytest.raises(RuntimeError,match='conflicts with existing'):
+        c.run()

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -292,7 +293,8 @@ def test_finetune_jobs_cover_the_grid_and_call_the_finetune_script(tmp_path):
     assert call[call.index("--base-checkpoints-dir") + 1] == str(FINETUNE_BASE_CHECKPOINTS_DIR)
     assert call[call.index("--base-step") + 1] == str(FINETUNE_BASE_STEP)
     assert call[call.index("--lrs") + 1] == "adamw=" + ",".join(repr(lr) for lr in grid["adamw"])
-    assert call[call.index("--seeds") + 1:] == ["1", "2", "3", "4", "5"]
+    assert call[call.index("--seeds") + 1:call.index("--checkpoint-retention")] == ["1", "2", "3", "4", "5"]
+    assert call[call.index("--checkpoint-retention") + 1] == "full"
     wb_call = (tmp_path / "call.log.wandb").read_text().split()
     assert wb_call == ["-m", "scripts.log_finetune_wandb", "--root", str(tmp_path / "scratch" / "finetune"),
                        "--stage", "finetune", "--dataset", "wikitext103", "--base-run", "e8-main-adamw-s42",
@@ -361,10 +363,39 @@ def test_pair_lr_fractions_reject_bad_input_and_out_root_results_are_persisted(t
     assert "FT_ROOT=/scratch/ft_main" in text.splitlines()
     copy = next(l for l in text.splitlines() if l.startswith("rsync -aH") and '"$FT_ROOT"' in l)
     assert '"$POOL/results/"' in copy and "--include='*.json'" in copy and "--include='*.npz'" in copy
+    assert "--include='eval_set_*.pt'" in copy and "--include='*.pt'" not in copy
+    assert "--exclude='model_*.pt'" in copy and "--exclude='optim_*.pt'" in copy
     assert text.splitlines()[-1] == 'exit "$failed"'
     finetune_jobs.main(common + ["--out", str(tmp_path / "default"), "--pair-lr-fractions", "adamw:adamw=1"])
     text = (tmp_path / "default" / "ft-e8-main-adamw-s43-sc-adamw.sbatch").read_text()
     assert 'FT_ROOT="$SCRATCH/finetune"' in text.splitlines()
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="requires local rsync for filter integration test")
+def test_finetune_pool_mirror_keeps_eval_artifacts_not_large_state(tmp_path):
+    from nanochat.pretrain_sweep import render_finetune_job
+    stage = tmp_path / "scratch" / "finetune_pilot"
+    pool = tmp_path / "pool"
+    branch = stage / "e8-main-adamw-s42" / "starcoderdata" / "muon-lr0.001-s1-T60"
+    shared = branch.parent / "base"
+    for directory, names in ((branch, ("model_000060.pt", "optim_000060_rank0.pt",
+                                        "meta_000060.json", "ckpt_000060.npz",
+                                        "config.json", "result.json")),
+                             (shared, ("eval_set_D0.pt", "eval_set_D1.pt", "base_arrays.npz"))):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (directory / name).write_bytes(b"fixture")
+    (pool / "results").mkdir(parents=True)
+    script = render_finetune_job("job", "e8-main-adamw-s42", "starcoderdata", "/data", "/d0", "muon",
+                                 [.001], "01:00:00", tmp_path,
+                                 extra_args=["--out-root", str(stage)])
+    copy = next(l for l in script.splitlines() if l.startswith("rsync -aH"))
+    subprocess.run(["bash", "-c", copy], env=dict(os.environ, FT_ROOT=str(stage), POOL=str(pool)), check=True)
+    files = {p.name for p in (pool / "results").rglob("*") if p.is_file()}
+    assert {"meta_000060.json", "ckpt_000060.npz", "config.json", "result.json",
+            "eval_set_D0.pt", "eval_set_D1.pt", "base_arrays.npz"} <= files
+    assert "model_000060.pt" not in files and "optim_000060_rank0.pt" not in files
+    assert (branch / "model_000060.pt").is_file()  # source unchanged
 
 
 def test_transfer_check_runs_are_3b_runs_at_half_and_double_without_checkpoints():

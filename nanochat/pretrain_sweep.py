@@ -628,11 +628,13 @@ def render_finetune_job(job_name, base_run, ft_name, ft_data_dir, d0_file, optim
         'fi',
     ]
     lines += PERSIST_LINES
-    # The fine-tuning output root, including the per-document arrays (*.npz) and saved eval sets (*.pt) the
-    # analysis checks; PERSIST_LINES copies only $SCRATCH/finetune's json/jsonl/log/parquet files.
-    # -H: decay branches hard-link their shared checkpoint arrays
+    # Pool retains lightweight metrics, metadata and evaluation arrays/sets.
+    # Actual model/optimizer state stays on scratch under the agreed retention
+    # policy; never accidentally duplicate multi-TB pilots into the 1-TB pool.
+    # -H preserves shared-prefix evaluation-array hard links.
     lines += ["rsync -aH --prune-empty-dirs --include='*/' --include='*.json' --include='*.jsonl' --include='*.log' "
-              "--include='*.parquet' --include='*.npz' --include='*.pt' --exclude='*' \"$FT_ROOT\" \"$POOL/results/\" "
+              "--include='*.parquet' --include='*.npz' --exclude='model_*.pt' --exclude='optim_*.pt' "
+              "--include='eval_set_*.pt' --exclude='*' \"$FT_ROOT\" \"$POOL/results/\" "
               '|| echo "WARNING: could not copy $FT_ROOT results to $POOL/results" >&2']
     lines.append('exit "$failed"')
     return "\n".join(lines) + "\n"

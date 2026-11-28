@@ -5,7 +5,8 @@ routing measurements of EXPERIMENT_SPEC.md §2, §6 and §7.
 One process runs every cell (fine-tuning optimizer x learning rate x seed) for one base
 model and one fine-tuning dataset, reusing the compiled model; each cell restarts from
 the base weights with fresh optimizer state (spec §6). Cells that already have a
-result.json are skipped, so a resubmitted job continues where it stopped.
+result.json are skipped only when the requested retention policy is satisfied. Interrupted
+branches are archived before being restarted from the base.
 
 Fine-tuning length (--branch-tokens): a cell can run several lengths at once. One trunk runs
 to the longest length; at the end of each shorter length's constant phase the model, optimizer
@@ -24,6 +25,10 @@ Per cell (output: <out-root>/<base-run>/<dataset>/<optimizer>-lr<lr>-s<seed>/):
   metrics.parquet  the same rows, written when the cell finishes
   ckpt_<step>.npz  per-document loss sums (normal, replay, reverse), per-document flip
                    counts per layer, and the route table on D0 (uint8, compressed)
+  model_<step>.pt, optim_<step>_rank0.pt, meta_<step>.json
+                   retained checkpoint weights, optimizer state and provenance, if requested.
+                   Shared states are hardlinked; metadata is always branch-specific.
+                   Evidence snapshots, not exact fault-tolerant resume checkpoints.
   result.json      status, final learning / forgetting, curves
 Base model (once per base and dataset, in .../base/): the same measurements at step 0,
 its route tables, separation S and the two-halves reference.
@@ -40,6 +45,7 @@ import math
 import os
 import re
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -49,7 +55,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from nanochat.checkpoint_manager import build_model
+from nanochat.checkpoint_manager import build_model, checkpoint_tokenizer_name
 from nanochat.common import COMPUTE_DTYPE, autodetect_device_type, compute_init, get_base_dir, print0
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.dataset import list_parquet_files
@@ -275,6 +281,132 @@ def train_steps(args, ctx, optimizer, loader, state, first, last, branch, on_che
     return True
 
 
+CHECKPOINT_RETENTION = ("none", "weights", "weights+final_optimizer", "full")
+
+
+def retention_files(policy, step, horizon):
+    """Return whether the state needs model weights and optimizer state."""
+    if policy not in CHECKPOINT_RETENTION:
+        raise ValueError(f"unknown checkpoint retention policy: {policy}")
+    return policy != "none", policy == "full" or (policy == "weights+final_optimizer" and step == horizon)
+
+
+def state_file_name(kind, step):
+    return {"model": f"model_{step:06d}.pt", "optim": f"optim_{step:06d}_rank0.pt",
+            "meta": f"meta_{step:06d}.json"}[kind]
+
+
+def save_measurement_states(args, ctx, model, optimizer, state, targets, meta, run_dirs, step, attempt_id):
+    """Persist one physical model/optimizer state for each unique measured state.
+
+    Synchronous atomic writes finish before the mutable training state can
+    advance. Metadata is a branch-specific commit marker written last; a crash
+    before it is written leaves a partial branch, not an apparently valid snapshot.
+    """
+    policy = args.checkpoint_retention
+    if policy == "none":
+        return
+    requested = {b.steps: retention_files(policy, step, b.steps) for b in targets}
+    paths = {}
+    for kind, retain_index, state_dict in (("model", 0, model.state_dict), ("optim", 1, optimizer.state_dict)):
+        owners = [b for b in targets if requested[b.steps][retain_index]]
+        if not owners:
+            continue
+        filename = state_file_name(kind, step)
+        first = run_dirs[owners[0].steps] / filename
+        replace_atomic(first, lambda f: torch.save(state_dict(), f))
+        for b in owners[1:]:
+            os.link(first, run_dirs[b.steps] / filename)
+        paths[kind] = (filename, first.stat().st_size)
+    for b in targets:
+        kept_model, kept_optim = requested[b.steps]
+        artifacts = {kind: {"file": paths[kind][0], "bytes": paths[kind][1]}
+                     for kind, keep in (("model", kept_model), ("optim", kept_optim)) if keep}
+        provenance = {
+            "stage": "finetune", "checkpoint_version": 1, "step": step, "attempt_id": attempt_id,
+            "tokens": step * args.total_batch_size, "max_seq_len": ctx["seq_len"],
+            "model_config": asdict(model.config), "tokenizer": ctx["tokenizer_name"],
+            "user_config": {**vars(args), "seed": meta[b.steps]["seed"],
+                            "optimizer_name": meta[b.steps]["ft_optimizer"]},
+            "base": ctx["base_identity"], "cell": meta[b.steps],
+            "data": {"ft_train_files": ctx["ft_train_files"], "eval_sets": ctx["eval_identity"]},
+            "data_fingerprint": int(state["fingerprint"]),
+            "cumulative_expert_counts": state["counts"].cpu().tolist(),
+            "warmup_steps": ctx["warmup"], "decay_steps": b.decay,
+            "branch_point": b.branch_point, "shared_state_horizons": [t.steps for t in targets],
+            "checkpoint_retention": policy, "artifacts": artifacts, "optimizer_saved": kept_optim,
+            "exact_resume_supported": False,
+            "note": "Measured state; shared_state_horizons refers to this attempt only. Loader replay buffers and RNG are not serialized.",
+        }
+        write_json_atomic(run_dirs[b.steps] / state_file_name("meta", step), provenance)
+
+
+def validate_retained_states(run_dir, result, config, policy):
+    """A finalized result is not a valid retention completion marker by itself."""
+    recorded = config.get("checkpoint_retention", config.get("args", {}).get("checkpoint_retention", "none"))
+    if recorded != policy:
+        raise RuntimeError(f"{run_dir}: checkpoint retention is {recorded!r}, requested {policy!r}; "
+                           "not overwriting finalized results. Use a separate output root for additional snapshots.")
+    if config.get("attempt_id") is not None and (
+        result.get("checkpoint_retention") != policy or result.get("attempt_id") != config["attempt_id"]):
+        raise RuntimeError(f"{run_dir}: inconsistent recorded retention or attempt identity")
+    if policy == "none":
+        return
+    if (result.get("checkpoint_retention") != policy or not config.get("attempt_id") or
+            result.get("attempt_id") != config["attempt_id"]):
+        raise RuntimeError(f"{run_dir}: inconsistent recorded checkpoint retention")
+    horizon = result["steps"]
+    curve_steps = [p["step"] for p in result["curve"]]
+    if result.get("status") == "completed" and (not curve_steps or curve_steps[-1] != horizon or
+                                                curve_steps != config.get("checkpoint_steps")):
+        raise RuntimeError(f"{run_dir}: finalized checkpoint schedule is incomplete")
+    for p in result["curve"]:
+        step = p["step"]
+        eval_path = run_dir / f"ckpt_{step:06d}.npz"
+        if not eval_path.is_file() or eval_path.stat().st_size == 0:
+            raise RuntimeError(f"{eval_path}: missing checkpoint evaluation arrays")
+        meta_path = run_dir / state_file_name("meta", step)
+        if not meta_path.is_file():
+            raise RuntimeError(f"{run_dir}: missing checkpoint metadata at step {step}")
+        snapshot = json.loads(meta_path.read_text())
+        if (snapshot.get("step") != step or snapshot.get("cell") != config.get("cell") or
+                snapshot.get("base") != config.get("base") or snapshot.get("checkpoint_retention") != policy or
+                snapshot.get("attempt_id") != config.get("attempt_id") or
+                snapshot.get("warmup_steps") != config.get("warmup_steps") or
+                snapshot.get("decay_steps") != config.get("decay_steps") or
+                snapshot.get("tokens") != step * config["args"]["total_batch_size"] or
+                horizon not in snapshot.get("shared_state_horizons", []) or
+                snapshot.get("model_config") != config.get("model_config") or
+                snapshot.get("data", {}).get("ft_train_files") != config.get("data", {}).get("ft_train_files") or
+                snapshot.get("data", {}).get("eval_sets") != config.get("data", {}).get("eval_sets")):
+            raise RuntimeError(f"{meta_path}: checkpoint provenance disagrees with finalized branch")
+        if result.get("status") == "completed" and step == horizon and (
+            snapshot.get("data_fingerprint") != result.get("data_fingerprint") or
+            snapshot.get("cumulative_expert_counts") != result.get("cumulative_expert_counts")):
+            raise RuntimeError(f"{meta_path}: final checkpoint data fingerprint/counts disagree with result")
+        weights, optim = retention_files(policy, step, horizon)
+        if snapshot.get("optimizer_saved") != optim:
+            raise RuntimeError(f"{meta_path}: optimizer retention disagrees with policy")
+        for kind, expected in (("model", weights), ("optim", optim)):
+            if not expected:
+                continue
+            path = run_dir / state_file_name(kind, step)
+            artifact = snapshot.get("artifacts", {}).get(kind, {})
+            if (not path.is_file() or artifact.get("file") != path.name or path.stat().st_size == 0 or
+                    artifact.get("bytes") != path.stat().st_size):
+                raise RuntimeError(f"{path}: missing or incomplete retained checkpoint artifact")
+
+
+def archive_interrupted_branch(run_dir, out_dir):
+    """Preserve incomplete artifacts under a non-active, same-filesystem tree."""
+    archive = out_dir.parents[1] / ".interrupted" / out_dir.parent.name / out_dir.name
+    archive.mkdir(parents=True, exist_ok=True)
+    dest = archive / f"{run_dir.name}.{uuid.uuid4().hex}"
+    run_dir.rename(dest)
+    print0(f"Archived incomplete branch {run_dir} -> {dest}")
+    return dest
+
+
 def run_cell(args, cell, ctx):
     """Fine-tune once from the base weights (one trunk with its decay branches, or a single
     run) and measure every checkpoint."""
@@ -288,12 +420,14 @@ def run_cell(args, cell, ctx):
         if not (run_dir / "result.json").is_file():
             continue
         done = json.loads((run_dir / "result.json").read_text())
+        if done.get("status") not in ("completed", "diverged"):
+            raise RuntimeError(f"{run_dir}: invalid finalized status; refusing to overwrite evidence")
         if (done.get("lr"), done.get("steps"), done.get("warmup_steps")) != (lr, b.steps, ctx["warmup"]):
             raise RuntimeError(f"{run_dir}/result.json has lr {done.get('lr')!r}, steps "
                                f"{done.get('steps')}, warmup {done.get('warmup_steps')}; this cell has "
                                f"lr {lr!r}, steps {b.steps}, warmup {ctx['warmup']}")
+        raw = json.loads((run_dir / "config.json").read_text())
         if ctx["model"].config.n_experts != 8 and "logical_run" in ctx["base_identity"]:
-            raw = json.loads((run_dir / "config.json").read_text())
             identity = ctx["base_identity"]
             keys = ("dir", "step", "model_file", "model_sha256", "logical_run", "checkpoint_run", "n_experts")
             fields = {"base_run": ctx["base_run"], "ft_optimizer": optimizer_name, "seed": seed,
@@ -307,14 +441,19 @@ def run_cell(args, cell, ctx):
                 or raw.get("args", {}).get("total_batch_size") != args.total_batch_size
                 or raw.get("args", {}).get("device_batch_size") != args.device_batch_size):
                 raise RuntimeError(f"{run_dir}: finalized cell provenance conflicts with the requested pin/data/schedule")
-    if all((d / "result.json").exists() for d in run_dirs.values()):
-        print0(f"Skipping {name}: result.json exists")
+        validate_retained_states(run_dir, done, raw, args.checkpoint_retention)
+        b.done = True
+    if all(b.done for b in branches):
+        print0(f"Skipping {name}: all finalized branches have requested retention")
         return
-    for run_dir in run_dirs.values():  # an interrupted cell restarts from scratch
+    for b in branches:  # preserve completed siblings; interrupted branches restart from base
+        if b.done:
+            continue
+        run_dir = run_dirs[b.steps]
         if run_dir.exists():
-            for f in run_dir.iterdir():
-                f.unlink()
+            archive_interrupted_branch(run_dir, ctx["out_dir"])
         run_dir.mkdir(parents=True, exist_ok=True)
+    attempt_id = uuid.uuid4().hex
     model, device = ctx["model"], ctx["device"]
     with torch.no_grad():  # restore the base weights and balancer state
         for key, tensor in model.state_dict().items():
@@ -337,6 +476,8 @@ def run_cell(args, cell, ctx):
                       "ft_optimizer": optimizer_name, "lr": lr, "seed": seed, "ft_steps": b.steps,
                       "n_experts": model.config.n_experts} for b in branches}
     for b in branches:
+        if b.done:
+            continue
         write_run_record(run_dirs[b.steps] / "config.json", args=args, model=model, optimizer=optimizer,
                          device_type=device.type, world_size=1, compute_dtype=COMPUTE_DTYPE,
                          data={"ft_data_dir": args.ft_data_dir, "ft_train_files": ctx["ft_train_files"],
@@ -346,7 +487,8 @@ def run_cell(args, cell, ctx):
                                 "decay_steps": b.decay, "checkpoint_steps": b.ckpts,
                                 "branch": {"lengths": lengths, "branch_point": b.branch_point,
                                            "trunk_steps": trunk.steps} if len(branches) > 1 else None,
-                                "conventions": CONVENTIONS, "balancer_mode": args.balancer_mode})
+                                "conventions": CONVENTIONS, "balancer_mode": args.balancer_mode,
+                                "checkpoint_retention": args.checkpoint_retention, "attempt_id": attempt_id})
     loader = ReplayLoader(tokenizing_distributed_data_loader_with_state_bos_bestfit(
         ctx["tokenizer"], args.device_batch_size, ctx["seq_len"], split="train", device=device,
         data_dir=args.ft_data_dir, shuffle_seed=seed))
@@ -363,6 +505,7 @@ def run_cell(args, cell, ctx):
         rows, entry = measure(args, ctx, model, step, step * args.total_batch_size, meta[first.steps],
                               run_dirs[first.steps], state["counts"])
         entry["train_loss"] = train_loss
+        save_measurement_states(args, ctx, model, optimizer, state, targets, meta, run_dirs, step, attempt_id)
         for b in targets:
             b.curve.append(dict(entry))
             if b is not first:
@@ -388,13 +531,14 @@ def run_cell(args, cell, ctx):
             "status": status, **meta[b.steps], "steps": b.steps, "steps_completed": b.steps_completed,
             "warmup_steps": ctx["warmup"], "decay_steps": b.decay,
             "final_learning": final.get("learning"), "final_forgetting": final.get("forgetting"),
+            "checkpoint_retention": args.checkpoint_retention, "attempt_id": attempt_id,
             "curve": b.curve, "data_fingerprint": int(state["fingerprint"]), "wall_time_s": time.time() - t0,
             "cumulative_expert_counts": state["counts"].cpu().tolist(),
         })
 
     def trunk_checkpoint(step, train_loss):
         # trunk steps up to a branch's branch point are shared with that branch
-        measure_for([b for b in branches if step in b.ckpts and (b is trunk or step <= b.branch_point)],
+        measure_for([b for b in branches if not b.done and step in b.ckpts and (b is trunk or step <= b.branch_point)],
                     step, train_loss)
 
     def branch_checkpoint_for(b):
@@ -408,6 +552,8 @@ def run_cell(args, cell, ctx):
                     finish(rest, "diverged")
             return
         position = b.branch_point
+        if b.done:
+            continue
         snapshot = {"model": {k: v.detach().clone() for k, v in model.state_dict().items()},
                     "optimizer": copy.deepcopy(optimizer.state_dict()),
                     "counts": state["counts"].clone(), "fingerprint": state["fingerprint"].clone()}
@@ -422,8 +568,9 @@ def run_cell(args, cell, ctx):
         model.zero_grad(set_to_none=True)
         state.update(step=position, counts=snapshot["counts"], fingerprint=snapshot["fingerprint"])
         del snapshot
-    ok = train_steps(args, ctx, optimizer, loader, state, position + 1, trunk.steps, trunk, trunk_checkpoint)
-    finish(trunk, "completed" if ok else "diverged")
+    if not trunk.done:
+        ok = train_steps(args, ctx, optimizer, loader, state, position + 1, trunk.steps, trunk, trunk_checkpoint)
+        finish(trunk, "completed" if ok else "diverged")
 
 
 def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
@@ -449,13 +596,14 @@ def measure(args, ctx, model, step, tokens, meta, run_dir, cumulative_counts):
     rows = cell_rows(meta, step, tokens, "D0", {k: v for k, v in entry.items() if k not in ("step", "tokens")},
                      d0["per_layer"])
     rows += cell_rows(meta, step, tokens, "D1", {"loss": l1_d1, "learning": entry["learning"]}, d1["per_layer"])
-    np.savez_compressed(
-        run_dir / f"ckpt_{step:06d}.npz",
+    replace_atomic(run_dir / f"ckpt_{step:06d}.npz", lambda f: np.savez_compressed(
+        f,
         d0_doc_loss=d0["doc_sums"]["normal"].numpy(), d0_doc_loss_replay=d0["doc_sums"]["replay"].numpy(),
         d0_doc_loss_reverse=d0["doc_sums"]["reverse"].numpy(), d0_doc_flips=d0["doc_flips"].numpy(),
         d1_doc_loss=d1["doc_sums"]["normal"].numpy(), d1_doc_flips=d1["doc_flips"].numpy(),
         d0_routes=torch.stack([d0["routes"][l] for l in layers]).numpy(),
-        layers=np.array(layers))
+        d1_routes=torch.stack([d1["routes"][l] for l in layers]).numpy(),
+        layers=np.array(layers)))
     return rows, entry
 
 
@@ -549,6 +697,8 @@ def main(argv=None):
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--non-matrix-lr-scale", type=float, default=0.1,
                         help="embedding and lm_head AdamW LRs = pretraining defaults x this, identical in every cell")
+    parser.add_argument("--checkpoint-retention", choices=CHECKPOINT_RETENTION, default="full",
+                        help="model/optimizer state saved at measured checkpoints (default: full)")
     parser.add_argument("--checkpoint-spacing", choices=("log", "linear"), default="log",
                         help="log: 2, 4, 8, ... in the constant phase, its end, mid-decay, last step")
     parser.add_argument("--n-checkpoints", type=int, default=10, help="with --checkpoint-spacing linear")
@@ -632,6 +782,7 @@ def main(argv=None):
     ctx = {
         "model": model, "compiled": torch.compile(model, dynamic=False) if device.type == "cuda" else model,
         "model0": model0, "device": device, "tokenizer": tokenizer, "seq_len": seq_len,
+        "tokenizer_name": checkpoint_tokenizer_name(base_meta),
         "base_state": {k: v.detach().clone() for k, v in model.state_dict().items()},
         "pretrain_defaults": pretrain_defaults, "out_dir": out_dir, "base_run": args.base_run,
         "pretrain_optimizer": base_meta["user_config"].get("optimizer_name"),
