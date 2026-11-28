@@ -58,9 +58,12 @@ across initial pilots. See `reports/finetune_checkpoint_storage_plan.md`. Harry 
 continue initial pilots without binary FT states and capture richer router data instead;
 selected-LR full-state reruns await storage and a separate plan. Rich router capture has been
 implemented and reviewed, whole repository suite 408 passed/13 skipped, with a one-cell GPU canary
-gate before each full grid. Coordinators hold FT until the tested revision is deployed. Harry clarified that
-existing project norms supersede the optional collaboration kit; no additional
-ratification or launcher requirement applies. See `reports/finetune_rich_router_capture.md`. E1 4× AdamW
+gate before each full grid. Harry clarified that the existing project norms supersede the optional
+collaboration kit; no additional ratification or launcher requirement applies.
+At 22:53 EST the GPU jobs were left untouched and the three CPU coordinators
+were replaced on pin a7e06a7 (30777015 E1, 30777060 E4, 30777061 E16),
+resuming their same durable ledgers with no binary FT states, rich soft capture
+and a mandatory implementation canary before the approved LR pilot grids. See `reports/finetune_rich_router_capture.md`. E1 4× AdamW
 extension queued (30772904), E4 two transfer jobs running; E8 rerun not authorized now.
 
 ## 1. Goal and where we are
