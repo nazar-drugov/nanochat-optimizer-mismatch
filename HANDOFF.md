@@ -54,8 +54,11 @@ deliberately cancelled (no GPU jobs cancelled) and resumed on pin 2921362 with `
 30772131 (E1), 30772137 (E4), 30772138 (E16). These finish approved pretraining and pin bases,
 but do not launch FT until a feasible retention policy is agreed. Actual personal storage free
 ~610 GB scratch + 976 GB pool, versus ~21.5 TB full measured-state (or ~19 TB every 60 steps)
-across initial pilots. See `reports/finetune_checkpoint_storage_plan.md`. Retention implementation
-is reviewed; further storage/selection/cadence decisions await Harry. E8 rerun is not authorized now.
+across initial pilots. See `reports/finetune_checkpoint_storage_plan.md`. Harry chose to
+continue initial pilots without binary FT states and capture richer router data instead;
+selected-LR full-state reruns await storage and a separate plan. Rich router capture is under
+implementation/review; coordinators still hold FT until the new code is ready. E1 4× AdamW
+extension queued (30772904), E4 two transfer jobs running; E8 rerun not authorized now.
 
 ## 1. Goal and where we are
 

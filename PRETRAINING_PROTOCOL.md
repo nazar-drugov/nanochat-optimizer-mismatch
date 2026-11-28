@@ -188,6 +188,15 @@ so that η·λ matches AdamW); seed-noise runs for the sweep.
   Initial sweeps, per-E transfer checks and the final seed-42 bases precede the approved
   three-horizon pilots. Longer horizons and pretraining seed replication remain out of scope.
 
+- **Initial FT retention revision (2026-11-27, user-confirmed):** the combined
+  personal scratch/pool quotas are insufficient for binary weights+optimizer
+  at every measured (or 60-step) state across all LR trials. Continue the
+  E1/4/16 pilot with no new binary FT states (`checkpoint-retention none`),
+  richer router capture on the already-planned checkpoints, and full D0/D1
+  hard routing IDs. Later selected-LR full-state reruns are deferred until
+  storage is arranged and separately agreed; E8 reruns are not approved now.
+  The full retention implementation remains available for the deferred work.
+
 Initial five-point ×2 search grid: AdamW centre 2e-3·E^-0.25; Muon centre
 4e-3·2^(−k/4) with k = 0, 1, 2, 3 for E = 1, 4, 8, 16. These are bracket
 starting guesses, not a constraint on the selected LR.
